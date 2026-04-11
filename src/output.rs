@@ -30,8 +30,10 @@ pub fn print_success<T: Serialize>(data: &T, pretty: bool, quiet: bool) {
     match json {
         Ok(s) => println!("{}", s),
         Err(e) => {
-            eprintln!("fatal: failed to serialize output: {}", e);
-            std::process::exit(2);
+            // Serialization of a known-good Serialize type should never fail.
+            // If it does, something is fundamentally wrong — panic rather than
+            // silently calling process::exit from a library function.
+            panic!("fatal: failed to serialize output: {}", e);
         }
     }
 }
@@ -51,8 +53,7 @@ pub fn print_error(err: &BttError, pretty: bool) {
     match json {
         Ok(s) => println!("{}", s),
         Err(e) => {
-            eprintln!("fatal: failed to serialize error output: {}", e);
-            std::process::exit(2);
+            panic!("fatal: failed to serialize error output: {}", e);
         }
     }
 }

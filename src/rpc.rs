@@ -41,7 +41,7 @@ pub fn resolve_endpoint(url: Option<&str>, network: Option<&str>) -> Result<Stri
 }
 
 /// Validate that a URL uses ws:// or wss:// scheme.
-fn validate_url(url: &str) -> Result<(), BttError> {
+pub fn validate_url(url: &str) -> Result<(), BttError> {
     if !url.starts_with("ws://") && !url.starts_with("wss://") {
         return Err(BttError::connection(
             "endpoint URL must use ws:// or wss:// scheme",
@@ -62,9 +62,11 @@ pub async fn connect(endpoint: &str) -> Result<OnlineClient<PolkadotConfig>, Btt
     .map_err(|e| BttError::connection(format!("failed to connect to {}: {}", endpoint, e)))
 }
 
-/// Get legacy RPC methods for lower-level queries.
-/// Applies a connection timeout.
-pub async fn legacy_rpc(endpoint: &str) -> Result<LegacyRpcMethods<PolkadotConfig>, BttError> {
+/// Connect once and return both an OnlineClient and LegacyRpcMethods sharing
+/// the same underlying WebSocket transport.
+pub async fn connect_full(
+    endpoint: &str,
+) -> Result<(OnlineClient<PolkadotConfig>, LegacyRpcMethods<PolkadotConfig>), BttError> {
     let rpc_client = tokio::time::timeout(
         CONNECT_TIMEOUT,
         RpcClient::from_url(endpoint),
@@ -72,5 +74,82 @@ pub async fn legacy_rpc(endpoint: &str) -> Result<LegacyRpcMethods<PolkadotConfi
     .await
     .map_err(|_| BttError::connection(format!("connection to {} timed out after {}s", endpoint, CONNECT_TIMEOUT.as_secs())))?
     .map_err(|e| BttError::connection(format!("failed to connect to {}: {}", endpoint, e)))?;
-    Ok(LegacyRpcMethods::new(rpc_client))
+
+    let legacy = LegacyRpcMethods::new(rpc_client.clone());
+    let api = OnlineClient::<PolkadotConfig>::from_rpc_client(rpc_client)
+        .await
+        .map_err(|e| BttError::connection(format!("failed to initialize client from {}: {}", endpoint, e)))?;
+
+    Ok((api, legacy))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- resolve_endpoint tests --
+
+    #[test]
+    fn resolve_endpoint_finney_returns_finney_url() {
+        let url = resolve_endpoint(None, Some("finney")).expect("finney should resolve");
+        assert_eq!(url, DEFAULT_ENDPOINT);
+    }
+
+    #[test]
+    fn resolve_endpoint_test_returns_test_url() {
+        let url = resolve_endpoint(None, Some("test")).expect("test should resolve");
+        assert_eq!(url, TEST_ENDPOINT);
+    }
+
+    #[test]
+    fn resolve_endpoint_local_returns_local_url() {
+        let url = resolve_endpoint(None, Some("local")).expect("local should resolve");
+        assert_eq!(url, LOCAL_ENDPOINT);
+    }
+
+    #[test]
+    fn resolve_endpoint_unknown_network_returns_error() {
+        let result = resolve_endpoint(None, Some("potato"));
+        assert!(result.is_err(), "unrecognized network should fail");
+    }
+
+    #[test]
+    fn resolve_endpoint_none_defaults_to_finney() {
+        let url = resolve_endpoint(None, None).expect("default should resolve");
+        assert_eq!(url, DEFAULT_ENDPOINT);
+    }
+
+    #[test]
+    fn resolve_endpoint_explicit_url_overrides_network() {
+        let url = resolve_endpoint(Some("wss://custom.example.com"), Some("test"))
+            .expect("explicit URL should take precedence");
+        assert_eq!(url, "wss://custom.example.com");
+    }
+
+    // -- validate_url tests --
+
+    #[test]
+    fn validate_url_wss_is_ok() {
+        assert!(validate_url("wss://example.com").is_ok());
+    }
+
+    #[test]
+    fn validate_url_ws_localhost_is_ok() {
+        assert!(validate_url("ws://localhost:9944").is_ok());
+    }
+
+    #[test]
+    fn validate_url_http_returns_error() {
+        assert!(validate_url("http://example.com").is_err());
+    }
+
+    #[test]
+    fn validate_url_empty_returns_error() {
+        assert!(validate_url("").is_err());
+    }
+
+    #[test]
+    fn validate_url_https_returns_error() {
+        assert!(validate_url("https://example.com").is_err());
+    }
 }

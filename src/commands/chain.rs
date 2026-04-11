@@ -27,8 +27,7 @@ pub struct BalanceInfo {
 
 /// Fetch chain info: chain name, runtime version, current block number.
 pub async fn info(endpoint: &str) -> Result<ChainInfo, BttError> {
-    let api = rpc::connect(endpoint).await?;
-    let legacy = rpc::legacy_rpc(endpoint).await?;
+    let (api, legacy) = rpc::connect_full(endpoint).await?;
 
     // Get chain name via legacy RPC
     let chain = tokio::time::timeout(RPC_TIMEOUT, legacy.system_chain())
@@ -60,8 +59,9 @@ pub async fn info(endpoint: &str) -> Result<ChainInfo, BttError> {
 pub async fn balance(endpoint: &str, address: &str) -> Result<BalanceInfo, BttError> {
     let api = rpc::connect(endpoint).await?;
 
-    // Decode and validate the SS58 address, then re-encode to canonical form
-    let (account_id_bytes, canonical_address) = parse_ss58(address)?;
+    // Validate the SS58 address and extract the raw account ID bytes.
+    // We keep the original address string for output to preserve the user's SS58 prefix.
+    let account_id_bytes = parse_ss58(address)?;
 
     // Build a dynamic storage query for System.Account
     let storage_query = subxt::dynamic::storage(
@@ -96,7 +96,7 @@ pub async fn balance(endpoint: &str, address: &str) -> Result<BalanceInfo, BttEr
             let reserved = extract_balance_field(&decoded, "data", "reserved")?;
 
             Ok(BalanceInfo {
-                address: canonical_address,
+                address: address.to_string(),
                 free,
                 reserved,
             })
@@ -104,7 +104,7 @@ pub async fn balance(endpoint: &str, address: &str) -> Result<BalanceInfo, BttEr
         None => {
             // Account not found on chain -- zero balances
             Ok(BalanceInfo {
-                address: canonical_address,
+                address: address.to_string(),
                 free: "0".to_string(),
                 reserved: "0".to_string(),
             })
@@ -112,17 +112,16 @@ pub async fn balance(endpoint: &str, address: &str) -> Result<BalanceInfo, BttEr
     }
 }
 
-/// Parse an SS58-encoded address into a 32-byte account ID and canonical SS58 string.
+/// Parse an SS58-encoded address into a 32-byte account ID.
 /// Uses sp-core for proper checksum verification.
-fn parse_ss58(address: &str) -> Result<(Vec<u8>, String), BttError> {
+/// Returns the raw bytes; callers should use the original address string
+/// to avoid SS58 prefix re-encoding mismatches.
+pub fn parse_ss58(address: &str) -> Result<Vec<u8>, BttError> {
     let account_id = AccountId32::from_ss58check(address)
         .map_err(|e| BttError::invalid_address(format!("invalid SS58 address: {:?}", e)))?;
 
-    let canonical = account_id.to_ss58check();
     let bytes: &[u8] = account_id.as_ref();
-    let bytes = bytes.to_vec();
-
-    Ok((bytes, canonical))
+    Ok(bytes.to_vec())
 }
 
 /// Extract a balance field from a decoded dynamic Value.
@@ -154,4 +153,49 @@ fn extract_balance_field(
             outer_field, inner_field
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A valid Bittensor SS58 address (prefix 42 / generic substrate).
+    // This is a well-known test address with a valid checksum.
+    const VALID_ADDRESS: &str = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
+
+    #[test]
+    fn parse_ss58_valid_address_returns_32_bytes() {
+        let bytes = parse_ss58(VALID_ADDRESS).expect("valid address should parse");
+        assert_eq!(bytes.len(), 32);
+    }
+
+    #[test]
+    fn parse_ss58_invalid_checksum_returns_error() {
+        // Flip the last character to break the checksum.
+        let bad = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQZ";
+        let result = parse_ss58(bad);
+        assert!(result.is_err(), "corrupted checksum should fail");
+    }
+
+    #[test]
+    fn parse_ss58_wrong_length_returns_error() {
+        // Too short to be a valid SS58 address.
+        let short = "5GrwvaEF";
+        let result = parse_ss58(short);
+        assert!(result.is_err(), "truncated address should fail");
+    }
+
+    #[test]
+    fn parse_ss58_non_base58_characters_returns_error() {
+        // '0', 'O', 'I', 'l' are not in the base58 alphabet.
+        let bad = "0OIl5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKu";
+        let result = parse_ss58(bad);
+        assert!(result.is_err(), "non-base58 characters should fail");
+    }
+
+    #[test]
+    fn parse_ss58_empty_string_returns_error() {
+        let result = parse_ss58("");
+        assert!(result.is_err(), "empty string should fail");
+    }
 }
