@@ -1029,4 +1029,76 @@ mod tests {
     fn extract_ss58_from_empty_returns_none() {
         assert!(extract_ss58_from_content("").is_none());
     }
+
+    #[test]
+    fn create_and_sign_roundtrip() {
+        let tmp = std::env::temp_dir().join(format!("btt-test-sign-{}", std::process::id()));
+        let wallet_name = "sign-test";
+
+        let original_home = std::env::var("HOME").ok();
+        let wallets_parent = tmp.join(".bittensor").join("wallets");
+        std::fs::create_dir_all(&wallets_parent).expect("create temp dir");
+
+        std::env::set_var("HOME", tmp.to_str().expect("valid path"));
+
+        let password = "sign-test-pw";
+        let cr = create(wallet_name, "default", 12, password).expect("create should work");
+
+        // Sign with coldkey
+        let sign_result =
+            sign(wallet_name, "default", "hello", false, Some(password)).expect("sign coldkey");
+        assert_eq!(sign_result.ss58_address, cr.coldkey_ss58);
+
+        // Verify the coldkey signature
+        let vr = verify("hello", &sign_result.signature, &sign_result.ss58_address)
+            .expect("verify coldkey sig");
+        assert!(vr.valid);
+
+        // Sign with hotkey
+        let hk_sign = sign(wallet_name, "default", "hello", true, None).expect("sign hotkey");
+        assert_eq!(hk_sign.ss58_address, cr.hotkey_ss58);
+
+        // Verify the hotkey signature
+        let hk_vr = verify("hello", &hk_sign.signature, &hk_sign.ss58_address)
+            .expect("verify hotkey sig");
+        assert!(hk_vr.valid);
+
+        if let Some(h) = original_home {
+            std::env::set_var("HOME", &h);
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn regen_coldkey_from_mnemonic() {
+        let tmp = std::env::temp_dir().join(format!("btt-test-regen-{}", std::process::id()));
+        let wallet_name = "regen-test";
+
+        let original_home = std::env::var("HOME").ok();
+        let wallets_parent = tmp.join(".bittensor").join("wallets");
+        std::fs::create_dir_all(&wallets_parent).expect("create temp dir");
+
+        std::env::set_var("HOME", tmp.to_str().expect("valid path"));
+
+        let password = "regen-pw";
+        let cr = create(wallet_name, "default", 12, password).expect("create should work");
+
+        // Regenerate the coldkey from the mnemonic
+        let regen = regen_coldkey(wallet_name, Some(&cr.mnemonic), None, password)
+            .expect("regen should work");
+        assert_eq!(regen.ss58_address, cr.coldkey_ss58);
+
+        // Sign with the regenerated coldkey and verify
+        let sign_result =
+            sign(wallet_name, "default", "regen-msg", false, Some(password)).expect("sign regen");
+        let vr = verify("regen-msg", &sign_result.signature, &sign_result.ss58_address)
+            .expect("verify regen sig");
+        assert!(vr.valid);
+        assert_eq!(sign_result.ss58_address, cr.coldkey_ss58);
+
+        if let Some(h) = original_home {
+            std::env::set_var("HOME", &h);
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
