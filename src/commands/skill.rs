@@ -39,6 +39,21 @@ btt chain balance <ss58_address>
 btt wallet list
 ```
 
+### Stake
+
+```bash
+# List all stakes for a wallet
+btt stake list --wallet <name>
+btt stake list --ss58 <address>
+
+# Add stake (TAO from coldkey to hotkey on a subnet)
+btt stake add --wallet <name> --hotkey <ss58> --netuid <u16> --amount <TAO>
+
+# Remove stake (unstake TAO from hotkey back to coldkey)
+btt stake remove --wallet <name> --hotkey <ss58> --netuid <u16> --amount <TAO>
+btt stake remove --wallet <name> --hotkey <ss58> --netuid <u16> --all
+```
+
 ### Skill
 
 ```bash

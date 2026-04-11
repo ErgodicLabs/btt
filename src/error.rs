@@ -12,6 +12,12 @@ pub enum ErrorCode {
     WalletNotFound,
     IoError,
     ParseError,
+    CryptoError,
+    InvalidInput,
+    SigningFailed,
+    SubmissionFailed,
+    DecryptionFailed,
+    InvalidAmount,
     Unknown,
 }
 
@@ -62,6 +68,32 @@ impl BttError {
 
     pub fn parse(msg: impl Into<String>) -> Self {
         Self::new(ErrorCode::ParseError, msg)
+    }
+
+    pub fn crypto(msg: impl Into<String>) -> Self {
+        Self::new(ErrorCode::CryptoError, msg)
+    }
+
+    pub fn invalid_input(msg: impl Into<String>) -> Self {
+        Self::new(ErrorCode::InvalidInput, msg)
+    }
+
+    #[allow(dead_code)]
+    pub fn signing_failed(msg: impl Into<String>) -> Self {
+        Self::new(ErrorCode::SigningFailed, msg)
+    }
+
+    pub fn submission_failed(msg: impl Into<String>) -> Self {
+        Self::new(ErrorCode::SubmissionFailed, msg)
+    }
+
+    #[allow(dead_code)]
+    pub fn decryption_failed(msg: impl Into<String>) -> Self {
+        Self::new(ErrorCode::DecryptionFailed, msg)
+    }
+
+    pub fn invalid_amount(msg: impl Into<String>) -> Self {
+        Self::new(ErrorCode::InvalidAmount, msg)
     }
 }
 
