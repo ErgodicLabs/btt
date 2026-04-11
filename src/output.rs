@@ -16,7 +16,11 @@ struct ErrorEnvelope<'a> {
 }
 
 /// Print a success result as JSON to stdout.
-pub fn print_success<T: Serialize>(data: &T, pretty: bool) {
+/// When `quiet` is true, output is suppressed entirely.
+pub fn print_success<T: Serialize>(data: &T, pretty: bool, quiet: bool) {
+    if quiet {
+        return;
+    }
     let envelope = SuccessEnvelope { ok: true, data };
     let json = if pretty {
         serde_json::to_string_pretty(&envelope)
@@ -32,8 +36,9 @@ pub fn print_success<T: Serialize>(data: &T, pretty: bool) {
     }
 }
 
-/// Print an error result as JSON to stdout, then exit with code 1.
-pub fn print_error(err: &BttError, pretty: bool) -> ! {
+/// Print an error result as JSON to stdout.
+/// The caller is responsible for setting the process exit code.
+pub fn print_error(err: &BttError, pretty: bool) {
     let envelope = ErrorEnvelope {
         ok: false,
         error: err,
@@ -44,10 +49,7 @@ pub fn print_error(err: &BttError, pretty: bool) -> ! {
         serde_json::to_string(&envelope)
     };
     match json {
-        Ok(s) => {
-            println!("{}", s);
-            std::process::exit(1);
-        }
+        Ok(s) => println!("{}", s),
         Err(e) => {
             eprintln!("fatal: failed to serialize error output: {}", e);
             std::process::exit(2);

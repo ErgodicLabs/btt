@@ -93,6 +93,8 @@ pub fn list() -> Result<WalletList, BttError> {
             }
         }
 
+        hotkeys.sort_by(|a, b| a.name.cmp(&b.name));
+
         wallets.push(WalletEntry {
             name: wallet_name,
             coldkey,
