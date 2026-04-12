@@ -16,11 +16,16 @@ struct ErrorEnvelope<'a> {
 }
 
 /// Print a success result as JSON to stdout.
-/// When `quiet` is true, output is suppressed entirely.
-pub fn print_success<T: Serialize>(data: &T, pretty: bool, quiet: bool) {
-    if quiet {
-        return;
-    }
+///
+/// `--quiet` does NOT suppress the success payload. The payload is the
+/// actual result of the command — suppressing it would leave a caller
+/// with no way to distinguish a successful empty result from a silenced
+/// one. `--quiet` is reserved for suppressing non-essential status
+/// output (progress indicators, banners, hints); none of those exist
+/// in the current scaffold, so the flag is effectively a no-op for
+/// successful results. Errors and security-critical warnings are
+/// never suppressed by `--quiet` regardless.
+pub fn print_success<T: Serialize>(data: &T, pretty: bool) {
     let envelope = SuccessEnvelope { ok: true, data };
     let json = if pretty {
         serde_json::to_string_pretty(&envelope)
