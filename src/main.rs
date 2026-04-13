@@ -7,8 +7,10 @@ mod output;
 mod rpc;
 
 use clap::Parser;
+use zeroize::Zeroizing;
 
 use cli::{ChainAction, Cli, Command, StakeAction, WalletAction};
+use commands::password_file;
 use error::BttError;
 
 #[tokio::main]
@@ -22,6 +24,18 @@ async fn main() {
             output::print_error(&e, pretty);
             std::process::exit(1);
         }
+    }
+}
+
+/// Resolve a coldkey password: from `--password-file` if given, otherwise
+/// prompted interactively. Returns a zeroizing string that is wiped on drop.
+fn resolve_coldkey_password(
+    password_file_arg: Option<&str>,
+) -> Result<Zeroizing<String>, BttError> {
+    if let Some(path) = password_file_arg {
+        password_file::read_password_file(path)
+    } else {
+        commands::wallet_keys::read_password("Enter password for coldkey: ")
     }
 }
 
@@ -60,17 +74,21 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                 name,
                 hotkey,
                 n_words,
+                password_file,
             } => {
-                let password = commands::wallet_keys::read_password("Enter password for coldkey: ")?;
+                let password = resolve_coldkey_password(password_file.as_deref())?;
                 let result =
                     commands::wallet_keys::create(&name, &hotkey, n_words, &password)?;
-                // Mnemonic is always shown, even with --quiet
-                output::print_success(&result, pretty, false);
+                output::print_success(&result, pretty);
             }
-            WalletAction::NewColdkey { name, n_words } => {
-                let password = commands::wallet_keys::read_password("Enter password for coldkey: ")?;
+            WalletAction::NewColdkey {
+                name,
+                n_words,
+                password_file,
+            } => {
+                let password = resolve_coldkey_password(password_file.as_deref())?;
                 let result = commands::wallet_keys::new_coldkey(&name, n_words, &password)?;
-                output::print_success(&result, pretty, false);
+                output::print_success(&result, pretty);
             }
             WalletAction::NewHotkey {
                 name,
@@ -78,21 +96,22 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                 n_words,
             } => {
                 let result = commands::wallet_keys::new_hotkey(&name, &hotkey, n_words)?;
-                output::print_success(&result, pretty, false);
+                output::print_success(&result, pretty);
             }
             WalletAction::RegenColdkey {
                 name,
                 mnemonic,
                 seed,
+                password_file,
             } => {
-                let password = commands::wallet_keys::read_password("Enter password for coldkey: ")?;
+                let password = resolve_coldkey_password(password_file.as_deref())?;
                 let result = commands::wallet_keys::regen_coldkey(
                     &name,
                     mnemonic.as_deref(),
                     seed.as_deref(),
                     &password,
                 )?;
-                output::print_success(&result, pretty, quiet);
+                output::print_success(&result, pretty);
             }
             WalletAction::RegenHotkey {
                 name,
@@ -106,18 +125,19 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                     mnemonic.as_deref(),
                     seed.as_deref(),
                 )?;
-                output::print_success(&result, pretty, quiet);
+                output::print_success(&result, pretty);
             }
             WalletAction::Sign {
                 name,
                 hotkey,
                 message,
                 use_hotkey,
+                password_file,
             } => {
                 let password = if use_hotkey {
                     None
                 } else {
-                    Some(commands::wallet_keys::read_password("Enter password for coldkey: ")?)
+                    Some(resolve_coldkey_password(password_file.as_deref())?)
                 };
                 let password_ref = password.as_ref().map(|p| p.as_str());
                 let result = commands::wallet_keys::sign(
@@ -127,7 +147,7 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                     use_hotkey,
                     password_ref,
                 )?;
-                output::print_success(&result, pretty, quiet);
+                output::print_success(&result, pretty);
             }
             WalletAction::Verify {
                 message,
@@ -135,7 +155,7 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                 ss58,
             } => {
                 let result = commands::wallet_keys::verify(&message, &signature, &ss58)?;
-                output::print_success(&result, pretty, quiet);
+                output::print_success(&result, pretty);
             }
         },
         Command::Stake { action } => {
@@ -151,7 +171,7 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                         ss58.as_deref(),
                     )
                     .await?;
-                    output::print_success(&result, pretty, quiet);
+                    output::print_success(&result, pretty);
                 }
                 StakeAction::Add {
                     wallet,
@@ -167,7 +187,7 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                         amount,
                     )
                     .await?;
-                    output::print_success(&result, pretty, quiet);
+                    output::print_success(&result, pretty);
                 }
                 StakeAction::Remove {
                     wallet,
@@ -185,7 +205,7 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                         all,
                     )
                     .await?;
-                    output::print_success(&result, pretty, quiet);
+                    output::print_success(&result, pretty);
                 }
             }
         }

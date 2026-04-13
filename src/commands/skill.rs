@@ -40,24 +40,28 @@ btt wallet list
 
 # Create a new wallet (coldkey + hotkey pair). Prompts for coldkey password
 # on stderr; JSON result (including mnemonic) on stdout.
-btt wallet create --name <name> [--hotkey default] [--n-words 12]
+btt wallet create --name <name> [--hotkey default] [--n-words 12] \
+  [--password-file <path>]
 
 # Generate only a new coldkey for an existing or new wallet
-btt wallet new-coldkey --name <name> [--n-words 12]
+btt wallet new-coldkey --name <name> [--n-words 12] [--password-file <path>]
 
 # Generate a new hotkey for an existing wallet
 btt wallet new-hotkey --name <name> [--hotkey default] [--n-words 12]
 
 # Restore a coldkey from a BIP39 mnemonic or a 0x-prefixed hex seed
-btt wallet regen-coldkey --name <name> (--mnemonic "<phrase>" | --seed 0x...)
+btt wallet regen-coldkey --name <name> (--mnemonic "<phrase>" | --seed 0x...) \
+  [--password-file <path>]
 
 # Restore a hotkey from a BIP39 mnemonic or hex seed
 btt wallet regen-hotkey --name <name> [--hotkey default] \
   (--mnemonic "<phrase>" | --seed 0x...)
 
 # Sign a message with a wallet key. --use-hotkey signs with the (unencrypted)
-# hotkey; otherwise the coldkey is decrypted interactively.
-btt wallet sign --name <name> --message "<msg>" [--use-hotkey] [--hotkey default]
+# hotkey; otherwise the coldkey is decrypted interactively (or via
+# --password-file, which is ignored when --use-hotkey is set).
+btt wallet sign --name <name> --message "<msg>" [--use-hotkey] \
+  [--hotkey default] [--password-file <path>]
 
 # Verify a signature against an SS58 address
 btt wallet verify --message "<msg>" --signature 0x... --ss58 <address>
@@ -66,6 +70,21 @@ btt wallet verify --message "<msg>" --signature 0x... --ss58 <address>
 Coldkeys are encrypted with the btwallet/btcli `$NACL` envelope
 (argon2i13 SENSITIVE + xsalsa20poly1305). Hotkey files and coldkey
 files are written at mode 0600 inside 0700 wallet directories.
+
+#### `--password-file`
+
+Every command that would normally prompt interactively for the coldkey
+password accepts `--password-file <path>` for non-interactive automation.
+The file's first line (up to but not including the trailing newline) is
+taken as the password; content beyond the first newline is ignored.
+
+On unix, btt refuses to read the file if its mode is other-readable
+(`mode & 0o077 != 0`). Ensure the file is mode 0600. Prefer a tmpfs
+(`/dev/shm`) so the bytes never hit a physical disk. Shred the file
+immediately after the command exits.
+
+Do not use `--password-file` with mainnet wallets unless your filesystem,
+process listing, and shell history are all under your control.
 
 ### Stake
 

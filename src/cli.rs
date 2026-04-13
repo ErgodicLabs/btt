@@ -75,6 +75,16 @@ pub enum WalletAction {
         /// Number of mnemonic words (12 or 24)
         #[arg(long, default_value_t = 12)]
         n_words: u32,
+        /// Read coldkey password from file at <path>. For non-interactive
+        /// automation only. The file's first line (up to but not including
+        /// the trailing newline) is taken as the password. Security note:
+        /// anyone who can read the file can recover your password. Ensure
+        /// the file is mode 0600, on a tmpfs (/dev/shm) if possible, and
+        /// shredded immediately after use. Do not use this with mainnet
+        /// wallets unless your filesystem, process listing, and shell
+        /// history are all under your control.
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<String>,
     },
 
     /// Generate a new coldkey only
@@ -85,6 +95,16 @@ pub enum WalletAction {
         /// Number of mnemonic words (12 or 24)
         #[arg(long, default_value_t = 12)]
         n_words: u32,
+        /// Read coldkey password from file at <path>. For non-interactive
+        /// automation only. The file's first line (up to but not including
+        /// the trailing newline) is taken as the password. Security note:
+        /// anyone who can read the file can recover your password. Ensure
+        /// the file is mode 0600, on a tmpfs (/dev/shm) if possible, and
+        /// shredded immediately after use. Do not use this with mainnet
+        /// wallets unless your filesystem, process listing, and shell
+        /// history are all under your control.
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<String>,
     },
 
     /// Generate a new hotkey for an existing wallet
@@ -111,6 +131,16 @@ pub enum WalletAction {
         /// Hex-encoded seed (0x...)
         #[arg(long)]
         seed: Option<String>,
+        /// Read coldkey password from file at <path>. For non-interactive
+        /// automation only. The file's first line (up to but not including
+        /// the trailing newline) is taken as the password. Security note:
+        /// anyone who can read the file can recover your password. Ensure
+        /// the file is mode 0600, on a tmpfs (/dev/shm) if possible, and
+        /// shredded immediately after use. Do not use this with mainnet
+        /// wallets unless your filesystem, process listing, and shell
+        /// history are all under your control.
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<String>,
     },
 
     /// Restore a hotkey from mnemonic or seed
@@ -143,6 +173,17 @@ pub enum WalletAction {
         /// Sign with hotkey instead of coldkey
         #[arg(long, default_value_t = false)]
         use_hotkey: bool,
+        /// Read coldkey password from file at <path>. For non-interactive
+        /// automation only. The file's first line (up to but not including
+        /// the trailing newline) is taken as the password. Security note:
+        /// anyone who can read the file can recover your password. Ensure
+        /// the file is mode 0600, on a tmpfs (/dev/shm) if possible, and
+        /// shredded immediately after use. Do not use this with mainnet
+        /// wallets unless your filesystem, process listing, and shell
+        /// history are all under your control. Ignored when --use-hotkey
+        /// is set.
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<String>,
     },
 
     /// Verify a signature
