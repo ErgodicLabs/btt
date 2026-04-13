@@ -65,14 +65,22 @@ jobs:
           VERBOSE: ${{ inputs.verbose && '1' || '0' }}
         run: |
           chmod +x scripts/dep-audit/audit.sh
+          # The script's exit code is captured into the report's STATUS line
+          # and re-checked by the final step. Bash -e (the default for
+          # GH Actions run blocks) would abort here on script failure and
+          # skip every subsequent step in this same block, so we suspend
+          # it around the script invocation only.
+          set +e
           scripts/dep-audit/audit.sh > audit-report.md 2> audit-stderr.log
-          # Always print the report to the job log
+          script_exit=$?
+          set -e
           echo '--- audit report ---'
           cat audit-report.md
           if [ "${VERBOSE}" = "1" ]; then
             echo '--- stderr ---'
             cat audit-stderr.log
           fi
+          echo "audit_exit=${script_exit}" >> "$GITHUB_OUTPUT"
 
       - name: Find existing comment
         id: find-comment
@@ -126,11 +134,22 @@ jobs:
           retention-days: 90
 
       - name: Fail job on critical findings
+        if: always()
         run: |
           # The audit script exits non-zero if any cargo-audit advisory
           # is present, or if cargo-deny errors out. Re-check the report
-          # for an explicit FAIL marker.
+          # for an explicit STATUS line, and treat a missing report as a
+          # failure too (the script crashed before writing it).
+          if [ ! -s audit-report.md ]; then
+            echo 'audit-report.md missing or empty; the audit script did not run to completion'
+            exit 1
+          fi
+          if ! grep -q '^STATUS: ' audit-report.md; then
+            echo 'audit-report.md has no STATUS line; the audit script crashed mid-run'
+            exit 1
+          fi
           if grep -q '^STATUS: FAIL' audit-report.md; then
             echo 'dep audit reported FAIL'
             exit 1
           fi
+          echo 'dep audit reported PASS'
