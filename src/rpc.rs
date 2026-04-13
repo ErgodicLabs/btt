@@ -29,14 +29,14 @@ pub fn resolve_endpoint(url: Option<&str>, network: Option<&str>) -> Result<Stri
         return Ok(u.to_string());
     }
     match network {
-        Some("finney") => Ok(std::env::var("RPC_DEFAULT_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string())),
-        Some("test") => Ok(std::env::var("RPC_TEST_ENDPOINT").unwrap_or_else(|_| TEST_ENDPOINT.to_string())),
-        Some("local") => Ok(std::env::var("RPC_LOCAL_ENDPOINT").unwrap_or_else(|_| LOCAL_ENDPOINT.to_string())),
+        Some("finney") => Ok(DEFAULT_ENDPOINT.to_string()),
+        Some("test") => Ok(TEST_ENDPOINT.to_string()),
+        Some("local") => Ok(LOCAL_ENDPOINT.to_string()),
         Some(other) => Err(BttError::connection(format!(
             "unrecognized network '{}'. valid options: finney, test, local",
             other
         ))),
-        None => Ok(std::env::var("RPC_DEFAULT_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string())),
+        None => Ok(DEFAULT_ENDPOINT.to_string()),
     }
 }
 
@@ -151,17 +151,5 @@ mod tests {
     #[test]
     fn validate_url_https_returns_error() {
         assert!(validate_url("https://example.com").is_err());
-    }
-
-    // -- env var tests --
-    // Note: Mutating env vars in tests can race if run in parallel, 
-    // but we only set/clear them sequentially here for basic coverage.
-
-    #[test]
-    fn resolve_endpoint_uses_env_var_override() {
-        std::env::set_var("RPC_DEFAULT_ENDPOINT", "wss://custom-env.example.com");
-        let url = resolve_endpoint(None, Some("finney")).expect("should resolve");
-        assert_eq!(url, "wss://custom-env.example.com");
-        std::env::remove_var("RPC_DEFAULT_ENDPOINT");
     }
 }
