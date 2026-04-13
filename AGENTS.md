@@ -47,6 +47,8 @@ This is not a style preference. Agents and scripts must be able to parse `btt` o
 
 Documentation lies. Comments lie. Memoized state lies. When we need to know what the chain says, we query the chain. When we need to know what a contract or runtime does, we read the bytecode or the source. Trust boundaries are drawn around the Substrate RPC connection, not around anything upstream of it.
 
+btcli keyfile format compatibility is verified in CI by `scripts/btcli-compat/check.py` against pinned `pynacl` and `argon2-cffi` primitives, never against `bittensor.*`. The verifier lives only in CI runners and never in dev environments or release artifacts.
+
 ### 5. Barbaric review
 
 Every PR receives one round of hostile review before merge. Reviewers are explicitly instructed to find what is wrong with the change, not to confirm what is right. Findings are classified by severity (CRITICAL, HIGH, MEDIUM, LOW, NIT). Any HIGH or CRITICAL finding blocks merge.
