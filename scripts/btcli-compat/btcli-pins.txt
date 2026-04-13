@@ -1,0 +1,62 @@
+# btcli-compat pinned verification dependencies.
+#
+# These are the ONLY python packages installed into the CI runner for the
+# btcli-compat workflow. Every hash in this file is the sha256 of a
+# specific artifact on files.pythonhosted.org, verified with `curl
+# https://pypi.org/pypi/<pkg>/<ver>/json`.
+#
+# DO NOT add `bittensor`, `btwallet`, `substrate-interface`, `scalecodec`,
+# or any other package from the opentensor/polkascan stacks to this file.
+# The entire reason this workflow exists is to verify the coldkey envelope
+# format *without* those packages ever running on the machine. The only
+# things this pin file authorises the runner to install are:
+#
+#   - pynacl                (libsodium wrapper, for secretbox)
+#   - argon2-cffi           (reference argon2 for the KDF)
+#   - argon2-cffi-bindings  (transitive cffi binding for argon2)
+#   - cffi                  (transitive cffi runtime)
+#   - pycparser             (transitive of cffi; pure python)
+#
+# All hashes verified 2026-04-13 via the pypi JSON API.
+#
+# The workflow runs on `ubuntu-latest` with python 3.11. For each package
+# we include manylinux x86_64 wheel hashes plus the source tarball hash as
+# a fallback. `pip install --require-hashes` will use the first match.
+
+# ── pynacl ────────────────────────────────────────────────────────────
+# https://pypi.org/pypi/pynacl/1.6.2/json
+pynacl==1.6.2 \
+    --hash=sha256:22de65bb9010a725b0dac248f353bb072969c94fa8d6b1f34b87d7953cf7bbe4 \
+    --hash=sha256:8a66d6fb6ae7661c58995f9c6435bda2b1e68b54b598a6a10247bfcdadac996c \
+    --hash=sha256:c8a231e36ec2cab018c4ad4358c386e36eede0319a0c41fed24f840b1dac59f6 \
+    --hash=sha256:018494d6d696ae03c7e656e5e74cdfd8ea1326962cc401bcf018f1ed8436811c
+
+# ── argon2-cffi ───────────────────────────────────────────────────────
+# https://pypi.org/pypi/argon2-cffi/25.1.0/json
+# Pure-python wheel + sdist.
+argon2-cffi==25.1.0 \
+    --hash=sha256:fdc8b074db390fccb6eb4a3604ae7231f219aa669a2652e0f20e16ba513d5741 \
+    --hash=sha256:694ae5cc8a42f4c4e2bf2ca0e64e51e23a040c6a517a85074683d3959e1346c1
+
+# ── argon2-cffi-bindings ──────────────────────────────────────────────
+# https://pypi.org/pypi/argon2-cffi-bindings/25.1.0/json
+argon2-cffi-bindings==25.1.0 \
+    --hash=sha256:d3e924cfc503018a714f94a49a149fdc0b644eaead5d1f089330399134fa028a \
+    --hash=sha256:b957f3e6ea4d55d820e40ff76f450952807013d361a65d7f28acc0acbf29229d
+
+# ── cffi ──────────────────────────────────────────────────────────────
+# https://pypi.org/pypi/cffi/2.0.0/json
+# Include cp311, cp312, and cp313 manylinux wheels so the workflow can
+# bump python minors without a re-pin, plus the sdist fallback.
+cffi==2.0.0 \
+    --hash=sha256:8941aaadaf67246224cee8c3803777eed332a19d909b47e29c9842ef1e79ac26 \
+    --hash=sha256:3e17ed538242334bf70832644a32a7aae3d83b57567f9fd60a26257e992b79ba \
+    --hash=sha256:c8d3b5532fc71b7a77c09192b4a5a200ea992702734a2e9279a37f2478236f26 \
+    --hash=sha256:44d1b5909021139fe36001ae048dbdde8214afa20200eda0f64c068cac5d5529
+
+# ── pycparser ─────────────────────────────────────────────────────────
+# https://pypi.org/pypi/pycparser/3.0/json
+# Pure python.
+pycparser==3.0 \
+    --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992 \
+    --hash=sha256:600f49d217304a5902ac3c37e1281c9fe94e4d0489de643a9504c5cdfdfc6b29

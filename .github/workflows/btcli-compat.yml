@@ -1,0 +1,137 @@
+name: btcli-compat
+
+# Byte-for-byte verification that btt's coldkey envelope is wire-compatible
+# with btcli/btwallet, using pinned pynacl + argon2-cffi primitives only.
+# See scripts/btcli-compat/README.md for the design.
+
+on:
+  pull_request:
+    paths:
+      - "src/commands/wallet_keys.rs"
+      - "src/commands/password_file.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/btcli-compat/**"
+      - ".github/workflows/btcli-compat.yml"
+  push:
+    branches:
+      - main
+  schedule:
+    # Weekly drift detector. If pynacl or argon2-cffi quietly change
+    # semantics in a way our pinned hashes somehow allow, this is how
+    # we find out.
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      btcli_version:
+        description: "Ignored — this workflow never installs btcli. Reserved for future cross-validation."
+        required: false
+        type: string
+      vector_count:
+        description: "Number of compat vectors (max 6)"
+        required: false
+        default: "6"
+        type: string
+      verbose:
+        description: "Echo every btt invocation to stderr"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      # Be explicit about which python the workflow gets. A future
+      # actions/setup-python bump to 3.12 or 3.13 needs a matching
+      # pin file audit.
+      BTCLI_COMPAT_PY: "3.11"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-btcli-compat-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-btcli-compat-
+
+      - name: Build btt (release)
+        run: cargo build --release
+
+      - name: Setup Python ${{ env.BTCLI_COMPAT_PY }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.BTCLI_COMPAT_PY }}
+
+      - name: Install pinned verifier deps
+        # --require-hashes forces every dep (transitive included) to match
+        # a hash in the pin file. If a transitive changes, the install
+        # fails and CI fails, which is the intended behaviour.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --require-hashes \
+              -r scripts/btcli-compat/btcli-pins.txt
+          python -c "import nacl; import argon2; print('nacl', nacl.__version__); print('argon2 ok')"
+
+      - name: Run compat check
+        env:
+          VECTOR_COUNT: ${{ github.event.inputs.vector_count || '6' }}
+          VERBOSE: ${{ github.event.inputs.verbose || 'false' }}
+        run: |
+          set -euo pipefail
+          extra_args=""
+          if [ "${VERBOSE}" = "true" ]; then
+              extra_args="--verbose"
+          fi
+          python scripts/btcli-compat/check.py \
+              --btt-binary ./target/release/btt \
+              --out-dir ./btcli-compat-out \
+              --vector-count "${VECTOR_COUNT}" \
+              ${extra_args}
+
+      - name: Upload compat vectors and report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: btcli-compat-vectors-${{ github.run_id }}
+          path: btcli-compat-out/
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Summarise
+        if: always()
+        run: |
+          if [ -f btcli-compat-out/report.json ]; then
+              python - <<'PY'
+          import json, pathlib, sys
+          rep = json.loads(pathlib.Path("btcli-compat-out/report.json").read_text())
+          print(f"overall: {rep['overall']}")
+          print(f"seed:    {rep['seed']}")
+          for r in rep["results"]:
+              print(
+                  f"  v{r['vector_index']:02d} [{r['label']:<22}] "
+                  f"A={r['btt_to_pynacl']:<4} B={r['pynacl_to_btt']:<4} "
+                  f"{r.get('error') or ''}"
+              )
+          PY
+          else
+              echo "no report.json produced; check.py crashed"
+          fi
