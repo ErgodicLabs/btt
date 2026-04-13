@@ -1,9 +1,9 @@
 name: dep-audit
 
-# Runs cargo-audit, cargo-deny, and cargo-outdated against the repo's
-# dependency tree, and posts a structured summary as a PR comment. This
-# is the basic dep-audit pass; the dep-checksum tripwire (issue #6) is
-# layered on later as a separate workflow.
+# Runs cargo-audit, cargo-deny, cargo-outdated, and the dep-checksum
+# tripwire (issue #6) against the repo's dependency tree, and posts a
+# structured summary as a PR comment. Couples to PR #15 (parallelization);
+# may need coordination if that lands first.
 #
 # Per AGENTS.md principle 1 (dependency discipline), every dep is an
 # attack surface until proven essential. This workflow surfaces the
@@ -82,6 +82,41 @@ jobs:
           fi
           echo "audit_exit=${script_exit}" >> "$GITHUB_OUTPUT"
 
+      - name: Run dep-checksum tripwire
+        id: checksum
+        run: |
+          # Issue #6: same-version-different-bytes tripwire. Compares every
+          # dep in Cargo.lock against the committed DB at
+          # .cryptid/dep-audit/checksums.db. Never passes --update in CI;
+          # any new entry must already be in the committed DB.
+          set +e
+          python3 scripts/dep-audit/checksum.py --report checksum-report.md \
+            > checksum-stdout.log 2> checksum-stderr.log
+          checksum_exit=$?
+          set -e
+          echo '--- checksum report ---'
+          cat checksum-report.md || true
+          if [ -s checksum-stderr.log ]; then
+            echo '--- checksum stderr ---'
+            cat checksum-stderr.log
+          fi
+          # Append the checksum section to the main audit report so the
+          # PR comment carries both in a single body.
+          if [ -s checksum-report.md ]; then
+            printf '\n' >> audit-report.md
+            cat checksum-report.md >> audit-report.md
+          fi
+          echo "checksum_exit=${checksum_exit}" >> "$GITHUB_OUTPUT"
+          # Flip the final STATUS line to FAIL if the tripwire tripped.
+          # The final job step re-parses STATUS to decide pass/fail, so
+          # rewriting the line here is the canonical way to merge the
+          # two scripts' verdicts into one report.
+          if [ "${checksum_exit}" != "0" ]; then
+            if grep -q '^STATUS: PASS' audit-report.md; then
+              sed -i 's/^STATUS: PASS$/STATUS: FAIL/' audit-report.md
+            fi
+          fi
+
       - name: Find existing comment
         id: find-comment
         if: github.event_name == 'pull_request'
@@ -131,6 +166,9 @@ jobs:
           path: |
             audit-report.md
             audit-stderr.log
+            checksum-report.md
+            checksum-stdout.log
+            checksum-stderr.log
           retention-days: 90
 
       - name: Fail job on critical findings
