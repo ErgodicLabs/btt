@@ -1,8 +1,9 @@
 name: dep-audit
 
 # Runs cargo-audit, cargo-deny, and cargo-outdated against the repo's
-# dependency tree in parallel matrix jobs, then combines the three
-# reports into a single structured summary posted as a PR comment.
+# dependency tree in parallel matrix jobs, runs the dep-checksum
+# tripwire (issue #6) in a sibling job, then combines the four reports
+# into a single structured summary posted as a PR comment.
 #
 # Per AGENTS.md principle 1 (dependency discipline), every dep is an
 # attack surface until proven essential. This workflow surfaces the
@@ -12,6 +13,12 @@ name: dep-audit
 # the cache key invalidates whenever we bump a tool, and the install
 # step reads the same file so the binary in the cache matches the
 # version we asked for.
+#
+# The checksum tripwire is its own job (not a matrix entry) because it
+# needs neither the Rust toolchain nor the cargo cache — only python3
+# and the committed DB at .cryptid/dep-audit/checksums.db. Keeping it
+# separate runs it in parallel with the cargo matrix and avoids the
+# toolchain setup cost.
 
 on:
   pull_request:
@@ -102,9 +109,52 @@ jobs:
             status-${{ matrix.tool }}.txt
           retention-days: 90
 
+  checksum:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run dep-checksum tripwire
+        id: run
+        run: |
+          # Issue #6: same-version-different-bytes tripwire. Compares
+          # every dep in Cargo.lock against the committed DB at
+          # .cryptid/dep-audit/checksums.db. Never passes --update in
+          # CI; any new entry must already be in the committed DB.
+          #
+          # python3 is pre-installed on ubuntu-latest runners and the
+          # script has no third-party imports, so no setup step is
+          # required.
+          set +e
+          python3 scripts/dep-audit/checksum.py --report report-checksum.md \
+            > stdout-checksum.log 2> stderr-checksum.log
+          tool_exit=$?
+          set -e
+          printf '%s\n' "${tool_exit}" > 'status-checksum.txt'
+          echo '--- checksum report ---'
+          cat report-checksum.md || true
+          if [ -s stderr-checksum.log ]; then
+            echo '--- checksum stderr ---'
+            cat stderr-checksum.log
+          fi
+          echo "tool_exit=${tool_exit}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload checksum artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dep-audit-checksum-${{ github.run_id }}
+          path: |
+            report-checksum.md
+            stdout-checksum.log
+            stderr-checksum.log
+            status-checksum.txt
+          retention-days: 90
+
   combine:
     runs-on: ubuntu-latest
-    needs: [audit]
+    needs: [audit, checksum]
     if: always()
     steps:
       - name: Checkout
@@ -132,15 +182,16 @@ jobs:
 
           overall_exit=0
           # Fixed order so the combined report is deterministic regardless
-          # of matrix scheduling.
-          for tool in cargo-audit cargo-deny cargo-outdated; do
+          # of matrix scheduling. checksum comes last so the supply-chain
+          # tripwire verdict is the final thing a reviewer sees.
+          for tool in cargo-audit cargo-deny cargo-outdated checksum; do
             artifact_dir="${artifacts_root}/dep-audit-${tool}-${{ github.run_id }}"
             report="${artifact_dir}/report-${tool}.md"
             status_file="${artifact_dir}/status-${tool}.txt"
 
             if [ ! -f "${report}" ]; then
               printf '### %s\n\n' "${tool}" >> "${combined}"
-              printf '(report missing — matrix job crashed before writing output)\n\n' >> "${combined}"
+              printf '(report missing — job crashed before writing output)\n\n' >> "${combined}"
               overall_exit=1
               continue
             fi
@@ -221,7 +272,7 @@ jobs:
         run: |
           overall_exit='${{ steps.combine.outputs.overall_exit }}'
           if [ "${overall_exit}" != "0" ]; then
-            echo 'dep audit reported FAIL (at least one matrix job blocked)'
+            echo 'dep audit reported FAIL (at least one matrix job or checksum tripwire blocked)'
             exit 1
           fi
           echo 'dep audit reported PASS'
