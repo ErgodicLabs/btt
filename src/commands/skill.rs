@@ -110,18 +110,34 @@ both before running any key-generation command with `--force`.
 
 ### Stake
 
+Post-dTAO, subtensor tracks per-subnet *alpha* — the subnet's own token —
+in `SubtensorModule::Alpha`. Each coldkey/hotkey/netuid position is an
+alpha balance, convertible to TAO through the subnet's liquidity pool
+(price = SubnetTAO / SubnetAlphaIn). `btt stake list` uses the
+`StakeInfoRuntimeApi::get_stake_info_for_coldkey` runtime API, which
+resolves alpha shares to alpha balances server-side, then values each
+entry in TAO via the head-block pool price.
+
 ```bash
-# List all stakes for a wallet
+# List all stakes for a wallet (alpha per subnet, plus TAO valuation)
 btt stake list --wallet <name>
 btt stake list --ss58 <address>
 
-# Add stake (TAO from coldkey to hotkey on a subnet)
+# Add stake. add_stake.amount_staked is TaoBalance, so --amount is in TAO.
 btt stake add --wallet <name> --hotkey <ss58> --netuid <u16> --amount <TAO>
 
-# Remove stake (unstake TAO from hotkey back to coldkey)
-btt stake remove --wallet <name> --hotkey <ss58> --netuid <u16> --amount <TAO>
+# Remove stake. remove_stake.amount_unstaked is AlphaBalance, so the
+# amount is in alpha. Pick one of:
+#   --amount-alpha <N>   Submit N alpha directly.
+#   --amount-tao   <N>   Convert ~N TAO -> alpha via head-block price.
+#   --all                Unstake the full current alpha balance.
+btt stake remove --wallet <name> --hotkey <ss58> --netuid <u16> --amount-alpha <ALPHA>
+btt stake remove --wallet <name> --hotkey <ss58> --netuid <u16> --amount-tao <TAO>
 btt stake remove --wallet <name> --hotkey <ss58> --netuid <u16> --all
 ```
+
+Before signing a `remove --all`, btt cross-checks the decrypted keypair's
+public address against `coldkeypub.txt` and refuses to sign on mismatch.
 
 ### Skill
 

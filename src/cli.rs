@@ -254,7 +254,20 @@ pub enum StakeAction {
         amount: f64,
     },
 
-    /// Unstake TAO from hotkey back to coldkey
+    /// Unstake alpha from a hotkey back to the coldkey on a subnet.
+    ///
+    /// The `remove_stake` pallet extrinsic takes its amount in ALPHA (the
+    /// subnet's own token), not TAO. Since dTAO, 1 alpha != 1 TAO on any
+    /// non-root subnet, so you must pick a denomination:
+    ///
+    ///   --amount-alpha <N>   Submit N alpha directly.
+    ///   --amount-tao   <N>   Ask to unstake ~N TAO worth. btt queries the
+    ///                        subnet pool's head-block spot price and
+    ///                        converts to alpha before signing. Slippage
+    ///                        still applies on execution.
+    ///   --all                Unstake the full current alpha balance.
+    ///
+    /// Exactly one of the three must be provided.
     Remove {
         /// Wallet name (coldkey will be decrypted for signing)
         #[arg(long)]
@@ -265,10 +278,19 @@ pub enum StakeAction {
         /// Subnet ID
         #[arg(long)]
         netuid: u16,
-        /// Amount in TAO (e.g. 10.5). Ignored if --all is set.
-        #[arg(long, required_unless_present = "all")]
-        amount: Option<f64>,
-        /// Unstake all TAO from this hotkey on this subnet
+        /// Amount in ALPHA (subnet token). Conflicts with --amount-tao and
+        /// --all. Sent directly as `amount_unstaked` after 9-decimal
+        /// scaling.
+        #[arg(long, conflicts_with_all = ["amount_tao", "all"])]
+        amount_alpha: Option<f64>,
+        /// Amount in TAO. btt queries the subnet's pool price at the head
+        /// block and converts TAO -> alpha before signing. Displayed
+        /// result reports the submitted alpha amount. Conflicts with
+        /// --amount-alpha and --all.
+        #[arg(long, conflicts_with_all = ["amount_alpha", "all"])]
+        amount_tao: Option<f64>,
+        /// Unstake the entire alpha balance on this (hotkey, netuid).
+        /// Conflicts with --amount-alpha and --amount-tao.
         #[arg(long, default_value_t = false)]
         all: bool,
     },

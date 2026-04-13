@@ -201,16 +201,33 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                     wallet,
                     hotkey,
                     netuid,
-                    amount,
+                    amount_alpha,
+                    amount_tao,
                     all,
                 } => {
+                    let source = match (amount_alpha, amount_tao, all) {
+                        (Some(a), None, false) => commands::stake::RemoveAmount::Alpha(a),
+                        (None, Some(t), false) => commands::stake::RemoveAmount::Tao(t),
+                        (None, None, true) => commands::stake::RemoveAmount::All,
+                        (None, None, false) => {
+                            return Err(error::BttError::invalid_input(
+                                "provide exactly one of --amount-alpha, --amount-tao, or --all",
+                            ));
+                        }
+                        _ => {
+                            // clap's conflicts_with_all should prevent this
+                            // at parse time, but defend in depth.
+                            return Err(error::BttError::invalid_input(
+                                "--amount-alpha, --amount-tao, and --all are mutually exclusive",
+                            ));
+                        }
+                    };
                     let result = commands::stake::remove(
                         &endpoint,
                         &wallet,
                         &hotkey,
                         netuid,
-                        amount,
-                        all,
+                        source,
                     )
                     .await?;
                     output::print_success(&result, pretty);
