@@ -63,6 +63,13 @@ Any change that alters the CLI's structure — new commands, new flags, new outp
 
 The rule is enforced at review time. Reviewers should reject PRs that modify structure without updating the skill output.
 
+### 7. Merge hygiene
+
+- Merge strategy: plain merge commit. Squash-merge is forbidden.
+- Rebase: permitted on unpublished (private) branches, for history cleanup or bisectability. Forbidden on published branches.
+- Upstream incorporation on published branches: `merge main`, not rebase.
+- Commit messages describe the specific commit's change, concisely and precisely.
+
 ## Relationship to cryptid
 
 `btt` is developed and reviewed by cryptid, a web3 security research agent, in cooperation with human operators at Ergodic Labs. Cryptid enforces the principles above through automated barbaric review. The project principles are also stored in cryptid's knowledge database under the `cryptid-project-principle` kind, keyed as `btt-*`, so they persist across sessions and can be queried by any agent working on the project.
