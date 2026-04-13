@@ -1,0 +1,155 @@
+name: dep-audit
+
+# Runs cargo-audit, cargo-deny, and cargo-outdated against the repo's
+# dependency tree, and posts a structured summary as a PR comment. This
+# is the basic dep-audit pass; the dep-checksum tripwire (issue #6) is
+# layered on later as a separate workflow.
+#
+# Per AGENTS.md principle 1 (dependency discipline), every dep is an
+# attack surface until proven essential. This workflow surfaces the
+# information; the human reviewer enforces the policy.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Sundays at 04:00 UTC. Catches advisories that land between PRs.
+    - cron: '0 4 * * 0'
+  workflow_dispatch:
+    inputs:
+      verbose:
+        description: 'Verbose output (dump full cargo tree and raw tool output)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo audit / deny / outdated binaries
+        id: cargo-tools-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/bin/cargo-outdated
+          key: cargo-audit-tools-v1
+
+      - name: Install cargo-audit
+        if: steps.cargo-tools-cache.outputs.cache-hit != 'true'
+        run: cargo install --locked cargo-audit
+
+      - name: Install cargo-deny
+        if: steps.cargo-tools-cache.outputs.cache-hit != 'true'
+        run: cargo install --locked cargo-deny
+
+      - name: Install cargo-outdated
+        if: steps.cargo-tools-cache.outputs.cache-hit != 'true'
+        run: cargo install --locked cargo-outdated
+
+      - name: Run dep audit
+        id: audit
+        env:
+          VERBOSE: ${{ inputs.verbose && '1' || '0' }}
+        run: |
+          chmod +x scripts/dep-audit/audit.sh
+          # The script's exit code is captured into the report's STATUS line
+          # and re-checked by the final step. Bash -e (the default for
+          # GH Actions run blocks) would abort here on script failure and
+          # skip every subsequent step in this same block, so we suspend
+          # it around the script invocation only.
+          set +e
+          scripts/dep-audit/audit.sh > audit-report.md 2> audit-stderr.log
+          script_exit=$?
+          set -e
+          echo '--- audit report ---'
+          cat audit-report.md
+          if [ "${VERBOSE}" = "1" ]; then
+            echo '--- stderr ---'
+            cat audit-stderr.log
+          fi
+          echo "audit_exit=${script_exit}" >> "$GITHUB_OUTPUT"
+
+      - name: Find existing comment
+        id: find-comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          result-encoding: string
+          script: |
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const marker = '<!-- cryptid-dep-audit -->';
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            return existing ? String(existing.id) : '';
+
+      - name: Post or update PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = '<!-- cryptid-dep-audit -->\n[cryptid] dep-audit run ' +
+              context.runId + '\n\n' + fs.readFileSync('audit-report.md', 'utf8');
+            const existingId = '${{ steps.find-comment.outputs.result }}';
+            if (existingId) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: parseInt(existingId, 10),
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Upload audit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dep-audit-report-${{ github.run_id }}
+          path: |
+            audit-report.md
+            audit-stderr.log
+          retention-days: 90
+
+      - name: Fail job on critical findings
+        if: always()
+        run: |
+          # The audit script exits non-zero if any cargo-audit advisory
+          # is present, or if cargo-deny errors out. Re-check the report
+          # for an explicit STATUS line, and treat a missing report as a
+          # failure too (the script crashed before writing it).
+          if [ ! -s audit-report.md ]; then
+            echo 'audit-report.md missing or empty; the audit script did not run to completion'
+            exit 1
+          fi
+          if ! grep -q '^STATUS: ' audit-report.md; then
+            echo 'audit-report.md has no STATUS line; the audit script crashed mid-run'
+            exit 1
+          fi
+          if grep -q '^STATUS: FAIL' audit-report.md; then
+            echo 'dep audit reported FAIL'
+            exit 1
+          fi
+          echo 'dep audit reported PASS'
