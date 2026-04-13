@@ -12,8 +12,16 @@
 //!   (`mode & 0o077 != 0`). Fail-closed. The caller is instructed to
 //!   `chmod 600 <path>`.
 //! - We refuse anything that is not a regular file. No FIFOs, no character
-//!   devices, no symlinks-to-devices. A password file is a tiny thing on a
-//!   tmpfs; it should not be a pipe.
+//!   devices, no directories. A password file is a tiny thing on a tmpfs;
+//!   it should not be a pipe.
+//! - On unix, we open with `O_NOFOLLOW` and refuse symlinks entirely. The
+//!   user's intent in `--password-file <path>` is "this exact file", not
+//!   "whatever `<path>` resolves to". Following symlinks would let an
+//!   attacker who can write into the containing directory swap a symlink
+//!   pointing at `~/.ssh/id_rsa` (or any other readable secret) between
+//!   btt's stat and btt's open. We close the TOCTOU window two ways at
+//!   once: refuse symlinks, and derive metadata from the open fd instead
+//!   of re-stat'ing the path. See issue #13.
 //! - Only the first line (up to the first `\n`, optionally dropping `\r`) is
 //!   taken as the password. Content beyond the first newline is discarded,
 //!   so `echo "pw" > /dev/shm/pw` works without trailing-whitespace footguns.
@@ -28,6 +36,8 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -65,13 +75,65 @@ pub fn read_password_file(path: &str) -> Result<Zeroizing<String>, BttError> {
 }
 
 fn read_password_file_inner(path: &Path) -> Result<Zeroizing<String>, BttError> {
-    // `symlink_metadata` would refuse to follow symlinks; `metadata` does
-    // follow. We use `metadata` so users can keep a symlink inside a
-    // 0700 dir pointing at a tmpfs file. The symlink target itself is what
-    // we stat for the permission check.
-    let md = fs::metadata(path).map_err(|e| {
+    // Order matters for security. Issue #13: the previous implementation
+    // called `fs::metadata(path)` first and then `fs::File::open(path)`
+    // later, leaving a TOCTOU window in which an attacker with write access
+    // to the containing directory could swap a symlink between the two
+    // syscalls. btt would validate one file and then read another.
+    //
+    // The fix is two-fold:
+    //   1. Open the file FIRST, with `O_NOFOLLOW` (unix), so symlinks are
+    //      refused outright at open() time.
+    //   2. Derive metadata from the open fd — `file.metadata()` — rather
+    //      than re-stat'ing the path. Once the fd is open, the referent
+    //      cannot change under us.
+    //
+    // On the error paths below, the fd held in `file` is dropped by `?` /
+    // early return, which closes it; no fd leak.
+    #[cfg(unix)]
+    let mut file = {
+        let mut opts = fs::OpenOptions::new();
+        // O_NOFOLLOW: refuse symlinks outright (issue #13).
+        // O_NONBLOCK: don't hang if the caller points us at a FIFO with
+        //   no writer — return immediately so `is_file()` below can reject
+        //   it. Regular files ignore O_NONBLOCK, so this is a no-op on the
+        //   happy path.
+        opts.read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        opts.open(path).map_err(|e| {
+            // ELOOP is the kernel's signal that `path` was a symlink and
+            // O_NOFOLLOW refused it. Surface that plainly so operators
+            // aren't left guessing why a perfectly readable-looking file
+            // won't open.
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                BttError::io(format!(
+                    "password file {} is a symlink; refusing to follow (O_NOFOLLOW). \
+                     Pass the real path or copy the file.",
+                    path.display()
+                ))
+            } else {
+                BttError::io(format!(
+                    "failed to open password file {}: {}",
+                    path.display(),
+                    e
+                ))
+            }
+        })?
+    };
+    #[cfg(not(unix))]
+    let mut file = fs::File::open(path).map_err(|e| {
         BttError::io(format!(
-            "failed to read password file {}: {}",
+            "failed to open password file {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+
+    // Metadata from the open fd. This is what closes the TOCTOU window:
+    // whatever we inspect here is exactly what we'll read below.
+    let md = file.metadata().map_err(|e| {
+        BttError::io(format!(
+            "failed to stat password file {}: {}",
             path.display(),
             e
         ))
@@ -108,14 +170,6 @@ fn read_password_file_inner(path: &Path) -> Result<Zeroizing<String>, BttError> 
             MAX_FILE_BYTES
         )));
     }
-
-    let mut file = fs::File::open(path).map_err(|e| {
-        BttError::io(format!(
-            "failed to open password file {}: {}",
-            path.display(),
-            e
-        ))
-    })?;
 
     let mut buf = Zeroizing::new(Vec::<u8>::with_capacity(md.len() as usize));
     file.read_to_end(&mut buf)
@@ -234,7 +288,7 @@ mod tests {
         let _ = fs::remove_file(&p);
         let err = read_password_file_inner(&p).expect_err("should fail");
         assert!(
-            err.message.contains("failed to read password file"),
+            err.message.contains("failed to open password file"),
             "msg: {}",
             err.message
         );
@@ -243,8 +297,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn rejects_fifo() {
-        // Create a FIFO via libc::mkfifo through std::process since we
-        // don't carry a libc dep; use `mkfifo` via std::process::Command.
+        // Create a FIFO via the `mkfifo` binary. We carry `libc` as a dep
+        // now (issue #13), but shelling out to `mkfifo` keeps the test
+        // identical to its pre-#13 form; the point is that `is_file()` on
+        // an fd opened via `O_NOFOLLOW | O_NONBLOCK` still rejects pipes.
         let p = tmp_path("fifo");
         let _ = fs::remove_file(&p);
         let status = std::process::Command::new("mkfifo")
@@ -286,6 +342,87 @@ mod tests {
             err.message
         );
         fs::remove_dir(&p).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_to_regular_file() {
+        // Issue #13: even a symlink pointing at a perfectly-permissioned
+        // file must be refused. The user asked for the file at `<path>`;
+        // if `<path>` is a symlink, we have no way to know whether it was
+        // swapped in under us.
+        let target = tmp_path("sym-target");
+        let link = tmp_path("sym-link");
+        let _ = fs::remove_file(&link);
+        let _ = fs::remove_file(&target);
+        write_mode(&target, b"pw\n", 0o600);
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        let err = read_password_file_inner(&link).expect_err("should refuse symlink");
+        assert!(
+            err.message.contains("symlink") && err.message.contains("O_NOFOLLOW"),
+            "msg: {}",
+            err.message
+        );
+
+        fs::remove_file(&link).ok();
+        fs::remove_file(&target).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_to_nonexistent_target() {
+        // A dangling symlink is also refused at open() time by O_NOFOLLOW.
+        // Crucially, the error comes from the open() call, not from a
+        // separate stat — so there is no TOCTOU window to race.
+        let link = tmp_path("sym-dangling");
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink("/nonexistent/btt-issue-13/nope", &link).expect("symlink");
+
+        let err = read_password_file_inner(&link).expect_err("should refuse dangling symlink");
+        assert!(
+            err.message.contains("symlink") && err.message.contains("O_NOFOLLOW"),
+            "msg: {}",
+            err.message
+        );
+
+        fs::remove_file(&link).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_in_place_of_regular_file() {
+        // Structural test for the TOCTOU fix. The previous (vulnerable)
+        // implementation would `fs::metadata(path)` first — which follows
+        // symlinks — and then `fs::File::open(path)` later, which also
+        // follows symlinks. An attacker could swap the target between the
+        // two calls and btt would happily read the attacker's file.
+        //
+        // The new implementation opens with `O_NOFOLLOW` and takes
+        // metadata from the *open fd*. Once the fd is open the referent
+        // cannot change. A racing-symlink test is impractical (you can't
+        // reliably win a race in CI), so we assert the structural
+        // property: when `path` is a symlink at all, the function refuses
+        // to open it. This is strictly stronger than "symlinks cannot be
+        // swapped mid-op" — swapping is moot when the initial open
+        // already fails.
+        let target = tmp_path("race-target");
+        let link = tmp_path("race-link");
+        let _ = fs::remove_file(&link);
+        let _ = fs::remove_file(&target);
+        write_mode(&target, b"attacker\n", 0o600);
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        // Even mode 0600 on the target cannot launder the link.
+        let err = read_password_file_inner(&link).expect_err("symlink must be refused");
+        assert!(
+            err.message.contains("O_NOFOLLOW"),
+            "error should name the defense: {}",
+            err.message
+        );
+
+        fs::remove_file(&link).ok();
+        fs::remove_file(&target).ok();
     }
 
     #[test]
