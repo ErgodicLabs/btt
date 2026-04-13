@@ -43,19 +43,28 @@ btt wallet list
 btt wallet create --name <name> [--hotkey default] [--n-words 12] \
   [--password-file <path>]
 
-# Generate only a new coldkey for an existing or new wallet
-btt wallet new-coldkey --name <name> [--n-words 12] [--password-file <path>]
+# Generate only a new coldkey for an existing or new wallet.
+# Refuses to run if <wallet>/coldkey already exists; pass --force to
+# destroy and replace the existing coldkey.
+btt wallet new-coldkey --name <name> [--n-words 12] [--password-file <path>] \
+  [--force]
 
-# Generate a new hotkey for an existing wallet
-btt wallet new-hotkey --name <name> [--hotkey default] [--n-words 12]
+# Generate a new hotkey for an existing wallet.
+# Refuses to run if <wallet>/hotkeys/<hotkey> already exists; pass --force
+# to destroy and replace the existing hotkey.
+btt wallet new-hotkey --name <name> [--hotkey default] [--n-words 12] [--force]
 
-# Restore a coldkey from a BIP39 mnemonic or a 0x-prefixed hex seed
+# Restore a coldkey from a BIP39 mnemonic or a 0x-prefixed hex seed.
+# Refuses to run if <wallet>/coldkey already exists; pass --force to
+# destroy and replace the existing coldkey.
 btt wallet regen-coldkey --name <name> (--mnemonic "<phrase>" | --seed 0x...) \
-  [--password-file <path>]
+  [--password-file <path>] [--force]
 
-# Restore a hotkey from a BIP39 mnemonic or hex seed
+# Restore a hotkey from a BIP39 mnemonic or hex seed.
+# Refuses to run if <wallet>/hotkeys/<hotkey> already exists; pass --force
+# to destroy and replace the existing hotkey.
 btt wallet regen-hotkey --name <name> [--hotkey default] \
-  (--mnemonic "<phrase>" | --seed 0x...)
+  (--mnemonic "<phrase>" | --seed 0x...) [--force]
 
 # Sign a message with a wallet key. --use-hotkey signs with the (unencrypted)
 # hotkey; otherwise the coldkey is decrypted interactively (or via
@@ -85,6 +94,19 @@ immediately after the command exits.
 
 Do not use `--password-file` with mainnet wallets unless your filesystem,
 process listing, and shell history are all under your control.
+
+#### `--force`
+
+`new-coldkey`, `new-hotkey`, `regen-coldkey`, and `regen-hotkey` refuse
+by default to run when the target key file already exists. This
+prevents a second invocation from silently destroying an existing —
+possibly irrecoverable — key. Pass `--force` to acknowledge that the
+existing key file will be deleted and replaced. When `--force` is used,
+btt emits a one-line warning to stderr naming the file being
+destroyed, then proceeds.
+
+Recovering an overwritten key requires its mnemonic or seed. Back up
+both before running any key-generation command with `--force`.
 
 ### Stake
 

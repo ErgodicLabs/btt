@@ -1329,6 +1329,285 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    // ── --force / overwrite guard tests ───────────────────────────────
+    //
+    // These tests share the same shape as the other HOME-mutating tests:
+    // take HOME_LOCK, point HOME at a fresh temp directory, exercise the
+    // command, then restore HOME and blow the temp directory away. They
+    // cover the three interesting points of the guard_overwrite matrix
+    // for each subcommand:
+    //
+    //   1. no flag + no existing file → success (baseline)
+    //   2. no flag + existing file    → error (issue #7 root cause)
+    //   3. --force  + existing file   → success with a new ss58
+    //
+    // The fourth point (--force + no existing file) is implicitly
+    // covered by case 3 — guard_overwrite short-circuits when the file
+    // is absent regardless of the force flag.
+
+    /// Helper: seat HOME at a fresh temp dir and return the temp path.
+    /// The caller is responsible for restoring HOME and removing the dir.
+    fn seat_home(tag: &str) -> (PathBuf, Option<String>) {
+        let tmp = std::env::temp_dir().join(format!(
+            "btt-force-{}-{}-{}",
+            tag,
+            std::process::id(),
+            // Distinct-per-test nonce: we never want two tests to alias
+            // each other's wallet dir if HOME_LOCK is ever relaxed.
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let original_home = std::env::var("HOME").ok();
+        let wallets_parent = tmp.join(".bittensor").join("wallets");
+        std::fs::create_dir_all(&wallets_parent).expect("create temp dir");
+        std::env::set_var("HOME", tmp.to_str().expect("valid path"));
+        (tmp, original_home)
+    }
+
+    fn restore_home(tmp: PathBuf, original: Option<String>) {
+        if let Some(h) = original {
+            std::env::set_var("HOME", &h);
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Pull the error out of a `Result<T, BttError>` without requiring
+    /// `T: Debug` (which our public result types deliberately do not
+    /// implement — they carry secret_phrase/secret_seed). Panics with a
+    /// custom message if the result is `Ok`.
+    fn unwrap_err<T>(r: Result<T, BttError>, ctx: &str) -> BttError {
+        match r {
+            Ok(_) => panic!("{ctx}: expected error, got Ok"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn new_coldkey_no_flag_no_file_succeeds() {
+        let _guard = HOME_LOCK.lock().expect("home lock");
+        let (tmp, original) = seat_home("nc-ok");
+
+        let result = new_coldkey("w", 12, "pw", false);
+
+        restore_home(tmp, original);
+        let result = result.expect("no existing file → should succeed");
+        assert!(result.ss58_address.starts_with('5'));
+    }
+
+    #[test]
+    fn new_coldkey_no_flag_existing_file_errors() {
+        let _guard = HOME_LOCK.lock().expect("home lock");
+        let (tmp, original) = seat_home("nc-refuse");
+
+        let first = new_coldkey("w", 12, "pw", false).expect("first create");
+        // Second call without --force must refuse and must not touch the
+        // existing file. We verify the error is an invalid_input naming
+        // the target path, then re-read the wallet dir and confirm the
+        // original ss58 is untouched.
+        let second = new_coldkey("w", 12, "pw", false);
+
+        let wdir = tmp.join(".bittensor").join("wallets").join("w");
+        let coldkey_exists = wdir.join("coldkey").exists();
+        let pub_after = std::fs::read_to_string(wdir.join("coldkeypub.txt")).ok();
+
+        restore_home(tmp, original);
+        assert!(coldkey_exists, "refusal path must preserve existing coldkey");
+        let err = unwrap_err(second, "existing file + no force");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("coldkey"),
+            "error message should mention coldkey, got: {msg}"
+        );
+        assert!(
+            msg.contains("--force"),
+            "error message should mention --force, got: {msg}"
+        );
+        // coldkeypub.txt should still point at the first key (its JSON
+        // content will contain the first ss58).
+        let pub_after = pub_after.expect("coldkeypub.txt preserved");
+        assert!(
+            pub_after.contains(&first.ss58_address),
+            "pubkey file should still contain the original ss58"
+        );
+    }
+
+    #[test]
+    fn new_coldkey_force_replaces_existing() {
+        let _guard = HOME_LOCK.lock().expect("home lock");
+        let (tmp, original) = seat_home("nc-force");
+
+        let first = new_coldkey("w", 12, "pw", false).expect("first create");
+        let second = new_coldkey("w", 12, "pw", true);
+
+        restore_home(tmp, original);
+        let second = second.expect("--force + existing file → should succeed");
+        assert_ne!(
+            first.ss58_address, second.ss58_address,
+            "force must yield a fresh keypair"
+        );
+        assert!(second.ss58_address.starts_with('5'));
+    }
+
+    #[test]
+    fn new_hotkey_no_flag_no_file_succeeds() {
+        let _guard = HOME_LOCK.lock().expect("home lock");
+        let (tmp, original) = seat_home("nh-ok");
+
+        // new_hotkey needs the wallet dir to exist, so bootstrap with a
+        // coldkey first.
+        let _cr = new_coldkey("w", 12, "pw", false).expect("bootstrap coldkey");
+        let result = new_hotkey("w", "default", 12, false);
+
+        restore_home(tmp, original);
+        let result = result.expect("no existing hotkey → should succeed");
+        assert!(result.ss58_address.starts_with('5'));
+    }
+
+    #[test]
+    fn new_hotkey_no_flag_existing_file_errors() {
+        let _guard = HOME_LOCK.lock().expect("home lock");
+        let (tmp, original) = seat_home("nh-refuse");
+
+        let _cr = new_coldkey("w", 12, "pw", false).expect("bootstrap coldkey");
+        let first = new_hotkey("w", "default", 12, false).expect("first hotkey");
+        let second = new_hotkey("w", "default", 12, false);
+
+        let wdir = tmp.join(".bittensor").join("wallets").join("w");
+        let hotkey_file = wdir.join("hotkeys").join("default");
+        let preserved = std::fs::read_to_string(&hotkey_file).ok();
+
+        restore_home(tmp, original);
+        let err = unwrap_err(second, "existing hotkey + no force");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("hotkey"), "error should mention hotkey: {msg}");
+        assert!(msg.contains("--force"), "error should mention --force: {msg}");
+        // The on-disk hotkey JSON must still carry the original ss58.
+        let preserved = preserved.expect("hotkey file preserved");
+        assert!(
+            preserved.contains(&first.ss58_address),
+            "refusal path must preserve the original hotkey"
+        );
+    }
+
+    #[test]
+    fn new_hotkey_force_replaces_existing() {
+        let _guard = HOME_LOCK.lock().expect("home lock");
+        let (tmp, original) = seat_home("nh-force");
+
+        let _cr = new_coldkey("w", 12, "pw", false).expect("bootstrap coldkey");
+        let first = new_hotkey("w", "default", 12, false).expect("first hotkey");
+        let second = new_hotkey("w", "default", 12, true);
+
+        restore_home(tmp, original);
+        let second = second.expect("--force + existing hotkey → should succeed");
+        assert_ne!(
+            first.ss58_address, second.ss58_address,
+            "force must yield a fresh hotkey"
+        );
+    }
+
+    #[test]
+    fn regen_coldkey_no_flag_existing_file_errors() {
+        let _guard = HOME_LOCK.lock().expect("home lock");
+        let (tmp, original) = seat_home("rc-refuse");
+
+        let first = new_coldkey("w", 12, "pw", false).expect("first create");
+        // Use the freshly generated mnemonic to drive regen; we don't care
+        // about the identity it produces, only that regen refuses.
+        let phrase = first.mnemonic.clone();
+        let second = regen_coldkey("w", Some(&phrase), None, "pw", false);
+
+        restore_home(tmp, original);
+        let err = unwrap_err(second, "existing coldkey + no force (regen)");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("coldkey"), "error should mention coldkey: {msg}");
+        assert!(msg.contains("--force"), "error should mention --force: {msg}");
+    }
+
+    #[test]
+    fn regen_coldkey_force_replaces_existing() {
+        let _guard = HOME_LOCK.lock().expect("home lock");
+        let (tmp, original) = seat_home("rc-force");
+
+        let first = new_coldkey("w", 12, "pw", false).expect("first create");
+        // Regen from the *same* mnemonic under --force and assert the
+        // operation succeeds and reproduces the same ss58 (mnemonic is
+        // deterministic). This is also a lightweight sanity check that
+        // the force path is not accidentally generating a different key.
+        let regen = regen_coldkey("w", Some(&first.mnemonic), None, "pw", true);
+
+        restore_home(tmp, original);
+        let regen = regen.expect("--force + existing coldkey → should succeed");
+        assert_eq!(
+            regen.ss58_address, first.ss58_address,
+            "regen from same mnemonic should reproduce the ss58"
+        );
+    }
+
+    #[test]
+    fn regen_coldkey_no_flag_no_file_succeeds() {
+        let _guard = HOME_LOCK.lock().expect("home lock");
+        let (tmp, original) = seat_home("rc-ok");
+
+        // Produce a mnemonic outside the HOME-scoped wallet dir so we can
+        // drive regen without having first written a coldkey.
+        let (_pair, phrase, _seed) = generate_keypair(12).expect("gen");
+
+        let result = regen_coldkey("w", Some(&phrase), None, "pw", false);
+
+        restore_home(tmp, original);
+        let _result = result.expect("no existing file + no force → should succeed");
+    }
+
+    #[test]
+    fn regen_hotkey_no_flag_existing_file_errors() {
+        let _guard = HOME_LOCK.lock().expect("home lock");
+        let (tmp, original) = seat_home("rh-refuse");
+
+        let _cr = new_coldkey("w", 12, "pw", false).expect("bootstrap coldkey");
+        let first = new_hotkey("w", "default", 12, false).expect("first hotkey");
+        let second = regen_hotkey("w", "default", Some(&first.mnemonic), None, false);
+
+        restore_home(tmp, original);
+        let err = unwrap_err(second, "existing hotkey + no force (regen)");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("hotkey"), "error should mention hotkey: {msg}");
+        assert!(msg.contains("--force"), "error should mention --force: {msg}");
+    }
+
+    #[test]
+    fn regen_hotkey_force_replaces_existing() {
+        let _guard = HOME_LOCK.lock().expect("home lock");
+        let (tmp, original) = seat_home("rh-force");
+
+        let _cr = new_coldkey("w", 12, "pw", false).expect("bootstrap coldkey");
+        let first = new_hotkey("w", "default", 12, false).expect("first hotkey");
+        let regen = regen_hotkey("w", "default", Some(&first.mnemonic), None, true);
+
+        restore_home(tmp, original);
+        let regen = regen.expect("--force + existing hotkey → should succeed");
+        assert_eq!(
+            regen.ss58_address, first.ss58_address,
+            "regen from same mnemonic should reproduce the hotkey ss58"
+        );
+    }
+
+    #[test]
+    fn regen_hotkey_no_flag_no_file_succeeds() {
+        let _guard = HOME_LOCK.lock().expect("home lock");
+        let (tmp, original) = seat_home("rh-ok");
+
+        let _cr = new_coldkey("w", 12, "pw", false).expect("bootstrap coldkey");
+        // Bootstrap wallet dir exists via new_coldkey; no hotkey yet.
+        let (_pair, phrase, _seed) = generate_keypair(12).expect("gen");
+        let result = regen_hotkey("w", "default", Some(&phrase), None, false);
+
+        restore_home(tmp, original);
+        let _result = result.expect("no existing hotkey → should succeed");
+    }
+
     #[test]
     fn regen_coldkey_from_mnemonic() {
         let _guard = HOME_LOCK.lock().expect("home lock");
