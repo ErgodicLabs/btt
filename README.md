@@ -45,6 +45,16 @@ On unix, btt refuses to read the file if its mode is other-readable. Do not
 use `--password-file` with mainnet wallets unless your filesystem, process
 listing, and shell history are all under your control.
 
+## Overwrite protection
+
+The key-generation subcommands (`wallet new-coldkey`, `wallet new-hotkey`,
+`wallet regen-coldkey`, `wallet regen-hotkey`) refuse by default to run
+when the target key file already exists, and emit an error naming the
+file. Pass `--force` to acknowledge that the existing key will be deleted
+and replaced; when `--force` is used, btt writes a one-line warning to
+stderr naming the file being destroyed. Recovering an overwritten key
+requires its mnemonic or seed, so back both up before forcing.
+
 ## btcli format compatibility
 
 btt's coldkey envelope (`$NACL` + argon2i13 SENSITIVE + xsalsa20poly1305) is

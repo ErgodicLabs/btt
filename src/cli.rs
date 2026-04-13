@@ -105,6 +105,13 @@ pub enum WalletAction {
         /// history are all under your control.
         #[arg(long, value_name = "PATH")]
         password_file: Option<String>,
+        /// Overwrite an existing coldkey file if one is present. Without
+        /// this flag, the command refuses to run when the target key file
+        /// already exists. The existing coldkey is destroyed before the
+        /// new one is written; recovering the old key requires its
+        /// mnemonic or seed.
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
 
     /// Generate a new hotkey for an existing wallet
@@ -118,6 +125,13 @@ pub enum WalletAction {
         /// Number of mnemonic words (12 or 24)
         #[arg(long, default_value_t = 12)]
         n_words: u32,
+        /// Overwrite an existing hotkey file if one is present. Without
+        /// this flag, the command refuses to run when the target key file
+        /// already exists. The existing hotkey is destroyed before the
+        /// new one is written; recovering the old key requires its
+        /// mnemonic or seed.
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
 
     /// Restore a coldkey from mnemonic or seed
@@ -141,6 +155,12 @@ pub enum WalletAction {
         /// history are all under your control.
         #[arg(long, value_name = "PATH")]
         password_file: Option<String>,
+        /// Overwrite an existing coldkey file if one is present. Without
+        /// this flag, the command refuses to run when the target key file
+        /// already exists. The existing coldkey is destroyed before the
+        /// restored one is written.
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
 
     /// Restore a hotkey from mnemonic or seed
@@ -157,6 +177,12 @@ pub enum WalletAction {
         /// Hex-encoded seed (0x...)
         #[arg(long)]
         seed: Option<String>,
+        /// Overwrite an existing hotkey file if one is present. Without
+        /// this flag, the command refuses to run when the target key file
+        /// already exists. The existing hotkey is destroyed before the
+        /// restored one is written.
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
 
     /// Sign a message with a wallet key
