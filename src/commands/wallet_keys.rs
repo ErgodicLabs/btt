@@ -1,12 +1,13 @@
 use std::fs;
+use std::io::Write;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
-use sp_core::crypto::{Ss58Codec, Pair as TraitPair};
+use sp_core::crypto::{Pair as TraitPair, Ss58Codec};
 use sp_core::sr25519::{Pair, Public, Signature};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::BttError;
 
@@ -128,14 +129,25 @@ fn extract_ss58_from_content(content: &str) -> Option<String> {
     None
 }
 
-// btcli uses scrypt with n=2^18, r=8, p=1 for key derivation
-const SCRYPT_LOG_N: u8 = 18;
-const SCRYPT_R: u32 = 8;
-const SCRYPT_P: u32 = 1;
-const SCRYPT_DKLEN: usize = 32;
-
-// NaCl secretbox nonce length
-const NONCE_LEN: usize = 24;
+// btcli / btwallet on-disk envelope for encrypted coldkeys.
+//
+// Format: b"$NACL" || nonce (24 bytes) || secretbox_ciphertext
+//
+// KDF: libsodium `pwhash::argon2i13::derive_key` with
+//   OPSLIMIT_SENSITIVE = 8, MEMLIMIT_SENSITIVE = 512 MiB, salt = NACL_SALT.
+// Mapped onto the RustCrypto `argon2` crate as
+//   Algorithm = Argon2i, Version = V0x13, t_cost = 8, m_cost = 524288 KiB,
+//   parallelism = 1, output = 32 bytes.
+//
+// Reference: opentensor/btwallet src/keyfile.rs (NACL_SALT, derive_key,
+// encrypt_keyfile_data, decrypt_keyfile_data).
+const NACL_SALT: &[u8; 16] = b"\x13q\x83\xdf\xf1Z\t\xbc\x9c\x90\xb5Q\x879\xe9\xb1";
+const NACL_MAGIC: &[u8; 5] = b"$NACL";
+const NACL_KEY_LEN: usize = 32;
+const NACL_NONCE_LEN: usize = 24;
+const ARGON2_T_COST: u32 = 8;
+const ARGON2_M_COST_KIB: u32 = 524_288; // 512 MiB
+const ARGON2_PARALLELISM: u32 = 1;
 
 // ── Output types ──────────────────────────────────────────────────────────
 
@@ -226,16 +238,18 @@ pub fn create(
 
     // Build the JSON for the coldkey
     let cold_json = build_key_json(&cold_pair, &cold_phrase, &cold_seed_hex);
-    let cold_json_str = serde_json::to_string(&cold_json)
+    let mut cold_json_str = serde_json::to_string(&cold_json)
         .map_err(|e| BttError::io(format!("failed to serialize coldkey: {}", e)))?;
 
-    // Encrypt and write coldkey
+    // Encrypt and write coldkey into a 0700 wallet directory
     let wallet_dir = wallet_path(wallet_name)?;
-    fs::create_dir_all(&wallet_dir)
-        .map_err(|e| BttError::io(format!("failed to create wallet directory: {}", e)))?;
+    ensure_wallets_root()?;
+    ensure_secure_dir(&wallet_dir)?;
 
-    let encrypted = encrypt_key_data(cold_json_str.as_bytes(), password)?;
+    let mut encrypted = encrypt_key_data(cold_json_str.as_bytes(), password)?;
     write_secure_file(&wallet_dir.join("coldkey"), &encrypted)?;
+    encrypted.zeroize();
+    cold_json_str.zeroize();
 
     // Write coldkeypub.txt (unencrypted public info)
     let pub_data = build_pub_key_json(&cold_pair);
@@ -250,19 +264,18 @@ pub fn create(
     let hot_seed_hex = format!("0x{}", hex::encode(hot_seed));
 
     let hot_json = build_key_json(&hot_pair, &hot_phrase, &hot_seed_hex);
-    let hot_json_str = serde_json::to_string(&hot_json)
+    let mut hot_json_str = serde_json::to_string(&hot_json)
         .map_err(|e| BttError::io(format!("failed to serialize hotkey: {}", e)))?;
 
-    // Write hotkey (unencrypted)
+    // Write hotkey as an unencrypted file with 0600 perms inside a 0700 dir.
     let hotkeys_dir = wallet_dir.join("hotkeys");
-    fs::create_dir_all(&hotkeys_dir)
-        .map_err(|e| BttError::io(format!("failed to create hotkeys directory: {}", e)))?;
-    fs::write(hotkeys_dir.join(hotkey_name), &hot_json_str)
-        .map_err(|e| BttError::io(format!("failed to write hotkey: {}", e)))?;
+    ensure_secure_dir(&hotkeys_dir)?;
+    write_secure_file(&hotkeys_dir.join(hotkey_name), hot_json_str.as_bytes())?;
+    hot_json_str.zeroize();
 
     let mnemonic_out = cold_phrase.clone();
 
-    // Zeroize sensitive material
+    // Zeroize sensitive material that will not be returned to the caller.
     cold_phrase.zeroize();
     cold_seed.zeroize();
     hot_phrase.zeroize();
@@ -289,15 +302,17 @@ pub fn new_coldkey(
     let seed_hex = format!("0x{}", hex::encode(seed));
 
     let json = build_key_json(&pair, &phrase, &seed_hex);
-    let json_str = serde_json::to_string(&json)
+    let mut json_str = serde_json::to_string(&json)
         .map_err(|e| BttError::io(format!("failed to serialize coldkey: {}", e)))?;
 
     let wallet_dir = wallet_path(wallet_name)?;
-    fs::create_dir_all(&wallet_dir)
-        .map_err(|e| BttError::io(format!("failed to create wallet directory: {}", e)))?;
+    ensure_wallets_root()?;
+    ensure_secure_dir(&wallet_dir)?;
 
-    let encrypted = encrypt_key_data(json_str.as_bytes(), password)?;
+    let mut encrypted = encrypt_key_data(json_str.as_bytes(), password)?;
     write_secure_file(&wallet_dir.join("coldkey"), &encrypted)?;
+    encrypted.zeroize();
+    json_str.zeroize();
 
     let pub_data = build_pub_key_json(&pair);
     let pub_json_str = serde_json::to_string(&pub_data)
@@ -339,14 +354,13 @@ pub fn new_hotkey(
     let seed_hex = format!("0x{}", hex::encode(seed));
 
     let json = build_key_json(&pair, &phrase, &seed_hex);
-    let json_str = serde_json::to_string(&json)
+    let mut json_str = serde_json::to_string(&json)
         .map_err(|e| BttError::io(format!("failed to serialize hotkey: {}", e)))?;
 
     let hotkeys_dir = wallet_dir.join("hotkeys");
-    fs::create_dir_all(&hotkeys_dir)
-        .map_err(|e| BttError::io(format!("failed to create hotkeys directory: {}", e)))?;
-    fs::write(hotkeys_dir.join(hotkey_name), &json_str)
-        .map_err(|e| BttError::io(format!("failed to write hotkey: {}", e)))?;
+    ensure_secure_dir(&hotkeys_dir)?;
+    write_secure_file(&hotkeys_dir.join(hotkey_name), json_str.as_bytes())?;
+    json_str.zeroize();
 
     let mnemonic_out = phrase.clone();
 
@@ -368,20 +382,24 @@ pub fn regen_coldkey(
     seed_hex: Option<&str>,
     password: &str,
 ) -> Result<RegenResult, BttError> {
-    let (pair, phrase, seed) = recover_keypair(mnemonic, seed_hex)?;
+    let (pair, mut phrase, mut seed) = recover_keypair(mnemonic, seed_hex)?;
     let ss58 = pair.public().to_ss58check();
     let seed_hex_str = format!("0x{}", hex::encode(seed));
 
     let json = build_key_json(&pair, &phrase, &seed_hex_str);
-    let json_str = serde_json::to_string(&json)
+    let mut json_str = serde_json::to_string(&json)
         .map_err(|e| BttError::io(format!("failed to serialize coldkey: {}", e)))?;
 
     let wallet_dir = wallet_path(wallet_name)?;
-    fs::create_dir_all(&wallet_dir)
-        .map_err(|e| BttError::io(format!("failed to create wallet directory: {}", e)))?;
+    ensure_wallets_root()?;
+    ensure_secure_dir(&wallet_dir)?;
 
-    let encrypted = encrypt_key_data(json_str.as_bytes(), password)?;
+    let mut encrypted = encrypt_key_data(json_str.as_bytes(), password)?;
     write_secure_file(&wallet_dir.join("coldkey"), &encrypted)?;
+    encrypted.zeroize();
+    json_str.zeroize();
+    phrase.zeroize();
+    seed.zeroize();
 
     let pub_data = build_pub_key_json(&pair);
     let pub_json_str = serde_json::to_string(&pub_data)
@@ -411,19 +429,20 @@ pub fn regen_hotkey(
         )));
     }
 
-    let (pair, phrase, seed) = recover_keypair(mnemonic, seed_hex)?;
+    let (pair, mut phrase, mut seed) = recover_keypair(mnemonic, seed_hex)?;
     let ss58 = pair.public().to_ss58check();
     let seed_hex_str = format!("0x{}", hex::encode(seed));
 
     let json = build_key_json(&pair, &phrase, &seed_hex_str);
-    let json_str = serde_json::to_string(&json)
+    let mut json_str = serde_json::to_string(&json)
         .map_err(|e| BttError::io(format!("failed to serialize hotkey: {}", e)))?;
 
     let hotkeys_dir = wallet_dir.join("hotkeys");
-    fs::create_dir_all(&hotkeys_dir)
-        .map_err(|e| BttError::io(format!("failed to create hotkeys directory: {}", e)))?;
-    fs::write(hotkeys_dir.join(hotkey_name), &json_str)
-        .map_err(|e| BttError::io(format!("failed to write hotkey: {}", e)))?;
+    ensure_secure_dir(&hotkeys_dir)?;
+    write_secure_file(&hotkeys_dir.join(hotkey_name), json_str.as_bytes())?;
+    json_str.zeroize();
+    phrase.zeroize();
+    seed.zeroize();
 
     Ok(RegenHotkeyResult {
         wallet_name: wallet_name.to_string(),
@@ -493,9 +512,12 @@ pub fn verify(message: &str, signature_hex: &str, ss58: &str) -> Result<VerifyRe
 // ── Internal helpers ──────────────────────────────────────────────────────
 
 fn validate_n_words(n: u32) -> Result<(), BttError> {
-    if n != 12 && n != 24 {
+    // sp-core's `generate_with_phrase` is fixed at 12 words. 24-word support
+    // previously relied on a direct `bip39` dep which has been removed per
+    // dependency-discipline review; it will return in a follow-up PR.
+    if n != 12 {
         return Err(BttError::invalid_input(
-            "n-words must be 12 or 24",
+            "n-words must be 12 (24-word support pending follow-up)",
         ));
     }
     Ok(())
@@ -510,15 +532,24 @@ fn wallet_path(name: &str) -> Result<PathBuf, BttError> {
         .join(name))
 }
 
-/// Generate an sr25519 keypair with a BIP39 mnemonic of the specified word count.
-fn generate_keypair(n_words: u32) -> Result<(Pair, String, [u8; 32]), BttError> {
-    let mnemonic = bip39::Mnemonic::generate(n_words as usize)
-        .map_err(|e| BttError::crypto(format!("failed to generate mnemonic: {}", e)))?;
-    let phrase = mnemonic.words().collect::<Vec<_>>().join(" ");
+/// Ensure `~/.bittensor` and `~/.bittensor/wallets` exist at mode 0700.
+fn ensure_wallets_root() -> Result<(), BttError> {
+    let home =
+        std::env::var("HOME").map_err(|_| BttError::io("HOME environment variable not set"))?;
+    let bittensor = PathBuf::from(&home).join(".bittensor");
+    ensure_secure_dir(&bittensor)?;
+    ensure_secure_dir(&bittensor.join("wallets"))?;
+    Ok(())
+}
 
-    let (pair, seed) = Pair::from_phrase(&phrase, None)
-        .map_err(|e| BttError::crypto(format!("failed to derive keypair from mnemonic: {:?}", e)))?;
-
+/// Generate an sr25519 keypair with a BIP39 mnemonic.
+/// Uses `sp_core::sr25519::Pair::generate_with_phrase`, which drives BIP39 via
+/// the transitive `substrate-bip39` / `parity-bip39` crates — no direct `bip39`
+/// dep required. sp-core only exposes 12-word generation; 24-word generation
+/// was removed in this PR pending a follow-up that doesn't require pulling a
+/// bip39 crate back in for wordlist access.
+fn generate_keypair(_n_words: u32) -> Result<(Pair, String, [u8; 32]), BttError> {
+    let (pair, phrase, seed) = <Pair as TraitPair>::generate_with_phrase(None);
     Ok((pair, phrase, seed))
 }
 
@@ -584,93 +615,121 @@ fn build_pub_key_json(pair: &Pair) -> PubKeyFileData {
     }
 }
 
-/// Encrypt key data using NaCl secretbox (XSalsa20-Poly1305) with
-/// password-derived key via scrypt. Matches btcli's encryption format.
+/// Derive a 32-byte NaCl secretbox key from a password using libsodium's
+/// `argon2i13::derive_key` parameters (Argon2i, v0x13, t=8, m=512 MiB, p=1,
+/// hardcoded `NACL_SALT`). Byte-for-byte compatible with btwallet/btcli.
+fn derive_key(password: &[u8]) -> Result<Zeroizing<[u8; NACL_KEY_LEN]>, BttError> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+
+    let params = Params::new(
+        ARGON2_M_COST_KIB,
+        ARGON2_T_COST,
+        ARGON2_PARALLELISM,
+        Some(NACL_KEY_LEN),
+    )
+    .map_err(|e| BttError::crypto(format!("invalid argon2 parameters: {}", e)))?;
+    let argon2 = Argon2::new(Algorithm::Argon2i, Version::V0x13, params);
+
+    let mut key = Zeroizing::new([0u8; NACL_KEY_LEN]);
+    argon2
+        .hash_password_into(password, NACL_SALT, key.as_mut_slice())
+        .map_err(|e| BttError::crypto(format!("argon2 key derivation failed: {}", e)))?;
+    Ok(key)
+}
+
+/// Encrypt key data with the btwallet NaCl envelope:
+///   b"$NACL" || nonce (24 bytes) || secretbox_seal(plaintext, nonce, key)
 fn encrypt_key_data(plaintext: &[u8], password: &str) -> Result<Vec<u8>, BttError> {
     use rand::RngCore;
-    use scrypt::scrypt;
     use xsalsa20poly1305::aead::Aead;
     use xsalsa20poly1305::{KeyInit, XSalsa20Poly1305};
 
-    // Derive key from password using scrypt
-    let mut salt = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut salt);
+    let key = derive_key(password.as_bytes())?;
 
-    let params = scrypt::Params::new(SCRYPT_LOG_N, SCRYPT_R, SCRYPT_P, SCRYPT_DKLEN)
-        .map_err(|e| BttError::crypto(format!("invalid scrypt parameters: {}", e)))?;
-
-    let mut key = [0u8; SCRYPT_DKLEN];
-    scrypt(password.as_bytes(), &salt, &params, &mut key)
-        .map_err(|e| BttError::crypto(format!("scrypt key derivation failed: {}", e)))?;
-
-    // Generate nonce
-    let mut nonce_bytes = [0u8; NONCE_LEN];
+    let mut nonce_bytes = [0u8; NACL_NONCE_LEN];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce = xsalsa20poly1305::Nonce::from(nonce_bytes);
 
-    // Encrypt
-    let cipher = XSalsa20Poly1305::new(xsalsa20poly1305::Key::from_slice(&key));
+    let cipher = XSalsa20Poly1305::new(xsalsa20poly1305::Key::from_slice(key.as_slice()));
     let ciphertext = cipher
         .encrypt(&nonce, plaintext)
         .map_err(|e| BttError::crypto(format!("encryption failed: {}", e)))?;
 
-    // Format: salt (16) || nonce (24) || ciphertext
-    let mut output = Vec::with_capacity(salt.len() + NONCE_LEN + ciphertext.len());
-    output.extend_from_slice(&salt);
+    let mut output = Vec::with_capacity(NACL_MAGIC.len() + NACL_NONCE_LEN + ciphertext.len());
+    output.extend_from_slice(NACL_MAGIC);
     output.extend_from_slice(&nonce_bytes);
     output.extend_from_slice(&ciphertext);
-
-    key.zeroize();
-
     Ok(output)
 }
 
-/// Decrypt key data encrypted with encrypt_key_data.
+/// Decrypt a btwallet-format NaCl envelope.
 fn decrypt_key_data(encrypted: &[u8], password: &str) -> Result<Vec<u8>, BttError> {
-    use scrypt::scrypt;
     use xsalsa20poly1305::aead::Aead;
     use xsalsa20poly1305::{KeyInit, XSalsa20Poly1305};
 
-    let min_len = 16 + NONCE_LEN + 16; // salt + nonce + poly1305 tag
-    if encrypted.len() < min_len {
+    if !encrypted.starts_with(NACL_MAGIC) {
+        return Err(BttError::crypto(
+            "unrecognized keyfile format (missing $NACL magic)",
+        ));
+    }
+    let body = &encrypted[NACL_MAGIC.len()..];
+    if body.len() < NACL_NONCE_LEN + 16 {
         return Err(BttError::crypto("encrypted data too short"));
     }
+    let (nonce_bytes, ciphertext) = body.split_at(NACL_NONCE_LEN);
 
-    let salt = &encrypted[..16];
-    let nonce_bytes = &encrypted[16..16 + NONCE_LEN];
-    let ciphertext = &encrypted[16 + NONCE_LEN..];
-
-    let params = scrypt::Params::new(SCRYPT_LOG_N, SCRYPT_R, SCRYPT_P, SCRYPT_DKLEN)
-        .map_err(|e| BttError::crypto(format!("invalid scrypt parameters: {}", e)))?;
-
-    let mut key = [0u8; SCRYPT_DKLEN];
-    scrypt(password.as_bytes(), salt, &params, &mut key)
-        .map_err(|e| BttError::crypto(format!("scrypt key derivation failed: {}", e)))?;
+    let key = derive_key(password.as_bytes())?;
 
     let nonce = xsalsa20poly1305::Nonce::from_slice(nonce_bytes);
-    let cipher = XSalsa20Poly1305::new(xsalsa20poly1305::Key::from_slice(&key));
+    let cipher = XSalsa20Poly1305::new(xsalsa20poly1305::Key::from_slice(key.as_slice()));
 
-    let plaintext = cipher
+    cipher
         .decrypt(nonce, ciphertext)
-        .map_err(|_| BttError::crypto("decryption failed — wrong password or corrupted file"))?;
-
-    key.zeroize();
-
-    Ok(plaintext)
+        .map_err(|_| BttError::crypto("decryption failed — wrong password or corrupted file"))
 }
 
-/// Write a file and set permissions to 0600 on unix.
-fn write_secure_file(path: &PathBuf, data: &[u8]) -> Result<(), BttError> {
-    fs::write(path, data)
-        .map_err(|e| BttError::io(format!("failed to write {}: {}", path.display(), e)))?;
-
-    #[cfg(unix)]
-    {
-        let perms = std::fs::Permissions::from_mode(0o600);
-        fs::set_permissions(path, perms)
-            .map_err(|e| BttError::io(format!("failed to set permissions on {}: {}", path.display(), e)))?;
+/// Create a file at `path` with mode 0600 (unix) atomically via `O_CREAT|O_EXCL`,
+/// write `data`, fsync, and close. Fails if the file already exists unless the
+/// existing file can be removed first (callers that intend to overwrite should
+/// delete first). No TOCTOU window at 0644.
+fn write_secure_file(path: &Path, data: &[u8]) -> Result<(), BttError> {
+    // If the file exists, remove it first; we want to replace atomically.
+    if path.exists() {
+        fs::remove_file(path)
+            .map_err(|e| BttError::io(format!("failed to remove {}: {}", path.display(), e)))?;
     }
 
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(path)
+        .map_err(|e| BttError::io(format!("failed to create {}: {}", path.display(), e)))?;
+    f.write_all(data)
+        .map_err(|e| BttError::io(format!("failed to write {}: {}", path.display(), e)))?;
+    f.sync_all()
+        .map_err(|e| BttError::io(format!("failed to sync {}: {}", path.display(), e)))?;
+    Ok(())
+}
+
+/// Create (or tighten) a directory at `path` with mode 0700 on unix.
+fn ensure_secure_dir(path: &Path) -> Result<(), BttError> {
+    fs::create_dir_all(path)
+        .map_err(|e| BttError::io(format!("failed to create directory {}: {}", path.display(), e)))?;
+    #[cfg(unix)]
+    {
+        let perms = fs::Permissions::from_mode(0o700);
+        fs::set_permissions(path, perms).map_err(|e| {
+            BttError::io(format!(
+                "failed to set permissions on {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+    }
     Ok(())
 }
 
@@ -743,10 +802,18 @@ fn pair_from_key_json(json_str: &str) -> Result<Pair, BttError> {
     ))
 }
 
-/// Read password from terminal with no echo.
-pub fn read_password(prompt: &str) -> Result<String, BttError> {
-    rpassword::prompt_password_stdout(prompt)
-        .map_err(|e| BttError::io(format!("failed to read password: {}", e)))
+/// Read password from terminal with no echo. Writes the prompt to stderr so
+/// that stdout remains a clean JSON channel (`btt wallet create | jq .` works).
+/// Backed by `rpassword::prompt_password`, which reads from the controlling
+/// TTY when one is available.
+pub fn read_password(prompt: &str) -> Result<Zeroizing<String>, BttError> {
+    use std::io::Write as _;
+    let mut stderr = std::io::stderr();
+    let _ = stderr.write_all(prompt.as_bytes());
+    let _ = stderr.flush();
+    let pw = rpassword::prompt_password("")
+        .map_err(|e| BttError::io(format!("failed to read password: {}", e)))?;
+    Ok(Zeroizing::new(pw))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -755,6 +822,12 @@ pub fn read_password(prompt: &str) -> Result<String, BttError> {
 mod tests {
     use super::*;
     use sp_core::Pair as TraitPairAlias;
+    use std::sync::Mutex;
+
+    // Tests that mutate `HOME` cannot run in parallel because env vars are
+    // process-global. Take this mutex at the start of any test that calls
+    // `std::env::set_var("HOME", ...)`.
+    static HOME_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn generate_12_word_keypair() {
@@ -767,19 +840,11 @@ mod tests {
     }
 
     #[test]
-    fn generate_24_word_keypair() {
-        let (pair, phrase, _seed) = generate_keypair(24).expect("24-word generation should work");
-        let words: Vec<&str> = phrase.split_whitespace().collect();
-        assert_eq!(words.len(), 24);
-        let ss58 = pair.public().to_ss58check();
-        assert!(ss58.starts_with('5'), "SS58 address should start with 5");
-    }
-
-    #[test]
-    fn invalid_n_words_rejected() {
+    fn only_12_word_supported() {
         assert!(validate_n_words(11).is_err());
         assert!(validate_n_words(12).is_ok());
-        assert!(validate_n_words(24).is_ok());
+        // 24-word support deferred with bip39 dep removal; see generate_keypair.
+        assert!(validate_n_words(24).is_err());
         assert!(validate_n_words(25).is_err());
     }
 
@@ -837,10 +902,130 @@ mod tests {
         let password = "test-password-123";
 
         let encrypted = encrypt_key_data(plaintext, password).expect("encryption should work");
+        assert!(
+            encrypted.starts_with(b"$NACL"),
+            "encrypted blob should start with btwallet magic $NACL"
+        );
         assert_ne!(&encrypted[..], plaintext, "ciphertext should differ from plaintext");
 
         let decrypted = decrypt_key_data(&encrypted, password).expect("decryption should work");
         assert_eq!(&decrypted[..], plaintext, "decrypted should match original");
+    }
+
+    #[test]
+    fn derive_key_matches_libsodium_reference() {
+        // Reference vector computed with pynacl:
+        //   nacl.pwhash.argon2i.kdf(
+        //     32, b"hello-btcli", NACL_SALT,
+        //     opslimit=OPSLIMIT_SENSITIVE, memlimit=MEMLIMIT_SENSITIVE)
+        // This test pins the argon2i13 parameters to libsodium's SENSITIVE
+        // profile. If it ever fails, the btwallet on-disk format will have
+        // silently diverged.
+        let key = derive_key(b"hello-btcli").expect("argon2 derive");
+        let expected =
+            hex::decode("39272631c10c56896024d406eef497421dcb6a6be0f2fb71adb7ae39f42456cd")
+                .expect("hex");
+        assert_eq!(key.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn decrypts_btwallet_reference_vector() {
+        // Fixed reference blob produced by pynacl (libsodium) using exactly
+        // the btwallet format:
+        //
+        //   import nacl.pwhash.argon2i as a, nacl.secret
+        //   salt = NACL_SALT
+        //   key  = a.kdf(32, b"correct horse battery staple", salt,
+        //                opslimit=a.OPSLIMIT_SENSITIVE,
+        //                memlimit=a.MEMLIMIT_SENSITIVE)
+        //   box  = nacl.secret.SecretBox(key)
+        //   ct   = bytes(box.encrypt(plaintext, nonce=bytes(24)))
+        //   blob = b"$NACL" + ct
+        //
+        // The all-zero nonce is chosen only so the vector is reproducible;
+        // production encryption uses random nonces. If this test fails, the
+        // on-disk envelope has drifted from btwallet.
+        let plaintext_hex =
+            "7b226163636f756e744964223a2230786465616462656566222c\
+             227373353841646472657373223a223546616b6541646472227d";
+        let blob_hex = "244e41434c000000000000000000000000000000000000000000000000\
+                        fc80b605e3f8a4e8ac1fe620d424cf239c6806fed7365d1bb2142107c6\
+                        fa3ed8f7bbc7af9b1e2c3e67f1cb90e58945e8520b7bb1006532a43e77\
+                        75d7c439db6f5fc337df";
+        let expected_plain =
+            hex::decode(plaintext_hex.replace(|c: char| c.is_whitespace(), "")).expect("hex");
+        let blob =
+            hex::decode(blob_hex.replace(|c: char| c.is_whitespace(), "")).expect("hex");
+        let password = "correct horse battery staple";
+
+        // btwallet -> btt: we must be able to decrypt the external blob.
+        let decoded = decrypt_key_data(&blob, password).expect("decrypt external blob");
+        assert_eq!(decoded, expected_plain);
+
+        // btt -> btt round trip: sanity check shape of our own output.
+        let enc = encrypt_key_data(&expected_plain, password).expect("encrypt");
+        assert!(enc.starts_with(b"$NACL"));
+        assert_eq!(enc.len(), 5 + 24 + expected_plain.len() + 16);
+        let dec = decrypt_key_data(&enc, password).expect("decrypt");
+        assert_eq!(dec, expected_plain);
+    }
+
+    #[test]
+    #[ignore = "helper for producing hex blobs consumed by external libsodium"]
+    fn dump_blob_for_python() {
+        let pt = b"btt-to-btwallet-interop-check";
+        let enc = encrypt_key_data(pt, "roundtrip-pw").expect("encrypt");
+        eprintln!("BTT_ENC_BLOB={}", hex::encode(&enc));
+    }
+
+    #[test]
+    fn decrypt_rejects_missing_magic() {
+        // Without the $NACL prefix, decrypt must refuse.
+        let fake = vec![0u8; 100];
+        assert!(decrypt_key_data(&fake, "pw").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_writes_secure_file_perms() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = HOME_LOCK.lock().expect("home lock");
+        let tmp = std::env::temp_dir().join(format!("btt-perm-{}", std::process::id()));
+        let wallet_name = "perm-test";
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", tmp.to_str().expect("valid path"));
+        let _ = std::fs::create_dir_all(&tmp);
+
+        let result = create(wallet_name, "default", 12, "perm-pw");
+
+        // Capture paths before cleanup
+        let wdir = tmp.join(".bittensor").join("wallets").join(wallet_name);
+        let coldkey = wdir.join("coldkey");
+        let hotkey = wdir.join("hotkeys").join("default");
+
+        let coldkey_mode = std::fs::metadata(&coldkey).map(|m| m.permissions().mode() & 0o777);
+        let hotkey_mode = std::fs::metadata(&hotkey).map(|m| m.permissions().mode() & 0o777);
+        let wdir_mode = std::fs::metadata(&wdir).map(|m| m.permissions().mode() & 0o777);
+
+        // Read first bytes of coldkey to confirm $NACL framing
+        let coldkey_bytes = std::fs::read(&coldkey).ok();
+
+        if let Some(h) = original_home {
+            std::env::set_var("HOME", &h);
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        result.expect("create should work");
+        assert_eq!(coldkey_mode.expect("coldkey stat"), 0o600);
+        assert_eq!(hotkey_mode.expect("hotkey stat"), 0o600);
+        assert_eq!(wdir_mode.expect("wallet dir stat"), 0o700);
+        let bytes = coldkey_bytes.expect("coldkey read");
+        assert!(
+            bytes.starts_with(b"$NACL"),
+            "coldkey file should start with $NACL magic"
+        );
     }
 
     #[test]
@@ -909,6 +1094,7 @@ mod tests {
 
     #[test]
     fn create_wallet_roundtrip() {
+        let _guard = HOME_LOCK.lock().expect("home lock");
         // Use a temp directory to avoid polluting ~/.bittensor
         let tmp = std::env::temp_dir().join(format!("btt-test-{}", std::process::id()));
         let wallet_name = "test-wallet";
@@ -1032,6 +1218,7 @@ mod tests {
 
     #[test]
     fn create_and_sign_roundtrip() {
+        let _guard = HOME_LOCK.lock().expect("home lock");
         let tmp = std::env::temp_dir().join(format!("btt-test-sign-{}", std::process::id()));
         let wallet_name = "sign-test";
 
@@ -1071,6 +1258,7 @@ mod tests {
 
     #[test]
     fn regen_coldkey_from_mnemonic() {
+        let _guard = HOME_LOCK.lock().expect("home lock");
         let tmp = std::env::temp_dir().join(format!("btt-test-regen-{}", std::process::id()));
         let wallet_name = "regen-test";
 

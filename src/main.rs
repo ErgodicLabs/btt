@@ -114,12 +114,13 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                 } else {
                     Some(commands::wallet_keys::read_password("Enter password for coldkey: ")?)
                 };
+                let password_ref = password.as_ref().map(|p| p.as_str());
                 let result = commands::wallet_keys::sign(
                     &name,
                     &hotkey,
                     &message,
                     use_hotkey,
-                    password.as_deref(),
+                    password_ref,
                 )?;
                 output::print_success(&result, pretty, quiet);
             }
