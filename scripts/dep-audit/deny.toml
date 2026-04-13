@@ -69,9 +69,38 @@ allow = [
     "CC0-1.0",
     "MPL-2.0",
     "0BSD",
+    # webpki-root-certs ships Mozilla's CA root list under this license.
+    # The CDLA Permissive 2.0 is an OSI-style permissive data license and
+    # is fine for our distribution. Allowed here scoped narrowly via the
+    # license, not exception, because the same license shape may appear
+    # in other root-cert packages later.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.93
-exceptions = []
+
+# Per-crate exceptions for crates whose declared license expression we
+# need to disambiguate. `subxt` and several `sp-*` / `subxt-*` siblings
+# declare `Apache-2.0 OR GPL-3.0` (or the deprecated `Apache-2.0/GPL-3.0`
+# spelling). We accept the Apache-2.0 leg of the OR. cargo-deny resolves
+# by picking the most restrictive unless told otherwise; the exception
+# below tells it to accept Apache-2.0.
+exceptions = [
+    { name = "array-bytes",                allow = ["Apache-2.0"] },
+    { name = "subxt",                      allow = ["Apache-2.0"] },
+    { name = "subxt-codegen",              allow = ["Apache-2.0"] },
+    { name = "subxt-core",                 allow = ["Apache-2.0"] },
+    { name = "subxt-macro",                allow = ["Apache-2.0"] },
+    { name = "subxt-metadata",             allow = ["Apache-2.0"] },
+    { name = "subxt-utils-fetchmetadata",  allow = ["Apache-2.0"] },
+    { name = "subxt-lightclient",          allow = ["Apache-2.0"] },
+    { name = "subxt-rpcs",                 allow = ["Apache-2.0"] },
+    { name = "subxt-signer",               allow = ["Apache-2.0"] },
+    { name = "scale-decode",               allow = ["Apache-2.0"] },
+    { name = "scale-encode",               allow = ["Apache-2.0"] },
+    { name = "scale-bits",                 allow = ["Apache-2.0"] },
+    { name = "scale-typegen",              allow = ["Apache-2.0"] },
+    { name = "scale-value",                allow = ["Apache-2.0"] },
+]
 
 [bans]
 multiple-versions = "warn"
