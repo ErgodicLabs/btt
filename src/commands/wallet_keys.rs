@@ -223,7 +223,46 @@ struct PubKeyFileData {
 
 // ── Core operations ───────────────────────────────────────────────────────
 
+/// Refuse to overwrite an existing key file unless `force` is set.
+///
+/// `label` is a short human-readable tag for the key type ("coldkey",
+/// "hotkey") used both in the error message and the stderr warning. If
+/// the file does not exist, this is a no-op. If it exists and `force` is
+/// false, returns a `wallet_not_found`-adjacent `invalid_input` error
+/// naming the file and instructing the caller to delete or pass
+/// `--force`. If it exists and `force` is true, emits a one-line stderr
+/// warning naming the file being destroyed and returns `Ok`. The actual
+/// removal is performed atomically by `write_secure_file`.
+fn guard_overwrite(path: &Path, label: &str, force: bool) -> Result<(), BttError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    if !force {
+        return Err(BttError::invalid_input(format!(
+            "{label} file already exists at {}: refusing to overwrite. \
+             Delete the file or pass --force to destroy and replace it.",
+            path.display()
+        )));
+    }
+    let _ = writeln!(
+        std::io::stderr(),
+        "btt: --force: destroying existing {label} at {}",
+        path.display()
+    );
+    Ok(())
+}
+
 /// Create a new wallet with both coldkey and hotkey.
+///
+/// Scope note (issue #7): the `--force` guard introduced for the single-key
+/// subcommands (`new-coldkey`, `new-hotkey`, `regen-coldkey`, `regen-hotkey`)
+/// is deliberately NOT applied to `wallet create`. The user-facing contract
+/// of `create` is "make me a fresh wallet pair" and a follow-up issue will
+/// decide whether it should hard-fail on any existing key files or grow its
+/// own `--force`. Today, if the target wallet directory already contains a
+/// `coldkey` or `hotkeys/<name>` file, this function replaces it — see
+/// `write_secure_file` for the atomic unlink+create sequence. Callers who
+/// want overwrite refusal semantics should use `new-coldkey` / `new-hotkey`.
 pub fn create(
     wallet_name: &str,
     hotkey_name: &str,
@@ -290,12 +329,23 @@ pub fn create(
 }
 
 /// Generate only a new coldkey.
+///
+/// Refuses to run if `<wallet>/coldkey` already exists unless `force` is set.
 pub fn new_coldkey(
     wallet_name: &str,
     n_words: u32,
     password: &str,
+    force: bool,
 ) -> Result<NewColdkeyResult, BttError> {
     validate_n_words(n_words)?;
+
+    // Resolve the target path and refuse overwrite before generating key
+    // material. This keeps us from spending CPU on argon2 only to throw
+    // the result away, and avoids any window where fresh secret bytes
+    // live on the heap alongside a caller-visible error.
+    let wallet_dir = wallet_path(wallet_name)?;
+    let coldkey_path = wallet_dir.join("coldkey");
+    guard_overwrite(&coldkey_path, "coldkey", force)?;
 
     let (pair, mut phrase, mut seed) = generate_keypair(n_words)?;
     let ss58 = pair.public().to_ss58check();
@@ -305,12 +355,11 @@ pub fn new_coldkey(
     let mut json_str = serde_json::to_string(&json)
         .map_err(|e| BttError::io(format!("failed to serialize coldkey: {}", e)))?;
 
-    let wallet_dir = wallet_path(wallet_name)?;
     ensure_wallets_root()?;
     ensure_secure_dir(&wallet_dir)?;
 
     let mut encrypted = encrypt_key_data(json_str.as_bytes(), password)?;
-    write_secure_file(&wallet_dir.join("coldkey"), &encrypted)?;
+    write_secure_file(&coldkey_path, &encrypted)?;
     encrypted.zeroize();
     json_str.zeroize();
 
@@ -333,10 +382,14 @@ pub fn new_coldkey(
 }
 
 /// Generate a new hotkey for an existing wallet.
+///
+/// Refuses to run if `<wallet>/hotkeys/<hotkey_name>` already exists unless
+/// `force` is set.
 pub fn new_hotkey(
     wallet_name: &str,
     hotkey_name: &str,
     n_words: u32,
+    force: bool,
 ) -> Result<NewHotkeyResult, BttError> {
     validate_n_words(n_words)?;
 
@@ -349,6 +402,10 @@ pub fn new_hotkey(
         )));
     }
 
+    // Refuse overwrite before generating fresh key material.
+    let hotkey_path = wallet_dir.join("hotkeys").join(hotkey_name);
+    guard_overwrite(&hotkey_path, "hotkey", force)?;
+
     let (pair, mut phrase, mut seed) = generate_keypair(n_words)?;
     let ss58 = pair.public().to_ss58check();
     let seed_hex = format!("0x{}", hex::encode(seed));
@@ -359,7 +416,7 @@ pub fn new_hotkey(
 
     let hotkeys_dir = wallet_dir.join("hotkeys");
     ensure_secure_dir(&hotkeys_dir)?;
-    write_secure_file(&hotkeys_dir.join(hotkey_name), json_str.as_bytes())?;
+    write_secure_file(&hotkey_path, json_str.as_bytes())?;
     json_str.zeroize();
 
     let mnemonic_out = phrase.clone();
@@ -376,12 +433,21 @@ pub fn new_hotkey(
 }
 
 /// Restore a coldkey from mnemonic or seed.
+///
+/// Refuses to run if `<wallet>/coldkey` already exists unless `force` is set.
 pub fn regen_coldkey(
     wallet_name: &str,
     mnemonic: Option<&str>,
     seed_hex: Option<&str>,
     password: &str,
+    force: bool,
 ) -> Result<RegenResult, BttError> {
+    // Resolve and guard before deriving any key material from the user's
+    // mnemonic/seed. An error here must not leak a partial recovery state.
+    let wallet_dir = wallet_path(wallet_name)?;
+    let coldkey_path = wallet_dir.join("coldkey");
+    guard_overwrite(&coldkey_path, "coldkey", force)?;
+
     let (pair, mut phrase, mut seed) = recover_keypair(mnemonic, seed_hex)?;
     let ss58 = pair.public().to_ss58check();
     let seed_hex_str = format!("0x{}", hex::encode(seed));
@@ -390,12 +456,11 @@ pub fn regen_coldkey(
     let mut json_str = serde_json::to_string(&json)
         .map_err(|e| BttError::io(format!("failed to serialize coldkey: {}", e)))?;
 
-    let wallet_dir = wallet_path(wallet_name)?;
     ensure_wallets_root()?;
     ensure_secure_dir(&wallet_dir)?;
 
     let mut encrypted = encrypt_key_data(json_str.as_bytes(), password)?;
-    write_secure_file(&wallet_dir.join("coldkey"), &encrypted)?;
+    write_secure_file(&coldkey_path, &encrypted)?;
     encrypted.zeroize();
     json_str.zeroize();
     phrase.zeroize();
@@ -414,11 +479,15 @@ pub fn regen_coldkey(
 }
 
 /// Restore a hotkey from mnemonic or seed.
+///
+/// Refuses to run if `<wallet>/hotkeys/<hotkey_name>` already exists unless
+/// `force` is set.
 pub fn regen_hotkey(
     wallet_name: &str,
     hotkey_name: &str,
     mnemonic: Option<&str>,
     seed_hex: Option<&str>,
+    force: bool,
 ) -> Result<RegenHotkeyResult, BttError> {
     let wallet_dir = wallet_path(wallet_name)?;
     if !wallet_dir.exists() {
@@ -428,6 +497,10 @@ pub fn regen_hotkey(
             wallet_dir.display()
         )));
     }
+
+    // Refuse overwrite before deriving any key material.
+    let hotkey_path = wallet_dir.join("hotkeys").join(hotkey_name);
+    guard_overwrite(&hotkey_path, "hotkey", force)?;
 
     let (pair, mut phrase, mut seed) = recover_keypair(mnemonic, seed_hex)?;
     let ss58 = pair.public().to_ss58check();
@@ -439,7 +512,7 @@ pub fn regen_hotkey(
 
     let hotkeys_dir = wallet_dir.join("hotkeys");
     ensure_secure_dir(&hotkeys_dir)?;
-    write_secure_file(&hotkeys_dir.join(hotkey_name), json_str.as_bytes())?;
+    write_secure_file(&hotkey_path, json_str.as_bytes())?;
     json_str.zeroize();
     phrase.zeroize();
     seed.zeroize();
@@ -1271,8 +1344,10 @@ mod tests {
         let password = "regen-pw";
         let cr = create(wallet_name, "default", 12, password).expect("create should work");
 
-        // Regenerate the coldkey from the mnemonic
-        let regen = regen_coldkey(wallet_name, Some(&cr.mnemonic), None, password)
+        // Regenerate the coldkey from the mnemonic. The wallet dir already
+        // holds a `coldkey` file from `create` above, so we must pass
+        // force=true or the guard would (correctly) refuse.
+        let regen = regen_coldkey(wallet_name, Some(&cr.mnemonic), None, password, true)
             .expect("regen should work");
         assert_eq!(regen.ss58_address, cr.coldkey_ss58);
 
