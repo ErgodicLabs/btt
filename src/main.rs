@@ -85,17 +85,21 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                 name,
                 n_words,
                 password_file,
+                force,
             } => {
                 let password = resolve_coldkey_password(password_file.as_deref())?;
-                let result = commands::wallet_keys::new_coldkey(&name, n_words, &password)?;
+                let result =
+                    commands::wallet_keys::new_coldkey(&name, n_words, &password, force)?;
                 output::print_success(&result, pretty);
             }
             WalletAction::NewHotkey {
                 name,
                 hotkey,
                 n_words,
+                force,
             } => {
-                let result = commands::wallet_keys::new_hotkey(&name, &hotkey, n_words)?;
+                let result =
+                    commands::wallet_keys::new_hotkey(&name, &hotkey, n_words, force)?;
                 output::print_success(&result, pretty);
             }
             WalletAction::RegenColdkey {
@@ -103,6 +107,7 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                 mnemonic,
                 seed,
                 password_file,
+                force,
             } => {
                 let password = resolve_coldkey_password(password_file.as_deref())?;
                 let result = commands::wallet_keys::regen_coldkey(
@@ -110,6 +115,7 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                     mnemonic.as_deref(),
                     seed.as_deref(),
                     &password,
+                    force,
                 )?;
                 output::print_success(&result, pretty);
             }
@@ -118,12 +124,14 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                 hotkey,
                 mnemonic,
                 seed,
+                force,
             } => {
                 let result = commands::wallet_keys::regen_hotkey(
                     &name,
                     &hotkey,
                     mnemonic.as_deref(),
                     seed.as_deref(),
+                    force,
                 )?;
                 output::print_success(&result, pretty);
             }
