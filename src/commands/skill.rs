@@ -40,8 +40,10 @@ btt wallet list
 
 # Create a new wallet (coldkey + hotkey pair). Prompts for coldkey password
 # on stderr; JSON result (including mnemonic) on stdout.
+# Refuses to run if <wallet>/coldkey or <wallet>/hotkeys/<hotkey> already
+# exists; pass --force to destroy the existing wallet and mint a new one.
 btt wallet create --name <name> [--hotkey default] [--n-words 12] \
-  [--password-file <path>]
+  [--password-file <path>] [--force]
 
 # Generate only a new coldkey for an existing or new wallet.
 # Refuses to run if <wallet>/coldkey already exists; pass --force to
@@ -97,13 +99,18 @@ process listing, and shell history are all under your control.
 
 #### `--force`
 
-`new-coldkey`, `new-hotkey`, `regen-coldkey`, and `regen-hotkey` refuse
-by default to run when the target key file already exists. This
-prevents a second invocation from silently destroying an existing —
-possibly irrecoverable — key. Pass `--force` to acknowledge that the
-existing key file will be deleted and replaced. When `--force` is used,
-btt emits a one-line warning to stderr naming the file being
-destroyed, then proceeds.
+`wallet create`, `new-coldkey`, `new-hotkey`, `regen-coldkey`, and
+`regen-hotkey` refuse by default to run when the target key file
+already exists. This prevents a second invocation from silently
+destroying an existing — possibly irrecoverable — key. Pass `--force`
+to acknowledge that the existing key file will be deleted and
+replaced. When `--force` is used, btt emits a one-line warning to
+stderr naming the file being destroyed, then proceeds.
+
+For `wallet create` specifically, `--force` destroys the entire
+wallet (both coldkey and hotkey) and mints a fresh mnemonic — there
+is no way to reconstruct the old wallet from the command's own
+inputs. The refusal error explicitly warns about irreversibility.
 
 Recovering an overwritten key requires its mnemonic or seed. Back up
 both before running any key-generation command with `--force`.
