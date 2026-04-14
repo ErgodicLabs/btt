@@ -40,7 +40,40 @@ cargo install --locked cargo-audit cargo-deny cargo-outdated
 
 ## Configuration
 
-`scripts/dep-audit/deny.toml` — cargo-deny config. License allowlist, banned crates, source allowlist, advisory ignores. Currently permissive; tightens as the project matures.
+`scripts/dep-audit/deny.toml.in` — cargo-deny config template. License allowlist, banned crates, source allowlist. The `[advisories].ignore` list is a single `@@RUSTSEC_IGNORES@@` placeholder that `render-deny-toml.sh` substitutes at CI run time from `rustsec-ignores.jsonl`. There is no committed `deny.toml`; it is generated on every invocation.
+
+`scripts/dep-audit/rustsec-ignores.jsonl` — single source of truth for the list of RUSTSEC advisories the audit ignores. One JSON object per line:
+
+```
+{"id": "RUSTSEC-2099-0001", "reason": "short why; tracking link"}
+```
+
+This jsonl feeds both cargo-audit (via `--ignore` CLI flags) and cargo-deny (via the rendered `deny.toml`). Adding a new ignore is a single-line append to this file — no longer two separate edits that can drift (see issue #52, the hotfix lineage of PR #51).
+
+### Render scripts
+
+- `render-ignores.sh --audit` — emits one `--ignore RUSTSEC-xxxx` per line, fed into cargo-audit by `run-one.sh`.
+- `render-ignores.sh --deny` — emits the body of the TOML `ignore = [...]` array, one quoted id per line, for substitution into `deny.toml.in`.
+- `render-deny-toml.sh [output-path]` — substitutes `@@RUSTSEC_IGNORES@@` in `deny.toml.in` with the `--deny` output. Writes to stdout by default.
+
+Both render scripts shell out to `jq` to parse the jsonl, so arbitrary reason text (including quotes and arrows) is safe. jq is preinstalled on ubuntu-latest runners.
+
+### Running cargo-deny locally
+
+```
+scripts/dep-audit/render-deny-toml.sh > /tmp/deny.toml
+cargo deny --config /tmp/deny.toml check
+```
+
+Or just run `scripts/dep-audit/run-one.sh cargo-deny`, which does the render to a `mktemp` file internally and cleans up on exit. The rendered config never touches the working tree.
+
+### Tests
+
+`scripts/dep-audit/test_render_ignores.sh` — bash unit tests over the render scripts. Asserts the audit and deny output shapes, the template substitution, the TOML parse of the rendered config, and that a malformed jsonl fails loudly instead of silently producing a short ignore list. Invoked as a pre-check in the CI workflow before the matrix runs.
+
+```
+bash scripts/dep-audit/test_render_ignores.sh
+```
 
 ## Dep-checksum tripwire (issue #6)
 
@@ -103,10 +136,17 @@ CI never passes `--update`. Any `Cargo.lock` diff that lacks the corresponding D
 
 ## Files
 
-- `audit.sh`     — cargo-audit / cargo-deny / cargo-outdated dispatcher
-- `checksum.py`  — dep-checksum tripwire (issue #6)
-- `deny.toml`    — cargo-deny configuration
-- `README.md`    — this file
+- `audit.sh`                — cargo-audit / cargo-deny / cargo-outdated dispatcher (legacy local wrapper)
+- `run-one.sh`              — runs ONE of the three cargo tools; invoked by the CI matrix
+- `checksum.py`             — dep-checksum tripwire (issue #6)
+- `deny.toml.in`            — cargo-deny config template with `@@RUSTSEC_IGNORES@@` placeholder
+- `rustsec-ignores.jsonl`   — single source of truth for RUSTSEC ignore list (issue #52)
+- `render-ignores.sh`       — emits audit `--ignore` args OR the TOML ignore-list body
+- `render-deny-toml.sh`     — renders `deny.toml` from template + jsonl
+- `test_render_ignores.sh`  — bash unit tests for the render scripts
+- `test_checksum.py`        — unit tests for `checksum.py`
+- `tool-versions.txt`       — pinned versions of cargo-audit / cargo-deny / cargo-outdated
+- `README.md`               — this file
 
 ## Related
 
