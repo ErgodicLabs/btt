@@ -48,7 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Run render-ignores.sh / render-deny-toml.sh unit tests
         run: |
@@ -83,7 +83,7 @@ jobs:
         tool: [cargo-audit, cargo-deny, cargo-outdated]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         # Pinned to match rust-toolchain.toml. When bumping, update both.
@@ -91,7 +91,7 @@ jobs:
 
       - name: Cache ${{ matrix.tool }} binary
         id: tool-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/bin/${{ matrix.tool }}
           key: cargo-${{ matrix.tool }}-${{ runner.os }}-${{ hashFiles('scripts/dep-audit/tool-versions.txt') }}
@@ -147,7 +147,7 @@ jobs:
 
       - name: Upload ${{ matrix.tool }} artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dep-audit-${{ matrix.tool }}-${{ github.run_id }}
           path: |
@@ -160,7 +160,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Run dep-checksum tripwire
         id: run
@@ -196,7 +196,7 @@ jobs:
 
       - name: Upload checksum artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dep-audit-checksum-${{ github.run_id }}
           path: |
@@ -217,7 +217,7 @@ jobs:
     if: ${{ !cancelled() }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Download all matrix artifacts
         uses: actions/download-artifact@v4
@@ -331,7 +331,7 @@ jobs:
 
       - name: Upload combined report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dep-audit-combined-${{ github.run_id }}
           path: combined-report.md
