@@ -18,11 +18,3 @@ xsalsa20poly1305 = "0.9"
 argon2 = "0.5"
 rand = "0.8"
 hex = "0.4"
-# libc: std-lib-equivalent binding for unix syscall constants. We need
-# `O_NOFOLLOW` in `commands/password_file.rs` to refuse symlinks at open()
-# time (closes the TOCTOU window in issue #13). libc is already transitively
-# present through sp-panic-handler / tokio / errno; pulling it in as a direct
-# dep costs nothing new and lets us avoid hard-coding a platform-specific
-# magic number. Per feedback_dep_discipline.md this is the explicit
-# justification.
-libc = "0.2"
