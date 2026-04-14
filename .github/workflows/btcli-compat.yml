@@ -9,6 +9,12 @@ on:
     paths:
       - "src/commands/wallet_keys.rs"
       - "src/commands/password_file.rs"
+      # main.rs and cli.rs added per #14 NEW-L1: a future PR that
+      # rewires --password-file via the dispatch helper or the flag
+      # declaration without touching wallet_keys.rs / password_file.rs
+      # would otherwise silently skip this verifier.
+      - "src/main.rs"
+      - "src/cli.rs"
       - "Cargo.toml"
       - "Cargo.lock"
       - "scripts/btcli-compat/**"

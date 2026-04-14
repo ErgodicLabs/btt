@@ -43,19 +43,25 @@ use zeroize::Zeroizing;
 
 use crate::error::BttError;
 
-/// Resolve `~` prefixes and `~user`-less tilde expansion using `$HOME`.
+/// Resolve `~` prefixes and `~user`-less tilde expansion against the
+/// caller-supplied home directory.
 ///
 /// We deliberately do NOT do arbitrary shell expansion — no `$VAR`
 /// substitution, no glob, no `..` magic. A password file path is supposed to
 /// be a concrete on-disk location.
-fn expand_tilde(path: &str) -> PathBuf {
+///
+/// `home` is taken as a parameter (rather than read from `std::env::var`
+/// internally) so tests can supply a synthetic value without mutating the
+/// process-global env. `std::env::set_var` becomes `unsafe` in Rust 1.82+
+/// and is a parallel-test footgun even before that — see issue #14 NEW-L2.
+fn expand_tilde(path: &str, home: Option<&str>) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
+        if let Some(home) = home {
             return PathBuf::from(home).join(rest);
         }
     }
     if path == "~" {
-        if let Ok(home) = std::env::var("HOME") {
+        if let Some(home) = home {
             return PathBuf::from(home);
         }
     }
@@ -68,7 +74,8 @@ fn expand_tilde(path: &str) -> PathBuf {
 /// other-readable. The first line (stripped of trailing `\n` or `\r\n`) is
 /// returned as the password.
 pub fn read_password_file(path: &str) -> Result<Zeroizing<String>, BttError> {
-    let resolved = expand_tilde(path);
+    let home = std::env::var("HOME").ok();
+    let resolved = expand_tilde(path, home.as_deref());
     read_password_file_inner(&resolved)
 }
 
@@ -484,20 +491,43 @@ mod tests {
 
     #[test]
     fn expand_tilde_absolute_untouched() {
-        let p = expand_tilde("/tmp/foo");
+        let p = expand_tilde("/tmp/foo", Some("/home/alice"));
+        assert_eq!(p, PathBuf::from("/tmp/foo"));
+        let p = expand_tilde("/tmp/foo", None);
         assert_eq!(p, PathBuf::from("/tmp/foo"));
     }
 
     #[test]
     fn expand_tilde_relative_untouched() {
-        let p = expand_tilde("foo/bar");
+        // A relative path with no leading tilde is passed through unchanged
+        // regardless of the home value.
+        let p = expand_tilde("foo/bar", Some("/home/alice"));
+        assert_eq!(p, PathBuf::from("foo/bar"));
+        let p = expand_tilde("foo/bar", None);
         assert_eq!(p, PathBuf::from("foo/bar"));
     }
 
     #[test]
     fn expand_tilde_prefix() {
-        std::env::set_var("HOME", "/home/alice");
-        let p = expand_tilde("~/foo");
+        // No std::env::set_var here — the home directory is passed in.
+        let p = expand_tilde("~/foo", Some("/home/alice"));
         assert_eq!(p, PathBuf::from("/home/alice/foo"));
+    }
+
+    #[test]
+    fn expand_tilde_bare() {
+        let p = expand_tilde("~", Some("/home/alice"));
+        assert_eq!(p, PathBuf::from("/home/alice"));
+    }
+
+    #[test]
+    fn expand_tilde_no_home_returns_unchanged() {
+        // When HOME is unset, a tilde path has no expansion target and is
+        // passed through unchanged. Caller-side error handling is expected
+        // to detect the "~/foo" → "~/foo" no-op and surface it.
+        let p = expand_tilde("~/foo", None);
+        assert_eq!(p, PathBuf::from("~/foo"));
+        let p = expand_tilde("~", None);
+        assert_eq!(p, PathBuf::from("~"));
     }
 }
