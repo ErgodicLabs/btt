@@ -147,10 +147,10 @@ pub async fn list(
 
     let mut prices: BTreeMap<u16, Option<f64>> = BTreeMap::new();
     for entry in &raw {
-        if !prices.contains_key(&entry.netuid) {
+        if let std::collections::btree_map::Entry::Vacant(slot) = prices.entry(entry.netuid) {
             // Failure of one price fetch must not drop the whole list.
             let price = fetch_subnet_price(&storage, entry.netuid).await.ok().flatten();
-            prices.insert(entry.netuid, price);
+            slot.insert(price);
         }
     }
 
@@ -340,7 +340,19 @@ pub async fn add(
         ],
     );
 
-    submit_stake_tx(&api, &tx, &signer, "add_stake", amount_rao, "tao", hotkey, netuid).await
+    submit_stake_tx(
+        &api,
+        &tx,
+        &signer,
+        StakeTxMeta {
+            action: "add_stake",
+            amount_rao,
+            amount_unit: "tao",
+            hotkey,
+            netuid,
+        },
+    )
+    .await
 }
 
 // ── remove ────────────────────────────────────────────────────────────────
@@ -459,11 +471,13 @@ pub async fn remove(
         &api,
         &tx,
         &signer,
-        "remove_stake",
-        amount_alpha_rao,
-        "alpha",
-        hotkey,
-        netuid,
+        StakeTxMeta {
+            action: "remove_stake",
+            amount_rao: amount_alpha_rao,
+            amount_unit: "alpha",
+            hotkey,
+            netuid,
+        },
     )
     .await
 }
@@ -481,8 +495,8 @@ async fn lookup_alpha_balance(
         "StakeInfoRuntimeApi",
         "get_stake_info_for_hotkey_coldkey_netuid",
         vec![
-            Value::from_bytes(hotkey_bytes.to_vec()),
-            Value::from_bytes(coldkey_bytes.to_vec()),
+            Value::from_bytes(hotkey_bytes),
+            Value::from_bytes(coldkey_bytes),
             Value::u128(netuid as u128),
         ],
     );
@@ -512,17 +526,25 @@ async fn lookup_alpha_balance(
     Ok(value_to_u64(stake_field).unwrap_or(0))
 }
 
+/// Result-envelope metadata for [`submit_stake_tx`]. Groups the per-call
+/// descriptors that get copied into the returned [`StakeTxResult`] so the
+/// helper takes a small, semantically-clustered struct instead of seven
+/// loose scalars.
+struct StakeTxMeta<'a> {
+    action: &'static str,
+    amount_rao: u64,
+    amount_unit: &'static str,
+    hotkey: &'a str,
+    netuid: u16,
+}
+
 /// Sign, submit, finalize, and convert a stake-related extrinsic into a
 /// `StakeTxResult` envelope.
 async fn submit_stake_tx(
     api: &OnlineClient<PolkadotConfig>,
     tx: &subxt::tx::DynamicPayload,
     signer: &PairSigner<PolkadotConfig, sr25519::Pair>,
-    action: &'static str,
-    amount_rao: u64,
-    amount_unit: &'static str,
-    hotkey: &str,
-    netuid: u16,
+    meta: StakeTxMeta<'_>,
 ) -> Result<StakeTxResult, BttError> {
     let progress = tokio::time::timeout(
         Duration::from_secs(120),
@@ -549,12 +571,12 @@ async fn submit_stake_tx(
     Ok(StakeTxResult {
         tx_hash,
         block: block_hash,
-        action: action.to_string(),
-        amount_rao,
-        amount: rao_to_tao_string(amount_rao),
-        amount_unit,
-        hotkey: hotkey.to_string(),
-        netuid,
+        action: meta.action.to_string(),
+        amount_rao: meta.amount_rao,
+        amount: rao_to_tao_string(meta.amount_rao),
+        amount_unit: meta.amount_unit,
+        hotkey: meta.hotkey.to_string(),
+        netuid: meta.netuid,
     })
 }
 
