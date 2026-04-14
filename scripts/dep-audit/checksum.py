@@ -51,16 +51,26 @@ scripts/dep-audit/README.md for the operator's guide.
 """
 
 import argparse
+import fnmatch
 import hashlib
 import os
 import re
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
 DEFAULT_LOCK = REPO_ROOT / "Cargo.lock"
 DEFAULT_DB = REPO_ROOT / ".cryptid" / "dep-audit" / "checksums.db"
+
+# Path-dep manifest exclusions. Anything matching these is omitted from the
+# deterministic file walk so the path-dep checksum doesn't churn on every
+# build. `target/` and `.git/` are directory names (matched against any
+# directory in the walk); the trailing entries are filename glob patterns
+# matched via fnmatch (editor swap files, OS metadata).
+PATH_DEP_EXCLUDE_DIRS = {"target", ".git"}
+PATH_DEP_EXCLUDE_FILE_GLOBS = ("*.swp", "*.swo", "*~", ".DS_Store")
 
 DB_HEADER = (
     "# btt dependency checksum database.\n"
@@ -81,6 +91,21 @@ DB_HEADER = (
 
 
 # ---------------------------------------------------------------------------
+# Error exit helper
+# ---------------------------------------------------------------------------
+
+def _die(msg):
+    """
+    Emit a script-error message to stderr and exit with code 2, per the
+    contract in the module docstring (1 = mismatch/new entry without --update,
+    2 = script error). Raises SystemExit(2) so callers that want to intercept
+    can still do so with `except SystemExit`.
+    """
+    print(msg, file=sys.stderr)
+    raise SystemExit(2)
+
+
+# ---------------------------------------------------------------------------
 # Cargo.lock parser (stdlib-only; Python 3.11 has tomllib but we avoid it
 # to keep this script runnable on any Python 3.x without version checks).
 # ---------------------------------------------------------------------------
@@ -94,7 +119,7 @@ def parse_cargo_lock(path):
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
-        raise SystemExit(f"error: cannot read {path}: {exc}")
+        _die(f"error: cannot read {path}: {exc}")
 
     packages = []
     current = None
@@ -136,6 +161,11 @@ def classify_source(source):
     """
     Return (kind, rest) where kind is 'registry', 'git', 'path', or 'workspace'
     (the last for packages with no `source` line — the workspace crate itself).
+
+    For path+ deps, Cargo writes `path+file:///abs/path` in Cargo.lock. We
+    parse the file:// URL and return the absolute filesystem path, so the
+    caller receives a value ready to hand to pathlib without re-joining
+    against REPO_ROOT (which would hard-fail on an absolute URL-shaped string).
     """
     if source is None:
         return ("workspace", "")
@@ -144,8 +174,12 @@ def classify_source(source):
     if source.startswith("git+"):
         return ("git", source[len("git+"):])
     if source.startswith("path+"):
-        return ("path", source[len("path+"):])
-    raise SystemExit(f"error: unknown source kind: {source!r}")
+        rest = source[len("path+"):]
+        if rest.startswith("file://"):
+            parsed = urlparse(rest)
+            rest = parsed.path
+        return ("path", rest)
+    _die(f"error: unknown source kind: {source!r}")
 
 
 def checksum_registry(pkg):
@@ -158,7 +192,7 @@ def checksum_registry(pkg):
     tripwire fires.
     """
     if not pkg.get("checksum"):
-        raise SystemExit(
+        _die(
             f"error: registry dep {pkg['name']}@{pkg['version']} has no "
             f"checksum field in Cargo.lock; cannot verify"
         )
@@ -173,13 +207,13 @@ def checksum_git(pkg, rest):
     content hash. We don't need to check out the tree.
     """
     if "#" not in rest:
-        raise SystemExit(
+        _die(
             f"error: git dep {pkg['name']}@{pkg['version']} has no commit "
             f"fragment in source {rest!r}"
         )
     commit = rest.rsplit("#", 1)[1]
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
-        raise SystemExit(
+        _die(
             f"error: git dep {pkg['name']}@{pkg['version']} has non-sha1 "
             f"commit fragment {commit!r}"
         )
@@ -197,21 +231,25 @@ def checksum_path(pkg, rest):
     if not root.is_absolute():
         root = (REPO_ROOT / rest).resolve()
     if not root.exists():
-        raise SystemExit(
+        _die(
             f"error: path dep {pkg['name']}@{pkg['version']} points at "
             f"{root} which does not exist"
         )
     entries = []
     for dirpath, dirnames, filenames in os.walk(root):
+        # Prune excluded directories in place so os.walk does not descend.
+        dirnames[:] = [d for d in dirnames if d not in PATH_DEP_EXCLUDE_DIRS]
         dirnames.sort()
         for fn in sorted(filenames):
+            if any(fnmatch.fnmatch(fn, pat) for pat in PATH_DEP_EXCLUDE_FILE_GLOBS):
+                continue
             full = Path(dirpath) / fn
             if full.is_symlink():
                 kind = "l"
                 try:
                     target = os.readlink(full)
                 except OSError as exc:
-                    raise SystemExit(f"error: cannot read symlink {full}: {exc}")
+                    _die(f"error: cannot read symlink {full}: {exc}")
                 content_hash = hashlib.sha256(target.encode("utf-8")).hexdigest()
             else:
                 kind = "f"
@@ -221,7 +259,7 @@ def checksum_path(pkg, rest):
                         for chunk in iter(lambda: fp.read(65536), b""):
                             h.update(chunk)
                 except OSError as exc:
-                    raise SystemExit(f"error: cannot read {full}: {exc}")
+                    _die(f"error: cannot read {full}: {exc}")
                 content_hash = h.hexdigest()
             rel = full.relative_to(root).as_posix()
             entries.append(f"{kind} {rel} {content_hash}")
@@ -245,7 +283,7 @@ def compute_entry(pkg):
     elif kind == "path":
         sha = checksum_path(pkg, rest)
     else:
-        raise SystemExit(f"error: unhandled source kind {kind!r}")
+        _die(f"error: unhandled source kind {kind!r}")
     key = f"{pkg['name']}@{pkg['version']}"
     return (key, kind, sha)
 
@@ -267,7 +305,7 @@ def load_db(path):
             continue
         parts = line.split("\t")
         if len(parts) != 3:
-            raise SystemExit(f"error: malformed DB line in {path}: {raw!r}")
+            _die(f"error: malformed DB line in {path}: {raw!r}")
         key, kind, sha = parts
         db[key] = (kind, sha)
     return db
@@ -403,7 +441,12 @@ def main(argv=None):
         )
         report_lines.append("")
 
-    if new_entries:
+    # The "new deps" interstitial is suppressed under --update: by the time
+    # the report renders, those entries are about to be written to the DB,
+    # so the framing ("not yet in DB", "Run --update locally") is stale.
+    # The trailing "DB updated: +N new" line on stderr already tells the
+    # operator what was added.
+    if new_entries and not args.update:
         report_lines.append("**New deps (not yet in DB):**")
         report_lines.append("")
         report_lines.append("```")
@@ -411,14 +454,13 @@ def main(argv=None):
             report_lines.append(f"  {key}  {kind}  {sha}")
         report_lines.append("```")
         report_lines.append("")
-        if not args.update:
-            report_lines.append(
-                "These entries are not in the committed DB. Run "
-                "`scripts/dep-audit/checksum.py --update` locally and "
-                "commit the resulting DB diff alongside the Cargo.lock "
-                "change. CI never runs with --update."
-            )
-            report_lines.append("")
+        report_lines.append(
+            "These entries are not in the committed DB. Run "
+            "`scripts/dep-audit/checksum.py --update` locally and "
+            "commit the resulting DB diff alongside the Cargo.lock "
+            "change. CI never runs with --update."
+        )
+        report_lines.append("")
 
     if stale:
         report_lines.append("**Stale DB entries (in DB but not in Cargo.lock):**")
