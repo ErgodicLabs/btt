@@ -96,17 +96,35 @@ EOF
 
   # --- cargo-audit --------------------------------------------------
   # Pull the ignore list out of rustsec-ignores.jsonl at run time so
-  # this script never drifts from deny.toml. Each non-empty line of
-  # render output is a single CLI token (either `--ignore` or an id);
-  # mapfile preserves them as array elements without word-splitting
-  # hazards.
+  # this script never drifts from deny.toml. Capture the renderer to a
+  # tempfile first and check its exit status explicitly: a process
+  # substitution (`< <(...)`) would swallow the subshell's exit status
+  # and silently feed a partial `--ignore` list to cargo-audit if the
+  # renderer ever mutated to emit-then-fail. That is the PR #51 drift
+  # class this whole jsonl pipeline was introduced to prevent (#54
+  # barbarian NIT 56.1).
+  local audit_tmp
+  audit_tmp="$(mktemp -t btt-audit-ignores.XXXXXX)"
+  if ! bash "${RENDER_IGNORES}" --audit > "${audit_tmp}"; then
+    rm -f "${audit_tmp}"
+    emit_details 'cargo-audit' 1 <<'EOF'
+```
+(render-ignores.sh --audit failed; cannot run cargo-audit)
+```
+EOF
+    return 1
+  fi
+  # Each non-empty line of render output is a single CLI token (either
+  # `--ignore` or an id); word-splitting turns the pair into the two
+  # array elements cargo-audit expects.
   local audit_ignore_args=()
   local line
   while IFS= read -r line; do
     [ -z "${line}" ] && continue
     # shellcheck disable=SC2206
     audit_ignore_args+=( ${line} )
-  done < <(bash "${RENDER_IGNORES}" --audit)
+  done < "${audit_tmp}"
+  rm -f "${audit_tmp}"
   local audit_output audit_status
   audit_output="$(cargo audit --quiet "${audit_ignore_args[@]}" 2>&1)"
   audit_status=$?
