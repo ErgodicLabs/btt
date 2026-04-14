@@ -1,0 +1,18 @@
+# Pinned toolchain for btt.
+#
+# Issue #33 fix: the project previously used `dtolnay/rust-toolchain@stable`
+# in every workflow. Floating `stable` means a Rust release with a new
+# default clippy lint will simultaneously break every CI workflow with no
+# warning and no clear fix path.
+#
+# Pinning here makes Rust version bumps explicit PRs that can be tested in
+# isolation. The CI workflows pin the same version via
+# `dtolnay/rust-toolchain@<version>` so local dev and CI agree.
+#
+# When bumping: update this file AND every `.github/workflows/*.yml` that
+# pins `dtolnay/rust-toolchain@<version>`. They must move together.
+
+[toolchain]
+channel = "1.94.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
