@@ -969,5 +969,98 @@ mod tests {
         let result = resolve_address(None, None);
         assert!(result.is_err());
     }
+
+    // -- Sr25519Signer wire-format tripwire ---------------------------------
+    //
+    // This test exists to catch silent subxt/sp_core API drift. The signer
+    // path was hand-rolled in PR #57 when subxt 0.50 dropped `PairSigner`,
+    // and at the time of merge the barbarian review verified byte-identical
+    // output vs. the old implementation. But neither type-checking nor
+    // clippy will notice if a future subxt bump reorders `MultiSignature`
+    // variants or changes `sr25519::Signature` layout — the refactor would
+    // still compile, and signed extrinsics would silently fail on-chain.
+    //
+    // The test locks three things:
+    //   1. The public key derived from a known seed (catches seed-derivation
+    //      drift in sp-core's sr25519 HKDF path).
+    //   2. The SCALE variant tag of `subxt::utils::MultiSignature::Sr25519`
+    //      (catches variant reordering — Ed25519 = 0, Sr25519 = 1, Ecdsa = 2
+    //      per the enum order in subxt-0.50 `utils/multi_signature.rs`).
+    //   3. The 64-byte signature body validates against the hard-coded
+    //      public key via `sr25519::Pair::verify` (catches any layout or
+    //      semantic change in the signature bytes themselves).
+    //
+    // We cannot assert raw signature bytes because sr25519 signatures are
+    // randomised (schnorrkel nonce). Verification closes the loop.
+    //
+    // If this test fails, DO NOT just re-pin the expected values. First
+    // confirm the wire format is actually unchanged by round-tripping
+    // against a known-good client, *then* update the pinned values here.
+    #[test]
+    fn sr25519_signer_wire_format_locked() {
+        use sp_core::sr25519;
+        use subxt::ext::codec::Encode;
+        use subxt::tx::Signer as _;
+
+        // Hard-coded 32-byte seed. Not a well-known dev key — we want the
+        // derivation itself under test, not a re-use of //Alice.
+        const SEED: [u8; 32] = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
+            0x32, 0x10, 0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe, 0x00, 0x11, 0x22, 0x33,
+            0x44, 0x55, 0x66, 0x77,
+        ];
+
+        // The expected sr25519 public key derived from SEED via
+        // `sp_core::sr25519::Pair::from_seed`. Locking this catches any
+        // change in sp-core's mini-secret → keypair expansion.
+        const EXPECTED_PUBKEY_HEX: &str =
+            "5e63279eb48e4656a4070ec89346105860d1628bf17c10e76c35f555be5aaf31";
+
+        // Fixed signer payload — the bytes that would normally be the
+        // extrinsic signed payload. 32 bytes of 0x42 is simply a fixed
+        // input so the verification side of the test is deterministic.
+        const SIGNER_PAYLOAD: [u8; 32] = [0x42; 32];
+
+        let pair = sr25519::Pair::from_seed(&SEED);
+        let signer = Sr25519Signer::new(pair.clone());
+
+        // (1) Public key lock.
+        let derived_pk: [u8; 32] = PairTrait::public(&pair).0;
+        assert_eq!(
+            hex::encode(derived_pk),
+            EXPECTED_PUBKEY_HEX,
+            "sr25519 public key derived from fixed seed changed — sp-core derivation drift"
+        );
+
+        // (2) SCALE-encoded MultiSignature tripwire. The signer returns a
+        // `subxt::utils::MultiSignature`. We SCALE-encode it directly and
+        // check:
+        //   - byte 0 is the variant tag (must be 0x01 for Sr25519)
+        //   - total length is 1 + 64 = 65 bytes (variant tag + sig body)
+        let sig = signer.sign(&SIGNER_PAYLOAD);
+        let encoded: Vec<u8> = sig.encode();
+        assert_eq!(
+            encoded.len(),
+            65,
+            "SCALE-encoded MultiSignature length changed — sig body size or tag width drift"
+        );
+        assert_eq!(
+            encoded[0], 0x01,
+            "MultiSignature::Sr25519 variant tag changed — enum variant reorder in subxt"
+        );
+
+        // (3) The 64-byte signature body must still verify against the
+        // public key under sp-core's sr25519 semantics. This catches any
+        // change in the on-wire signature format itself.
+        let sig_bytes: [u8; 64] = encoded[1..]
+            .try_into()
+            .expect("65-byte encoding minus 1-byte tag is 64");
+        let sp_sig = sr25519::Signature::from_raw(sig_bytes);
+        let sp_pub = sr25519::Public::from_raw(derived_pk);
+        assert!(
+            <sr25519::Pair as PairTrait>::verify(&sp_sig, SIGNER_PAYLOAD.as_slice(), &sp_pub),
+            "SCALE-decoded sig body did not verify — sr25519 signature layout drift"
+        );
+    }
 }
 
