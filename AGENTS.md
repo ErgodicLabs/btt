@@ -72,6 +72,14 @@ The rule is enforced at review time. Reviewers should reject PRs that modify str
 - Upstream incorporation on published branches: `merge main`, not rebase.
 - Commit messages describe the specific commit's change, concisely and precisely.
 
+### 8. Lint discipline
+
+Clippy is a merge gate, not advisory. The `lint` workflow in `.github/workflows/lint.yml` runs `cargo clippy --all-targets -- -D warnings` on every PR and on every push to `main`. Any `clippy::-D warnings`-level lint — style, correctness, perf, suspicious, anything in the default set — fails the gate and blocks merge.
+
+Rationale: during the PR #23 dTAO stake-ops rewrite, four clippy errors slipped into `src/commands/stake.rs` and survived several subsequent merges because no CI job ran clippy. They were only caught by the PR #26 barbaric review. Lint regressions that are not mechanically prevented will accumulate; issue #30 closed that gap.
+
+If a specific lint is wrong for a specific site, the correct response is a narrowly scoped `#[allow(clippy::whatever)]` with a comment explaining why, not disabling the gate. Blanket `#![allow(...)]` at the crate root is forbidden.
+
 ## Relationship to cryptid
 
 `btt` is developed and reviewed by cryptid, a web3 security research agent, in cooperation with human operators at Ergodic Labs. Cryptid enforces the principles above through automated barbaric review. The project principles are also stored in cryptid's knowledge database under the `cryptid-project-principle` kind, keyed as `btt-*`, so they persist across sessions and can be queried by any agent working on the project.

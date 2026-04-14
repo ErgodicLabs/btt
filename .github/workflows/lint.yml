@@ -1,0 +1,64 @@
+name: lint
+
+# Clippy gate. Per AGENTS.md principle 8 (lint discipline), clippy is a
+# required merge gate, not advisory: any `clippy::-D warnings`-level lint
+# on `--all-targets` blocks the PR.
+#
+# Background: issue #30. Four clippy errors in src/commands/stake.rs from
+# the PR #23 dTAO rewrite went unnoticed until PR #26's barbarian flagged
+# them, because no CI workflow ran clippy. PR #31 cleaned up those four
+# lints and unblocked this workflow landing — if we had added the gate
+# any earlier it would have broken every open PR.
+#
+# This workflow is intentionally small and does one thing. It does not
+# run `cargo build` or `cargo test` — `cargo clippy --all-targets` already
+# type-checks every target (bins, tests, benches, examples), and tests
+# will get their own job when that question is answered.
+#
+# The cargo cache key mirrors the btcli-compat workflow's scheme so a
+# clippy run on a PR that already built via btcli-compat can at least
+# share the registry/index portion of the cache.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-lint-
+
+      - name: Run clippy
+        # --all-targets so tests, benches, and examples are linted too.
+        # -D warnings promotes every remaining warning to an error, which
+        # is the whole point of the gate: a warning that isn't a gate is
+        # a warning that accumulates.
+        run: cargo clippy --all-targets -- -D warnings
