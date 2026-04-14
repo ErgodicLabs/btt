@@ -237,6 +237,39 @@ pub enum WalletAction {
         #[arg(long)]
         ss58: String,
     },
+
+    /// Reap stale `.tmp.*`, `.bak.*`, and `.lock.*` entries under the
+    /// wallets directory. These are reserved prefixes left behind by
+    /// `wallet create` on crashed or interrupted runs (see issue #42).
+    ///
+    /// `.tmp.<name>.<pid>.<nanos>.<ctr>/` are atomic-create staging
+    /// dirs, `.bak.<name>.<pid>.<nanos>.<ctr>/` are `--force` backup
+    /// dirs, and `.lock.<name>` are per-wallet `flock(2)` sentinels.
+    /// The cleanup command uses a strict grammar match and will never
+    /// touch anything that does not fit the reserved-prefix pattern.
+    /// `.lock.*` files are probed with a non-blocking `flock(LOCK_NB)`
+    /// and skipped if currently held by another process.
+    ///
+    /// Emits a JSON array of `{path, kind, action}` records.
+    Cleanup {
+        /// List what would be removed without touching disk. Each
+        /// candidate is reported with `action = "kept-dry-run"`.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Restrict the scan to entries whose `<name>` component
+        /// matches this wallet name verbatim: `.tmp.<name>.*`,
+        /// `.bak.<name>.*`, and `.lock.<name>`. The name is validated
+        /// (1..=64 chars of `[A-Za-z0-9_-]`) before use; path-traversal
+        /// characters (`/`, `..`, NUL) are rejected.
+        #[arg(long, value_name = "NAME")]
+        wallet: Option<String>,
+        /// Only reap entries whose modification time is older than
+        /// this duration. Grammar: `\d+[smhd]` — for example `60s`,
+        /// `30m`, `24h`, `7d`. Default: no age filter (reap everything
+        /// matching the prefix).
+        #[arg(long, value_name = "DURATION")]
+        older_than: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]

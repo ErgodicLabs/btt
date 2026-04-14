@@ -166,6 +166,18 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                 let result = commands::wallet_keys::verify(&message, &signature, &ss58)?;
                 output::print_success(&result, pretty);
             }
+            WalletAction::Cleanup {
+                dry_run,
+                wallet,
+                older_than,
+            } => {
+                let report = commands::wallet::cleanup(commands::wallet::CleanupOptions {
+                    dry_run,
+                    wallet,
+                    older_than,
+                })?;
+                output::print_success(&report, pretty);
+            }
         },
         Command::Stake { action } => {
             let endpoint = rpc::resolve_endpoint(

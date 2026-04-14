@@ -20,6 +20,9 @@ btt chain balance <ss58_address>
 # List local wallets
 btt wallet list
 
+# Reap stale staging/backup/lock artefacts from crashed wallet create runs
+btt wallet cleanup [--dry-run] [--wallet <name>] [--older-than 7d]
+
 # Emit SKILL.md for AI agent integration
 btt skill
 ```
@@ -102,6 +105,42 @@ to reconstruct the old wallet from the command's own inputs, so the
 refusal error explicitly warns about irreversibility. If you only want to
 replace one half of a wallet, use `new-coldkey` / `new-hotkey` /
 `regen-coldkey` / `regen-hotkey` instead.
+
+## Wallet cleanup
+
+`wallet create`'s atomic staging path (PR #40) writes sibling
+`.tmp.<name>.<pid>.<nanos>.<ctr>/` and `.bak.<name>.<pid>.<nanos>.<ctr>/`
+directories under `<wallets>/` during a create, and the per-wallet
+`flock(2)` path (PR #43) writes a `.lock.<name>` sentinel file. All three
+prefixes are reserved — `wallet create` refuses them as names, and
+`wallet list` filters them out.
+
+On a crashed or interrupted run, stale `.tmp.*` / `.bak.*` directories
+accumulate. `btt wallet cleanup` is the explicit, opt-in sweep:
+
+```bash
+# List (and reap) stale entries under <wallets>/
+btt wallet cleanup
+
+# Same, but don't remove anything — just emit the JSON report.
+btt wallet cleanup --dry-run
+
+# Reap only the staging/backup/lock entries belonging to a specific wallet.
+btt wallet cleanup --wallet alice
+
+# Reap only entries whose mtime is older than a duration (s/m/h/d).
+btt wallet cleanup --older-than 7d
+```
+
+The command uses a strict reserved-prefix grammar match — it will never
+`remove_dir_all` anything that does not fit `.tmp.<name>.<pid>.<nanos>.<ctr>`
+(or the `.bak.` / `.lock.` analogues). Symlinks are never followed.
+`.lock.*` files are probed with a non-blocking `flock(LOCK_EX | LOCK_NB)`
+before unlink so that a lock currently held by a concurrent `wallet
+create` is reported as `skipped-held` and left on disk. The JSON output
+is `{ok: true, data: {entries: [{path, kind, action}, ...]}}` where
+`kind` ∈ `tmp` / `bak` / `lock` and `action` is one of `reaped`,
+`kept-dry-run`, `skipped-held`, `skipped-too-young`, `skipped-no-match`.
 
 ## btcli format compatibility
 
