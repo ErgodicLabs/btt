@@ -4,10 +4,10 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sp_core::crypto::{Pair as TraitPair, Ss58Codec};
 use sp_core::sr25519::{Pair, Public, Signature};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::BttError;
 
@@ -90,14 +90,22 @@ pub fn decrypt_coldkey_interactive(wallet_name: &str) -> Result<Pair, BttError> 
         )));
     }
 
-    // Try reading as unencrypted JSON first (development/testing keys)
-    if let Ok(content) = fs::read_to_string(&coldkey_path) {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Ok(pair) = pair_from_key_json(&content) {
+    // Try reading as unencrypted JSON first (development/testing keys).
+    // The plaintext contents still hold a mnemonic, so funnel it through
+    // a `Zeroizing<Vec<u8>>` instead of `fs::read_to_string`, which would
+    // leak the bytes to an unscrubbed `String` allocation.
+    //
+    // We skip the old `serde_json::Value` pre-check (which itself would
+    // allocate unscrubbed owned `String`s for every JSON string node) and
+    // go straight to `pair_from_key_json`, which routes the data through
+    // the zeroizing `LoadedKeyFile`. On an encrypted `$NACL` envelope the
+    // UTF-8 check fails and we fall through to the decrypt branch.
+    if let Ok(raw) = fs::read(&coldkey_path) {
+        let raw: Zeroizing<Vec<u8>> = Zeroizing::new(raw);
+        if let Ok(content) = std::str::from_utf8(&raw) {
+            if let Ok(pair) = pair_from_key_json(content) {
                 return Ok(pair);
             }
-            // Has JSON structure but no usable key fields -- fall through to encrypted path
-            let _ = json;
         }
     }
 
@@ -219,6 +227,30 @@ struct PubKeyFileData {
     account_id: String,
     public_key: String,
     ss58_address: String,
+}
+
+// ── Load-path deserialization target ──────────────────────────────────────
+//
+// When decrypting a coldkey (or reading an unencrypted hotkey), the JSON
+// blob is parsed into this struct instead of a free-form `serde_json::Value`.
+// `Value` owns `String`s for every string node and does NOT scrub them on
+// drop, so routing the decrypted material through it would leave the
+// mnemonic and raw seed floating in freed heap chunks until reuse.
+//
+// `LoadedKeyFile` holds exactly the secret-bearing fields we consume and
+// derives `Zeroize` + `ZeroizeOnDrop`, so every `String` byte is overwritten
+// with zero before the allocation is returned to the allocator. Non-secret
+// hint fields from the on-disk format (accountId, publicKey, ss58Address)
+// are intentionally ignored — they carry no value the caller cannot
+// rederive from the keypair itself, and omitting them keeps the zeroized
+// footprint minimal.
+#[derive(Deserialize, Zeroize, ZeroizeOnDrop, Default)]
+#[serde(rename_all = "camelCase")]
+struct LoadedKeyFile {
+    #[serde(default)]
+    secret_phrase: Option<String>,
+    #[serde(default)]
+    secret_seed: Option<String>,
 }
 
 // ── Core operations ───────────────────────────────────────────────────────
@@ -733,9 +765,17 @@ fn recover_keypair(
 }
 
 /// Parse a hex string (with optional 0x prefix) into bytes.
-fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, BttError> {
+///
+/// The returned buffer is wrapped in `Zeroizing` because every current
+/// caller uses it to reconstruct secret key material (raw seeds on the
+/// load / regen paths). Callers that feed in non-secret hex get a
+/// harmlessly-scrubbed buffer; callers that feed in secret hex get a
+/// guaranteed scrub on drop.
+fn parse_hex_bytes(s: &str) -> Result<Zeroizing<Vec<u8>>, BttError> {
     let stripped = s.strip_prefix("0x").unwrap_or(s);
-    hex::decode(stripped).map_err(|e| BttError::parse(format!("invalid hex: {}", e)))
+    hex::decode(stripped)
+        .map(Zeroizing::new)
+        .map_err(|e| BttError::parse(format!("invalid hex: {}", e)))
 }
 
 /// Build the btcli-compatible key JSON structure.
@@ -808,7 +848,14 @@ fn encrypt_key_data(plaintext: &[u8], password: &str) -> Result<Vec<u8>, BttErro
 }
 
 /// Decrypt a btwallet-format NaCl envelope.
-fn decrypt_key_data(encrypted: &[u8], password: &str) -> Result<Vec<u8>, BttError> {
+///
+/// The returned plaintext is wrapped in `Zeroizing<Vec<u8>>` so the decrypted
+/// bytes — which, for a real coldkey, contain the JSON-serialized mnemonic
+/// and raw seed — are scrubbed when the caller drops the return value. A
+/// plain `Vec<u8>` here would rely on `Vec::drop` returning the allocation
+/// to the allocator without touching the bytes, leaving the secret sitting
+/// in the freed chunk until something else happens to allocate over it.
+fn decrypt_key_data(encrypted: &[u8], password: &str) -> Result<Zeroizing<Vec<u8>>, BttError> {
     use xsalsa20poly1305::aead::Aead;
     use xsalsa20poly1305::{KeyInit, XSalsa20Poly1305};
 
@@ -828,9 +875,10 @@ fn decrypt_key_data(encrypted: &[u8], password: &str) -> Result<Vec<u8>, BttErro
     let nonce = xsalsa20poly1305::Nonce::from_slice(nonce_bytes);
     let cipher = XSalsa20Poly1305::new(xsalsa20poly1305::Key::from_slice(key.as_slice()));
 
-    cipher
+    let plaintext = cipher
         .decrypt(nonce, ciphertext)
-        .map_err(|_| BttError::crypto("decryption failed — wrong password or corrupted file"))
+        .map_err(|_| BttError::crypto("decryption failed — wrong password or corrupted file"))?;
+    Ok(Zeroizing::new(plaintext))
 }
 
 /// Create a file at `path` with mode 0600 (unix) atomically via `O_CREAT|O_EXCL`,
@@ -879,6 +927,13 @@ fn ensure_secure_dir(path: &Path) -> Result<(), BttError> {
 }
 
 /// Load and decrypt a coldkey from a wallet directory.
+///
+/// The decrypted plaintext never leaves this function as an owned unscoped
+/// buffer: the decrypt step hands back a `Zeroizing<Vec<u8>>`, we view it
+/// as a UTF-8 slice without a second allocation, and `pair_from_key_json`
+/// funnels the bytes into a `LoadedKeyFile` that zeroes itself on drop.
+/// When this function returns, every heap region that held the mnemonic
+/// or the raw seed has been overwritten with zero.
 fn load_coldkey(wallet_dir: &std::path::Path, password: &str) -> Result<Pair, BttError> {
     let coldkey_path = wallet_dir.join("coldkey");
     if !coldkey_path.exists() {
@@ -888,14 +943,23 @@ fn load_coldkey(wallet_dir: &std::path::Path, password: &str) -> Result<Pair, Bt
     let encrypted = fs::read(&coldkey_path)
         .map_err(|e| BttError::io(format!("failed to read coldkey: {}", e)))?;
 
-    let decrypted = decrypt_key_data(&encrypted, password)?;
-    let json_str = String::from_utf8(decrypted)
+    let decrypted: Zeroizing<Vec<u8>> = decrypt_key_data(&encrypted, password)?;
+    // Borrow the plaintext as &str instead of moving it into an owned
+    // `String`. An owned `String` here would double the secret footprint
+    // and, unlike the `Zeroizing<Vec<u8>>` backing store, would not be
+    // scrubbed on drop.
+    let json_str = std::str::from_utf8(&decrypted)
         .map_err(|_| BttError::crypto("decrypted coldkey is not valid UTF-8"))?;
 
-    pair_from_key_json(&json_str)
+    pair_from_key_json(json_str)
 }
 
 /// Load a hotkey (unencrypted) from a wallet directory.
+///
+/// Even though the hotkey file is stored without encryption, its contents
+/// still contain a mnemonic / raw seed. Read it as bytes into a
+/// `Zeroizing<Vec<u8>>` and view it as a slice, rather than calling
+/// `fs::read_to_string` which returns an unscrubbed `String`.
 fn load_hotkey(wallet_dir: &std::path::Path, hotkey_name: &str) -> Result<Pair, BttError> {
     let hotkey_path = wallet_dir.join("hotkeys").join(hotkey_name);
     if !hotkey_path.exists() {
@@ -905,31 +969,45 @@ fn load_hotkey(wallet_dir: &std::path::Path, hotkey_name: &str) -> Result<Pair, 
         )));
     }
 
-    let json_str = fs::read_to_string(&hotkey_path)
-        .map_err(|e| BttError::io(format!("failed to read hotkey: {}", e)))?;
+    let raw: Zeroizing<Vec<u8>> = Zeroizing::new(
+        fs::read(&hotkey_path)
+            .map_err(|e| BttError::io(format!("failed to read hotkey: {}", e)))?,
+    );
+    let json_str = std::str::from_utf8(&raw)
+        .map_err(|_| BttError::parse("hotkey file is not valid UTF-8"))?;
 
-    pair_from_key_json(&json_str)
+    pair_from_key_json(json_str)
 }
 
 /// Recover a Pair from a btcli-format key JSON string.
-/// Tries secretPhrase first (mnemonic), then secretSeed.
+/// Tries `secretPhrase` first (mnemonic), then `secretSeed`.
+///
+/// Deserialization targets `LoadedKeyFile` (which derives
+/// `Zeroize + ZeroizeOnDrop`) so that the intermediate owned `String`s are
+/// overwritten with zero when this function returns — regardless of
+/// whether the recovery succeeds or errors out.
 fn pair_from_key_json(json_str: &str) -> Result<Pair, BttError> {
-    let v: serde_json::Value = serde_json::from_str(json_str)
+    let loaded: LoadedKeyFile = serde_json::from_str(json_str)
         .map_err(|e| BttError::parse(format!("invalid key JSON: {}", e)))?;
 
-    // Try mnemonic first
-    if let Some(phrase) = v.get("secretPhrase").and_then(|v| v.as_str()) {
+    // Try mnemonic first.
+    if let Some(phrase) = loaded.secret_phrase.as_deref() {
         if !phrase.is_empty() {
-            let (pair, _seed) = Pair::from_phrase(phrase, None).map_err(|e| {
+            // `Pair::from_phrase` returns `(Pair, Seed)`. The seed is a
+            // fixed-size array; scrub it immediately on the way out.
+            let (pair, mut seed) = Pair::from_phrase(phrase, None).map_err(|e| {
                 BttError::crypto(format!("failed to recover from mnemonic: {:?}", e))
             })?;
+            seed.zeroize();
             return Ok(pair);
         }
     }
 
-    // Fall back to seed
-    if let Some(seed_str) = v.get("secretSeed").and_then(|v| v.as_str()) {
+    // Fall back to seed.
+    if let Some(seed_str) = loaded.secret_seed.as_deref() {
         if !seed_str.is_empty() {
+            // `parse_hex_bytes` now returns `Zeroizing<Vec<u8>>`; the
+            // intermediate hex decode is scrubbed on drop.
             let seed_bytes = parse_hex_bytes(seed_str)?;
             if seed_bytes.len() != 32 {
                 return Err(BttError::parse("secretSeed must be 32 bytes"));
@@ -1054,7 +1132,7 @@ mod tests {
         assert_ne!(&encrypted[..], plaintext, "ciphertext should differ from plaintext");
 
         let decrypted = decrypt_key_data(&encrypted, password).expect("decryption should work");
-        assert_eq!(&decrypted[..], plaintext, "decrypted should match original");
+        assert_eq!(decrypted.as_slice(), plaintext, "decrypted should match original");
     }
 
     #[test]
@@ -1105,14 +1183,14 @@ mod tests {
 
         // btwallet -> btt: we must be able to decrypt the external blob.
         let decoded = decrypt_key_data(&blob, password).expect("decrypt external blob");
-        assert_eq!(decoded, expected_plain);
+        assert_eq!(decoded.as_slice(), expected_plain.as_slice());
 
         // btt -> btt round trip: sanity check shape of our own output.
         let enc = encrypt_key_data(&expected_plain, password).expect("encrypt");
         assert!(enc.starts_with(b"$NACL"));
         assert_eq!(enc.len(), 5 + 24 + expected_plain.len() + 16);
         let dec = decrypt_key_data(&enc, password).expect("decrypt");
-        assert_eq!(dec, expected_plain);
+        assert_eq!(dec.as_slice(), expected_plain.as_slice());
     }
 
     #[test]
@@ -1202,16 +1280,139 @@ mod tests {
         assert_eq!(pair.public(), recovered.public());
     }
 
+    // ── Load-path zeroization tests (issue #8) ─────────────────────────
+    //
+    // These assertions are defense-in-depth checks, not end-to-end memory
+    // dumps. We verify the types that hold decrypted secret material
+    // actually call `.zeroize()` on their backing buffers. The runtime
+    // check is necessarily indirect — once a `String` has been dropped
+    // the allocator is free to reuse or return the pages — so we invoke
+    // `Zeroize::zeroize` manually and inspect the struct afterward.
+
+    #[test]
+    fn loaded_key_file_zeroizes_fields() {
+        let json = r#"{
+            "secretPhrase": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            "secretSeed": "0x1111111111111111111111111111111111111111111111111111111111111111"
+        }"#;
+
+        let mut loaded: LoadedKeyFile =
+            serde_json::from_str(json).expect("LoadedKeyFile should deserialize");
+
+        // Sanity: the fields are populated before the scrub.
+        assert!(loaded
+            .secret_phrase
+            .as_deref()
+            .expect("secret_phrase deserialized")
+            .contains("abandon"));
+        assert!(loaded
+            .secret_seed
+            .as_deref()
+            .expect("secret_seed deserialized")
+            .starts_with("0x1111"));
+
+        // Manually invoke the scrub and confirm both fields are wiped.
+        // `Zeroize for Option<String>` zeros the inner `String` buffer,
+        // drops it, and then volatile-writes the `Option` discriminant
+        // back to `None`. So after this call both fields are `None`.
+        loaded.zeroize();
+        assert!(loaded.secret_phrase.is_none());
+        assert!(loaded.secret_seed.is_none());
+    }
+
+    #[test]
+    fn decrypt_key_data_returns_zeroizing_buffer() {
+        // Pin the decrypt return type: any refactor that weakens the
+        // scrub guarantee (e.g. reverting to `Vec<u8>`) will fail to
+        // compile this test.
+        fn assert_zeroizing(_: &Zeroizing<Vec<u8>>) {}
+
+        let password = "load-zeroize-test-pw";
+        let plaintext = b"{\"secretPhrase\":\"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about\"}";
+        let encrypted = encrypt_key_data(plaintext, password).expect("encrypt");
+        let decrypted = decrypt_key_data(&encrypted, password).expect("decrypt");
+        assert_zeroizing(&decrypted);
+        assert_eq!(decrypted.as_slice(), plaintext.as_slice());
+    }
+
+    #[test]
+    fn parse_hex_bytes_returns_zeroizing_buffer() {
+        // Same story as `decrypt_key_data`: pin the return type so a
+        // future refactor cannot silently strip the scrub.
+        fn assert_zeroizing(_: &Zeroizing<Vec<u8>>) {}
+        let bytes = parse_hex_bytes("0xdeadbeef").expect("parse");
+        assert_zeroizing(&bytes);
+    }
+
+    #[test]
+    fn pair_from_key_json_load_roundtrip() {
+        // End-to-end correctness check for the load path: the same
+        // mnemonic produced by `generate_keypair` must reconstruct the
+        // same public key when routed back through `pair_from_key_json`
+        // (which now goes via the zeroizing `LoadedKeyFile`).
+        let (original, phrase, seed) = generate_keypair(12).expect("generate");
+        let seed_hex = format!("0x{}", hex::encode(seed));
+        let json = build_key_json(&original, &phrase, &seed_hex);
+        let json_str = serde_json::to_string(&json).expect("serialize");
+
+        // Mnemonic branch.
+        let via_phrase = pair_from_key_json(&json_str).expect("recover via phrase");
+        assert_eq!(via_phrase.public(), original.public());
+
+        // Seed branch: strip the phrase so the fallback is exercised.
+        let seed_only = serde_json::json!({
+            "secretPhrase": "",
+            "secretSeed": seed_hex,
+        });
+        let via_seed =
+            pair_from_key_json(&seed_only.to_string()).expect("recover via seed");
+        assert_eq!(via_seed.public(), original.public());
+    }
+
+    #[test]
+    fn load_coldkey_roundtrip_via_create() {
+        // The highest-value load-path test: drive the full pipeline
+        // (generate → write → decrypt → load → sign) and confirm the
+        // ss58 matches the create-time ss58. This exercises
+        // `decrypt_key_data`, `load_coldkey`, and `pair_from_key_json`
+        // on the zeroized code path.
+        let _guard = HOME_LOCK.lock().expect("home lock");
+        let tmp = std::env::temp_dir().join(format!("btt-load-zeroize-{}", std::process::id()));
+        let wallet_name = "load-zero-test";
+
+        let original_home = std::env::var("HOME").ok();
+        let wallets_parent = tmp.join(".bittensor").join("wallets");
+        std::fs::create_dir_all(&wallets_parent).expect("create temp dir");
+        std::env::set_var("HOME", tmp.to_str().expect("valid path"));
+
+        let password = "load-zero-pw";
+        let cr = create(wallet_name, "default", 12, password, false).expect("create");
+
+        // load_coldkey is private; invoke it indirectly via `sign`.
+        let sr =
+            sign(wallet_name, "default", "hi", false, Some(password)).expect("sign coldkey");
+
+        if let Some(h) = original_home {
+            std::env::set_var("HOME", &h);
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            sr.ss58_address, cr.coldkey_ss58,
+            "load_coldkey must reproduce the create-time ss58"
+        );
+    }
+
     #[test]
     fn parse_hex_with_prefix() {
         let bytes = parse_hex_bytes("0xdeadbeef").expect("should parse");
-        assert_eq!(bytes, vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(bytes.as_slice(), [0xde, 0xad, 0xbe, 0xef].as_slice());
     }
 
     #[test]
     fn parse_hex_without_prefix() {
         let bytes = parse_hex_bytes("deadbeef").expect("should parse");
-        assert_eq!(bytes, vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(bytes.as_slice(), [0xde, 0xad, 0xbe, 0xef].as_slice());
     }
 
     #[test]
