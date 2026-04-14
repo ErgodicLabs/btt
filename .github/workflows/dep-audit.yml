@@ -116,10 +116,19 @@ jobs:
           VERBOSE: ${{ inputs.verbose && '1' || '0' }}
         run: |
           chmod +x scripts/dep-audit/run-one.sh
-          # Suspend bash -e around the script so its exit status flows
-          # through to the artifact instead of aborting the job. The
-          # combine job re-derives pass/fail from the per-tool status
-          # files in the downloaded artifacts.
+          # Suspend bash -e around the script so we can capture the
+          # exit status into the status file (which the combine job
+          # re-reads) before propagating it out of the step. The
+          # artifact upload step below is `if: always()` so the report
+          # and status file still upload on tool failure, and the
+          # combine job has `if: !cancelled()` so it still runs and
+          # posts its verdict even when a matrix cell fails.
+          #
+          # Issue #65: the previous version ended with tool_exit=0 as
+          # the last expression, so every matrix cell reported SUCCESS
+          # regardless of tool result. Now the cell's status check
+          # mirrors the tool's own exit — `audit (cargo-deny): fail`
+          # when cargo-deny reported advisories, `pass` when it didn't.
           set +e
           scripts/dep-audit/run-one.sh '${{ matrix.tool }}' \
             > 'report-${{ matrix.tool }}.md' \
@@ -134,6 +143,7 @@ jobs:
             cat 'stderr-${{ matrix.tool }}.log'
           fi
           echo "tool_exit=${tool_exit}" >> "$GITHUB_OUTPUT"
+          exit "${tool_exit}"
 
       - name: Upload ${{ matrix.tool }} artifact
         if: always()
@@ -192,7 +202,12 @@ jobs:
   combine:
     runs-on: ubuntu-latest
     needs: [audit, checksum]
-    if: always()
+    # `!cancelled()` runs combine on both success and failure of the
+    # matrix cells and checksum job, but NOT when the whole workflow is
+    # cancelled mid-run. Issue #65: we need combine to run even when a
+    # matrix cell fails (so reviewers still get the aggregated PR
+    # comment) while still honoring cancellation.
+    if: ${{ !cancelled() }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
