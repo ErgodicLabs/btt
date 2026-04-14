@@ -186,6 +186,13 @@ jobs:
             cat stderr-checksum.log
           fi
           echo "tool_exit=${tool_exit}" >> "$GITHUB_OUTPUT"
+          # Mirror the #65/#70 fix: propagate the tool exit so the per-cell
+          # `checksum` status check accurately reflects whether the tripwire
+          # fired. The upload step below is `if: always()` so the artifact
+          # still reaches combine even when we exit non-zero here. The
+          # combine job's `if: !cancelled()` predicate already tolerates
+          # failed needs, so this change is strictly additive.
+          exit "${tool_exit}"
 
       - name: Upload checksum artifact
         if: always()
