@@ -75,9 +75,15 @@ btt wallet create --name compat-test --password-file /dev/shm/btt-pw
 shred -u /dev/shm/btt-pw
 ```
 
-On unix, btt refuses to read the file if its mode is other-readable. Do not
-use `--password-file` with mainnet wallets unless your filesystem, process
-listing, and shell history are all under your control.
+On unix, btt refuses to read the file if its mode is other-readable. The
+file must be at most 64 KiB; anything larger is refused outright. A leading
+UTF-8 BOM (`\xef\xbb\xbf`) is stripped on read, so password files created by
+PowerShell's `Out-File -Encoding utf8` (which prepends a BOM) still match
+the password used at wallet creation — but prefer `Set-Content -Encoding
+ascii` or equivalent to avoid the ambiguity in the first place.
+
+Do not use `--password-file` with mainnet wallets unless your filesystem,
+process listing, and shell history are all under your control.
 
 ## Overwrite protection
 
