@@ -67,7 +67,7 @@ impl Sr25519Signer {
 
 impl subxt::tx::Signer<PolkadotConfig> for Sr25519Signer {
     fn account_id(&self) -> SubxtAccountId32 {
-        self.account_id.clone()
+        self.account_id
     }
 
     fn sign(&self, signer_payload: &[u8]) -> SubxtMultiSignature {
