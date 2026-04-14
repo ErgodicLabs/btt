@@ -55,17 +55,22 @@ pub fn list() -> Result<WalletList, BttError> {
             .to_string_lossy()
             .to_string();
 
-        // Skip staging and backup directories left behind by
-        // `wallet create` (issue #29). The atomic-create path writes a
-        // sibling `.tmp.<wallet>.<pid>.<nanos>.<ctr>` staging dir, and
+        // Skip staging, backup, and lock files left behind by
+        // `wallet create`. The atomic-create path writes a sibling
+        // `.tmp.<wallet>.<pid>.<nanos>.<ctr>` staging dir (issue #29),
         // the `--force` promote path writes a sibling
         // `.bak.<wallet>.<pid>.<nanos>.<ctr>` backup dir during the
-        // swap. Both prefixes are reserved (see `wallet_keys::create`,
-        // which refuses to create a wallet with either prefix). Stale
-        // `.tmp.*` / `.bak.*` dirs from a crashed run are left on disk
-        // deliberately (forensics) but must not appear in `wallet list`
-        // as if they were real wallets.
-        if wallet_name.starts_with(".tmp.") || wallet_name.starts_with(".bak.") {
+        // swap (PR #40), and the per-wallet `flock(2)` sentinel lives
+        // at `.lock.<wallet>` (issue #41). All three prefixes are
+        // reserved — `wallet_keys::create` refuses to create a wallet
+        // whose name starts with any of them. Stale `.tmp.*` / `.bak.*`
+        // dirs from a crashed run and persistent `.lock.*` sentinels
+        // are deliberately left on disk but must not appear in `wallet
+        // list` as if they were real wallets.
+        if wallet_name.starts_with(".tmp.")
+            || wallet_name.starts_with(".bak.")
+            || wallet_name.starts_with(".lock.")
+        {
             continue;
         }
 

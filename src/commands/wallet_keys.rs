@@ -6,6 +6,100 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Per-wallet `flock(2)` advisory locking for the `wallet create` path.
+///
+/// Two simultaneous `btt wallet create --force --name foo` invocations
+/// from different processes could interleave the backup-and-rename
+/// sequence in [`promote_staged_into_existing`] and lose the user's
+/// wallet (see issue #41 for the full race analysis). The fix is a
+/// per-wallet-name lock file at `<wallets>/.lock.<name>` held under
+/// `flock(LOCK_EX)` for the duration of `create`, so concurrent creates
+/// on the same name serialize while creates on different names remain
+/// independent.
+///
+/// We declare `flock` directly via an `extern "C"` block rather than
+/// pulling `libc`, `nix`, or `fs2` as a new dependency — see PR #21 for
+/// the dep-discipline rationale. `flock(2)`, `LOCK_EX`, and `LOCK_UN`
+/// are POSIX and their ABI has been stable on linux, macOS, and BSDs
+/// for decades; a one-symbol FFI declaration is safer and smaller than
+/// the blast radius of a new transitive crate.
+#[cfg(unix)]
+mod flock_sys {
+    use std::fs::File;
+    use std::io;
+    use std::os::unix::io::AsRawFd;
+
+    // POSIX advisory lock constants from <sys/file.h>. Stable ABI on
+    // linux, macOS, and BSDs — these values have not changed in 30+
+    // years. We declare `flock()` directly to avoid pulling `libc` as
+    // a new dep; see PR #21.
+    extern "C" {
+        fn flock(fd: i32, op: i32) -> i32;
+    }
+    const LOCK_EX: i32 = 2;
+    const LOCK_UN: i32 = 8;
+
+    /// Owns a [`File`] handle with a `LOCK_EX` advisory lock held on
+    /// its file descriptor. The lock is released on drop — explicitly
+    /// via `LOCK_UN` for clarity, and implicitly by `close(2)` when
+    /// `File` drops immediately afterwards (a redundancy that is also
+    /// a safety net if the explicit call ever fails).
+    pub struct LockGuard {
+        // Kept alive until drop. The file is never read or written —
+        // it exists only as a stable fd to carry the flock.
+        _file: File,
+    }
+
+    impl LockGuard {
+        /// Acquire `LOCK_EX` on `file`'s descriptor. Blocks until the
+        /// lock is available. Returns an I/O error if the syscall
+        /// fails.
+        pub fn acquire(file: File) -> io::Result<LockGuard> {
+            let fd = file.as_raw_fd();
+            // SAFETY: `fd` is a valid, open file descriptor owned by
+            // `file` for the duration of this call. `flock` with
+            // `LOCK_EX` has no memory-safety preconditions beyond a
+            // valid fd, and we check the return value.
+            let rc = unsafe { flock(fd, LOCK_EX) };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(LockGuard { _file: file })
+        }
+    }
+
+    impl Drop for LockGuard {
+        fn drop(&mut self) {
+            let fd = self._file.as_raw_fd();
+            // SAFETY: `fd` is still a valid fd (the `File` has not
+            // been dropped yet; it drops immediately after this call
+            // returns). `flock` with `LOCK_UN` has no memory-safety
+            // preconditions. We ignore the return value — `close(2)`
+            // on the file in the `File` drop will release the lock
+            // regardless.
+            let _ = unsafe { flock(fd, LOCK_UN) };
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod flock_sys {
+    use std::fs::File;
+    use std::io;
+
+    /// Windows stub: we do not currently implement file locking on
+    /// windows. Concurrent `wallet create --force` on windows is
+    /// undefined behavior; the race documented in issue #41 is left
+    /// unaddressed pending a follow-up that uses `LockFileEx` on the
+    /// same sentinel file. Linux/macOS are the primary btt targets.
+    pub struct LockGuard;
+    impl LockGuard {
+        pub fn acquire(_file: File) -> io::Result<LockGuard> {
+            Ok(LockGuard)
+        }
+    }
+}
+
 use serde::{Deserialize, Serialize};
 use sp_core::crypto::{Pair as TraitPair, Ss58Codec};
 use sp_core::sr25519::{Pair, Public, Signature};
@@ -378,25 +472,68 @@ pub fn create(
     password: &str,
     force: bool,
 ) -> Result<CreateResult, BttError> {
-    // Reject wallet names starting with the reserved staging/backup
+    // Reject wallet names starting with the reserved staging/backup/lock
     // prefixes. `.tmp.` is reserved for the sibling staging dir used by
-    // the atomic create path, and `.bak.` is reserved for the backup dir
-    // used by `promote_staged_into_existing` on the `--force` path. If a
-    // user legitimately named a wallet `.tmp.foo` or `.bak.foo`, it would
-    // be silently filtered by `wallet list` (see `wallet.rs`), so we
-    // refuse to create one at all. The check runs before
-    // `validate_n_words` so a bad name fails fast without any further
-    // work.
-    if wallet_name.starts_with(".tmp.") || wallet_name.starts_with(".bak.") {
+    // the atomic create path, `.bak.` is reserved for the backup dir
+    // used by `promote_staged_into_existing` on the `--force` path, and
+    // `.lock.` is reserved for the per-wallet-name `flock(2)` sentinel
+    // file used to serialize concurrent `--force` invocations (issue
+    // #41). All three prefixes are silently filtered by `wallet list`
+    // (see `wallet.rs`), so we refuse to create one at all. The check
+    // runs before `validate_n_words` so a bad name fails fast without
+    // any further work.
+    if wallet_name.starts_with(".tmp.")
+        || wallet_name.starts_with(".bak.")
+        || wallet_name.starts_with(".lock.")
+    {
         return Err(BttError::invalid_input(format!(
-            "wallet name '{}' uses a reserved prefix (.tmp. or .bak.). \
-             These prefixes are reserved for atomic-create staging and \
-             force-overwrite backups; pick a different name.",
+            "wallet name '{}' uses a reserved prefix (.tmp., .bak., or .lock.). \
+             These prefixes are reserved for atomic-create staging, \
+             force-overwrite backups, and per-wallet lock files; pick a \
+             different name.",
             wallet_name
         )));
     }
 
     validate_n_words(n_words)?;
+
+    // Per-wallet `flock(2)` to serialize concurrent `wallet create`
+    // invocations on the same wallet name. Held for the full duration
+    // of `create` — acquired BEFORE `guard_create_overwrite` so that
+    // the check-then-write sequence in the force path is atomic with
+    // respect to other btt processes on this host. See issue #41 for
+    // the concrete interleaving this closes. The lock file lives at
+    // `<wallets>/.lock.<name>`, is created 0600 if absent, and is
+    // reused across runs (never auto-cleaned — issue #42 may decide
+    // to reap stale lock files alongside `.tmp.*` / `.bak.*`).
+    //
+    // The lock granularity is per-wallet-name: two `create --name
+    // alice` calls serialize, while `create --name alice` and
+    // `create --name bob` run in parallel because they acquire
+    // different lock files. Locking the whole `wallets/` directory
+    // would be overly conservative.
+    ensure_wallets_root()?;
+    let lock_path = paths::wallets_dir()?.join(format!(".lock.{wallet_name}"));
+    let mut lock_open = fs::OpenOptions::new();
+    lock_open.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        lock_open.mode(0o600);
+    }
+    let lock_file = lock_open.open(&lock_path).map_err(|e| {
+        BttError::io(format!(
+            "failed to open wallet lock file {}: {}",
+            lock_path.display(),
+            e
+        ))
+    })?;
+    let _lock = flock_sys::LockGuard::acquire(lock_file).map_err(|e| {
+        BttError::io(format!(
+            "failed to acquire flock on wallet lock file {}: {}",
+            lock_path.display(),
+            e
+        ))
+    })?;
 
     // Resolve paths and refuse overwrite BEFORE generating key material.
     // We check both the coldkey and the hotkey file: either one existing
@@ -2835,16 +2972,18 @@ mod tests {
 
     #[test]
     fn wallet_create_rejects_reserved_prefix() {
-        // `.tmp.` and `.bak.` are reserved for staging and backup
-        // directories. A user-facing wallet with either prefix would
-        // be invisible to `wallet list` (the list path filters them),
-        // so `create` must refuse the name at the door — before
-        // validate_n_words, before any key material is generated.
+        // `.tmp.`, `.bak.`, and `.lock.` are reserved for staging,
+        // backup, and lock sentinel files. A user-facing wallet with
+        // any of these prefixes would be invisible to `wallet list`
+        // (the list path filters them), so `create` must refuse the
+        // name at the door — before validate_n_words, before any key
+        // material is generated.
         let _guard = HOME_LOCK.lock().expect("home lock");
         let (tmp, original) = seat_home("reserved-prefix");
 
         let tmp_result = create(".tmp.foo", "default", 12, "pw", false);
         let bak_result = create(".bak.foo", "default", 12, "pw", false);
+        let lock_result = create(".lock.foo", "default", 12, "pw", false);
 
         restore_home(tmp, original);
 
@@ -2868,6 +3007,219 @@ mod tests {
         assert!(
             bak_msg.contains(".bak."),
             "error should quote the .bak. prefix, got: {bak_msg}"
+        );
+
+        let lock_err = unwrap_err(lock_result, ".lock. name should be rejected");
+        let lock_msg = format!("{lock_err:?}");
+        assert!(
+            lock_msg.contains("reserved prefix"),
+            "error should mention reserved prefix, got: {lock_msg}"
+        );
+        assert!(
+            lock_msg.contains(".lock."),
+            "error should quote the .lock. prefix, got: {lock_msg}"
+        );
+        assert!(
+            matches!(lock_err.code, crate::error::ErrorCode::InvalidInput),
+            "reject should be invalid_input, got: {lock_err:?}"
+        );
+    }
+
+    // ── flock(2) concurrency tests (issue #41) ───────────────────────
+    //
+    // These tests pin the per-wallet `flock(LOCK_EX)` serialization
+    // added in response to the round-2 concurrent-`--force` race.
+    // They all take `HOME_LOCK` because they mutate HOME / XDG env
+    // vars, and they use `std::thread::scope` + `std::sync::Barrier`
+    // to coordinate lock hand-off without spinning or sleeping.
+
+    /// Helper: open (or create) the per-wallet lock file and acquire
+    /// `LOCK_EX` on it, using the same code path as `create()`. Used
+    /// by the flock tests to prove the lock is held or released at a
+    /// given point in time.
+    fn acquire_wallet_lock(wallet_name: &str) -> flock_sys::LockGuard {
+        let lock_path = paths::wallets_dir()
+            .expect("wallets dir")
+            .join(format!(".lock.{wallet_name}"));
+        let mut open = fs::OpenOptions::new();
+        open.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            open.mode(0o600);
+        }
+        let file = open.open(&lock_path).expect("open lock file");
+        flock_sys::LockGuard::acquire(file).expect("flock LOCK_EX")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wallet_create_acquires_lock() {
+        // Background thread grabs the per-wallet lock and holds it
+        // for ~200ms, then releases. The main thread calls `create`
+        // and must block until the background thread lets go. We
+        // measure elapsed wall time to confirm the blocking actually
+        // occurred (a lock-free implementation would return in ~0ms).
+        use std::sync::Barrier;
+        use std::time::{Duration, Instant};
+
+        let _guard = HOME_LOCK.lock().expect("home lock");
+        let (tmp, original) = seat_home("flock-acquires");
+
+        let wallet_name = "w-flock-acq";
+        let barrier = Barrier::new(2);
+        let result: Result<CreateResult, BttError> = std::thread::scope(|s| {
+            let bg = s.spawn(|| {
+                // Acquire the lock, signal the main thread, sleep,
+                // release. The drop at the end of this closure is
+                // what releases the flock.
+                let _held = acquire_wallet_lock(wallet_name);
+                barrier.wait();
+                std::thread::sleep(Duration::from_millis(200));
+            });
+            // Wait until the background thread has the lock.
+            barrier.wait();
+            let start = Instant::now();
+            let r = create(wallet_name, "default", 12, "pw", false);
+            let elapsed = start.elapsed();
+            bg.join().expect("bg thread");
+            // The create call should have blocked for at least most
+            // of the 200ms sleep. Use a slack of 100ms to absorb
+            // scheduler jitter.
+            assert!(
+                elapsed >= Duration::from_millis(100),
+                "create should have blocked on the flock for ~200ms, \
+                 observed {elapsed:?}"
+            );
+            r
+        });
+
+        restore_home(tmp, original);
+        let cr = result.expect("create should succeed once lock releases");
+        assert!(cr.coldkey_ss58.starts_with('5'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wallet_create_releases_lock_on_success() {
+        // After a successful `create`, a second `flock(LOCK_EX)` call
+        // must acquire immediately (no blocking). If the first call
+        // leaked the lock, the second acquisition would block forever;
+        // we use a thread with a short timeout via a channel to catch
+        // that case.
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let _guard = HOME_LOCK.lock().expect("home lock");
+        let (tmp, original) = seat_home("flock-release-ok");
+
+        let wallet_name = "w-flock-rel-ok";
+        let result = create(wallet_name, "default", 12, "pw", false);
+
+        // Second thread: try to acquire the lock. On success it
+        // sends `()`. The main thread waits with a 2s timeout; if
+        // it times out the first create must have leaked the lock.
+        let (tx, rx) = mpsc::channel();
+        let name_owned = wallet_name.to_string();
+        let handle = std::thread::spawn(move || {
+            let start = Instant::now();
+            let _held = acquire_wallet_lock(&name_owned);
+            let _ = tx.send(start.elapsed());
+            // Drop the guard here, releasing the lock.
+        });
+        let elapsed = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("lock must be free after successful create");
+        handle.join().expect("thread");
+
+        restore_home(tmp, original);
+        let _cr = result.expect("create should succeed");
+        // Sanity: the second acquisition should be effectively
+        // instant — if it took more than 500ms the kernel is under
+        // suspicious load, but don't fail the test on that alone.
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "lock reacquire took {elapsed:?}, expected near-zero"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wallet_create_releases_lock_on_error() {
+        // Same shape as the success test, but trigger an error inside
+        // the create path via `BTT_FAIL_BEFORE_PUBLISH`. The lock must
+        // still be released when the error propagates out of `create`.
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let _guard = HOME_LOCK.lock().expect("home lock");
+        let (tmp, original) = seat_home("flock-release-err");
+
+        let wallet_name = "w-flock-rel-err";
+        // First create to populate the target so the --force path
+        // triggers and promote_staged_into_existing runs (which is
+        // where BTT_FAIL_BEFORE_PUBLISH fires).
+        let _first = create(wallet_name, "default", 12, "pw", false)
+            .expect("baseline create");
+
+        std::env::set_var("BTT_FAIL_BEFORE_PUBLISH", "1");
+        let result = create(wallet_name, "default", 12, "pw", true);
+        std::env::remove_var("BTT_FAIL_BEFORE_PUBLISH");
+
+        // Now attempt to re-acquire the lock from another thread —
+        // if the error path leaked the lock, this will hang.
+        let (tx, rx) = mpsc::channel();
+        let name_owned = wallet_name.to_string();
+        let handle = std::thread::spawn(move || {
+            let start = Instant::now();
+            let _held = acquire_wallet_lock(&name_owned);
+            let _ = tx.send(start.elapsed());
+        });
+        let elapsed = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("lock must be free after errored create");
+        handle.join().expect("thread");
+
+        restore_home(tmp, original);
+        let err = unwrap_err(result, "BTT_FAIL_BEFORE_PUBLISH should error");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("BTT_FAIL_BEFORE_PUBLISH"),
+            "expected synthetic failure in error, got: {msg}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "lock reacquire took {elapsed:?}, expected near-zero"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wallet_list_skips_lock_files() {
+        // Plant a `.lock.example` file manually inside `<wallets>/`
+        // and confirm `wallet::list` does not surface it. The file
+        // filter (`!path.is_dir()`) is the first line of defense, but
+        // we still keep the explicit `.lock.*` skip for defense in
+        // depth.
+        let _guard = HOME_LOCK.lock().expect("home lock");
+        let (tmp, original) = seat_home("flock-list-skip");
+
+        // Create a real wallet so `list` has at least one entry.
+        let _cr = create("real", "default", 12, "pw", false).expect("create");
+        let wallets_parent = test_wallets_parent(&tmp);
+        let lock_file = wallets_parent.join(".lock.example");
+        std::fs::write(&lock_file, b"").expect("plant lock file");
+
+        let listing = crate::commands::wallet::list().expect("wallet list");
+        let names: Vec<&str> = listing.wallets.iter().map(|w| w.name.as_str()).collect();
+
+        restore_home(tmp, original);
+        assert!(
+            names.contains(&"real"),
+            "real wallet should still be listed: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with(".lock.")),
+            "wallet list must skip .lock.* files, got: {names:?}"
         );
     }
 
