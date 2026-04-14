@@ -5,20 +5,16 @@ name: btcli-compat
 # See scripts/btcli-compat/README.md for the design.
 
 on:
+  # No paths filter: this workflow runs on EVERY pull_request and EVERY
+  # push to main, regardless of which files changed. Per neeraj 2026-04-14:
+  # "btcli compat and audit/deny should always trigger". The previous
+  # paths filter was too narrow — a PR touching only cli/dispatch/main.rs
+  # or a merge commit that brought in cross-path changes would silently
+  # skip the verifier, which is how the 2026-04-14 empty-password
+  # regression went undetected for 14 PRs. Branch protection on main now
+  # has `verify` as a required check, so "always trigger" also means
+  # "always block merge until green".
   pull_request:
-    paths:
-      - "src/commands/wallet_keys.rs"
-      - "src/commands/password_file.rs"
-      # main.rs and cli.rs added per #14 NEW-L1: a future PR that
-      # rewires --password-file via the dispatch helper or the flag
-      # declaration without touching wallet_keys.rs / password_file.rs
-      # would otherwise silently skip this verifier.
-      - "src/main.rs"
-      - "src/cli.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "scripts/btcli-compat/**"
-      - ".github/workflows/btcli-compat.yml"
   push:
     branches:
       - main
