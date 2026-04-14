@@ -209,32 +209,32 @@ jobs:
           set -uo pipefail
           artifacts_root='dep-audit-artifacts'
           combined='combined-report.md'
-
-          {
-            printf '## Dep audit\n\n'
-            printf 'Run against `%s` on `%s`.\n\n' \
-              "$(git rev-parse --short HEAD)" \
-              "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
-          } > "${combined}"
+          sections='sections.md'
+          : > "${sections}"
 
           overall_exit=0
           # Fixed order so the combined report is deterministic regardless
           # of matrix scheduling. checksum comes last so the supply-chain
-          # tripwire verdict is the final thing a reviewer sees.
+          # tripwire is the final section a reviewer expands.
           for tool in cargo-audit cargo-deny cargo-outdated checksum; do
             artifact_dir="${artifacts_root}/dep-audit-${tool}-${{ github.run_id }}"
             report="${artifact_dir}/report-${tool}.md"
             status_file="${artifact_dir}/status-${tool}.txt"
 
             if [ ! -f "${report}" ]; then
-              printf '### %s\n\n' "${tool}" >> "${combined}"
-              printf '(report missing — job crashed before writing output)\n\n' >> "${combined}"
+              # Auto-expand the placeholder so a missing artifact is loud.
+              {
+                printf '<details open>\n'
+                printf '<summary><strong>%s</strong></summary>\n\n' "${tool}"
+                printf '(report missing — job crashed before writing output)\n\n'
+                printf '</details>\n\n'
+              } >> "${sections}"
               overall_exit=1
               continue
             fi
 
-            cat "${report}" >> "${combined}"
-            printf '\n' >> "${combined}"
+            cat "${report}" >> "${sections}"
+            printf '\n' >> "${sections}"
 
             if [ -f "${status_file}" ]; then
               tool_exit="$(cat "${status_file}")"
@@ -246,11 +246,21 @@ jobs:
             fi
           done
 
-          if [ "${overall_exit}" = "0" ]; then
-            printf 'STATUS: PASS\n' >> "${combined}"
-          else
-            printf 'STATUS: FAIL\n' >> "${combined}"
-          fi
+          # Write the combined report with STATUS at the TOP so the
+          # high-level verdict is visible without scrolling or
+          # expanding any <details> block.
+          {
+            printf '## Dep audit\n\n'
+            printf 'Run against `%s` on `%s`.\n\n' \
+              "$(git rev-parse --short HEAD)" \
+              "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+            if [ "${overall_exit}" = "0" ]; then
+              printf 'STATUS: PASS\n\n'
+            else
+              printf 'STATUS: FAIL\n\n'
+            fi
+            cat "${sections}"
+          } > "${combined}"
 
           echo '--- combined report ---'
           cat "${combined}"
