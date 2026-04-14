@@ -75,10 +75,11 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                 hotkey,
                 n_words,
                 password_file,
+                force,
             } => {
                 let password = resolve_coldkey_password(password_file.as_deref())?;
                 let result =
-                    commands::wallet_keys::create(&name, &hotkey, n_words, &password)?;
+                    commands::wallet_keys::create(&name, &hotkey, n_words, &password, force)?;
                 output::print_success(&result, pretty);
             }
             WalletAction::NewColdkey {

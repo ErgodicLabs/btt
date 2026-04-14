@@ -47,13 +47,21 @@ listing, and shell history are all under your control.
 
 ## Overwrite protection
 
-The key-generation subcommands (`wallet new-coldkey`, `wallet new-hotkey`,
-`wallet regen-coldkey`, `wallet regen-hotkey`) refuse by default to run
-when the target key file already exists, and emit an error naming the
-file. Pass `--force` to acknowledge that the existing key will be deleted
-and replaced; when `--force` is used, btt writes a one-line warning to
-stderr naming the file being destroyed. Recovering an overwritten key
-requires its mnemonic or seed, so back both up before forcing.
+The key-generation subcommands (`wallet create`, `wallet new-coldkey`,
+`wallet new-hotkey`, `wallet regen-coldkey`, `wallet regen-hotkey`) refuse
+by default to run when the target key file already exists, and emit an
+error naming the file. Pass `--force` to acknowledge that the existing key
+will be deleted and replaced; when `--force` is used, btt writes a
+one-line warning to stderr naming the file being destroyed. Recovering an
+overwritten key requires its mnemonic or seed, so back both up before
+forcing.
+
+`wallet create` is a special case: `--force` destroys the entire wallet
+(both coldkey and hotkey) and mints a brand new mnemonic. There is no way
+to reconstruct the old wallet from the command's own inputs, so the
+refusal error explicitly warns about irreversibility. If you only want to
+replace one half of a wallet, use `new-coldkey` / `new-hotkey` /
+`regen-coldkey` / `regen-hotkey` instead.
 
 ## btcli format compatibility
 

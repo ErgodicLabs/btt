@@ -85,6 +85,15 @@ pub enum WalletAction {
         /// history are all under your control.
         #[arg(long, value_name = "PATH")]
         password_file: Option<String>,
+        /// Overwrite an existing wallet if one is present. Without this
+        /// flag, the command refuses to run when a coldkey or hotkey file
+        /// at the target wallet path already exists. With this flag, the
+        /// existing coldkey AND hotkey are destroyed before the new pair
+        /// is written. THIS IS IRREVERSIBLE — recovering the old wallet
+        /// requires its mnemonic or seed. Back up the existing mnemonic
+        /// first if you have not.
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
 
     /// Generate a new coldkey only
