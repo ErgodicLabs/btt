@@ -1628,7 +1628,9 @@ pub fn read_password(prompt: &str) -> Result<Zeroizing<String>, BttError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::paths::ENV_LOCK;
+    use crate::commands::paths::{
+        seat_config_env_at, wallets_parent_for, EnvGuard, ENV_LOCK,
+    };
     use sp_core::Pair as TraitPairAlias;
 
     // Tests that mutate the config-dir env vars cannot run in parallel
@@ -1638,69 +1640,28 @@ mod tests {
     static HOME_LOCK: &std::sync::Mutex<()> = &ENV_LOCK;
 
     /// Pin the btt config directory to `<tmp>` for the duration of the
-    /// currently running test. Sets the per-OS env vars that
+    /// returned guard. Sets the per-OS env vars that
     /// [`crate::commands::paths::config_dir`] consults so the resolver
     /// returns a path inside `tmp`, and ensures the directory tree exists
     /// so the legacy-fallback branch is never taken.
     ///
-    /// Returns the `<tmp>/.../wallets` path — i.e., exactly the parent of
-    /// `<wallet_name>` that `wallet_path(name)` will produce.
+    /// Returns `(guard, wallets_parent)`. The guard restores `HOME`,
+    /// `XDG_CONFIG_HOME`, and `APPDATA` to their prior values on drop;
+    /// the `wallets_parent` is exactly the parent of `<wallet_name>` that
+    /// `wallet_path(name)` will produce.
     ///
-    /// Caller must hold `HOME_LOCK`.
-    fn seat_home_env(tmp: &std::path::Path) -> PathBuf {
-        // Always set HOME (macOS resolver needs it, linux fallback needs
-        // it, and some surrounding test code reads it directly).
-        std::env::set_var("HOME", tmp.to_str().expect("valid path"));
-
-        // On linux (and BSDs, via the fallback arm), pin
-        // XDG_CONFIG_HOME inside tmp so the resolver never looks at the
-        // real `$HOME/.config`.
-        #[cfg(any(
-            target_os = "linux",
-            not(any(target_os = "macos", target_os = "windows"))
-        ))]
-        {
-            let xdg = tmp.join("xdg");
-            std::env::set_var("XDG_CONFIG_HOME", xdg.to_str().expect("valid path"));
-        }
-
-        // On windows, pin APPDATA inside tmp.
-        #[cfg(target_os = "windows")]
-        {
-            let appdata = tmp.join("AppData").join("Roaming");
-            std::env::set_var("APPDATA", appdata.to_str().expect("valid path"));
-        }
-
-        // Compute what `paths::config_dir()` will now return, and make
-        // sure it exists so the legacy-fallback branch (which checks for
-        // `$HOME/.bittensor`) is never taken.
-        let parent = test_wallets_parent(tmp);
-        std::fs::create_dir_all(&parent).expect("create wallets parent");
-        parent
+    /// Delegates to `paths::seat_config_env_at` so the per-OS resolver
+    /// logic lives in exactly one place (see issue #37 item 4). Caller
+    /// must hold `HOME_LOCK`.
+    fn seat_home_env(tmp: &std::path::Path) -> (EnvGuard, PathBuf) {
+        seat_config_env_at(tmp)
     }
 
     /// Compute the `wallets/` parent dir that `paths::config_dir()` will
-    /// resolve to for a given test tmp root, on the host OS.
+    /// resolve to for a given test tmp root, on the host OS. Thin
+    /// delegation to `paths::wallets_parent_for`.
     fn test_wallets_parent(tmp: &std::path::Path) -> PathBuf {
-        #[cfg(target_os = "linux")]
-        {
-            tmp.join("xdg").join("btt").join("wallets")
-        }
-        #[cfg(target_os = "macos")]
-        {
-            tmp.join("Library")
-                .join("Application Support")
-                .join("btt")
-                .join("wallets")
-        }
-        #[cfg(target_os = "windows")]
-        {
-            tmp.join("AppData").join("Roaming").join("btt").join("wallets")
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-        {
-            tmp.join("xdg").join("btt").join("wallets")
-        }
+        wallets_parent_for(tmp)
     }
 
     #[test]
@@ -1868,9 +1829,8 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("btt-perm-{}", std::process::id()));
         let wallet_name = "perm-test";
 
-        let original_home = std::env::var("HOME").ok();
         let _ = std::fs::create_dir_all(&tmp);
-        let wallets_parent = seat_home_env(&tmp);
+        let (_env_guard, wallets_parent) = seat_home_env(&tmp);
 
         let result = create(wallet_name, "default", 12, "perm-pw", false);
 
@@ -1886,9 +1846,7 @@ mod tests {
         // Read first bytes of coldkey to confirm $NACL framing
         let coldkey_bytes = std::fs::read(&coldkey).ok();
 
-        if let Some(h) = original_home {
-            std::env::set_var("HOME", &h);
-        }
+        drop(_env_guard);
         let _ = std::fs::remove_dir_all(&tmp);
 
         result.expect("create should work");
@@ -2031,9 +1989,8 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("btt-load-zeroize-{}", std::process::id()));
         let wallet_name = "load-zero-test";
 
-        let original_home = std::env::var("HOME").ok();
         std::fs::create_dir_all(&tmp).expect("create tmp root");
-        let _wallets_parent = seat_home_env(&tmp);
+        let (_env_guard, _wallets_parent) = seat_home_env(&tmp);
 
         let password = "load-zero-pw";
         let cr = create(wallet_name, "default", 12, password, false).expect("create");
@@ -2042,9 +1999,7 @@ mod tests {
         let sr =
             sign(wallet_name, "default", "hi", false, Some(password)).expect("sign coldkey");
 
-        if let Some(h) = original_home {
-            std::env::set_var("HOME", &h);
-        }
+        drop(_env_guard);
         let _ = std::fs::remove_dir_all(&tmp);
 
         assert_eq!(
@@ -2096,18 +2051,15 @@ mod tests {
         let wallet_name = "test-wallet";
         let _wallet_dir = tmp.join(wallet_name);
 
-        // Override the config-dir env vars for this test.
-        let original_home = std::env::var("HOME").ok();
+        // Override the config-dir env vars for this test. The guard
+        // restores HOME/XDG_CONFIG_HOME/APPDATA on drop.
         std::fs::create_dir_all(&tmp).expect("create tmp root");
-        let _wallets_parent = seat_home_env(&tmp);
+        let (_env_guard, _wallets_parent) = seat_home_env(&tmp);
 
         let password = "test-password";
         let result = create(wallet_name, "default", 12, password, false);
 
-        // Restore HOME
-        if let Some(h) = original_home {
-            std::env::set_var("HOME", &h);
-        }
+        drop(_env_guard);
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2214,9 +2166,8 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("btt-test-sign-{}", std::process::id()));
         let wallet_name = "sign-test";
 
-        let original_home = std::env::var("HOME").ok();
         std::fs::create_dir_all(&tmp).expect("create tmp root");
-        let _wallets_parent = seat_home_env(&tmp);
+        let (_env_guard, _wallets_parent) = seat_home_env(&tmp);
 
         let password = "sign-test-pw";
         let cr = create(wallet_name, "default", 12, password, false).expect("create should work");
@@ -2240,9 +2191,7 @@ mod tests {
             .expect("verify hotkey sig");
         assert!(hk_vr.valid);
 
-        if let Some(h) = original_home {
-            std::env::set_var("HOME", &h);
-        }
+        drop(_env_guard);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -2263,9 +2212,11 @@ mod tests {
     // is absent regardless of the force flag.
 
     /// Helper: seat the config-dir env vars at a fresh temp dir and
-    /// return the temp path. The caller is responsible for restoring
-    /// HOME and removing the dir.
-    fn seat_home(tag: &str) -> (PathBuf, Option<String>) {
+    /// return `(tmp, env_guard)`. The guard restores HOME /
+    /// XDG_CONFIG_HOME / APPDATA on drop (symmetric restoration, see
+    /// issue #37 item 1). Pair with [`restore_home`] to also blow away
+    /// the temp directory.
+    fn seat_home(tag: &str) -> (PathBuf, EnvGuard) {
         let tmp = std::env::temp_dir().join(format!(
             "btt-force-{}-{}-{}",
             tag,
@@ -2277,16 +2228,13 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        let original_home = std::env::var("HOME").ok();
         std::fs::create_dir_all(&tmp).expect("create tmp root");
-        let _ = seat_home_env(&tmp);
-        (tmp, original_home)
+        let (guard, _parent) = seat_home_env(&tmp);
+        (tmp, guard)
     }
 
-    fn restore_home(tmp: PathBuf, original: Option<String>) {
-        if let Some(h) = original {
-            std::env::set_var("HOME", &h);
-        }
+    fn restore_home(tmp: PathBuf, guard: EnvGuard) {
+        drop(guard);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -2714,9 +2662,8 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("btt-test-regen-{}", std::process::id()));
         let wallet_name = "regen-test";
 
-        let original_home = std::env::var("HOME").ok();
         std::fs::create_dir_all(&tmp).expect("create tmp root");
-        let _wallets_parent = seat_home_env(&tmp);
+        let (_env_guard, _wallets_parent) = seat_home_env(&tmp);
 
         let password = "regen-pw";
         let cr = create(wallet_name, "default", 12, password, false).expect("create should work");
@@ -2736,9 +2683,7 @@ mod tests {
         assert!(vr.valid);
         assert_eq!(sign_result.ss58_address, cr.coldkey_ss58);
 
-        if let Some(h) = original_home {
-            std::env::set_var("HOME", &h);
-        }
+        drop(_env_guard);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
