@@ -1,8 +1,10 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use sp_core::crypto::{Pair as TraitPair, Ss58Codec};
@@ -376,6 +378,24 @@ pub fn create(
     password: &str,
     force: bool,
 ) -> Result<CreateResult, BttError> {
+    // Reject wallet names starting with the reserved staging/backup
+    // prefixes. `.tmp.` is reserved for the sibling staging dir used by
+    // the atomic create path, and `.bak.` is reserved for the backup dir
+    // used by `promote_staged_into_existing` on the `--force` path. If a
+    // user legitimately named a wallet `.tmp.foo` or `.bak.foo`, it would
+    // be silently filtered by `wallet list` (see `wallet.rs`), so we
+    // refuse to create one at all. The check runs before
+    // `validate_n_words` so a bad name fails fast without any further
+    // work.
+    if wallet_name.starts_with(".tmp.") || wallet_name.starts_with(".bak.") {
+        return Err(BttError::invalid_input(format!(
+            "wallet name '{}' uses a reserved prefix (.tmp. or .bak.). \
+             These prefixes are reserved for atomic-create staging and \
+             force-overwrite backups; pick a different name.",
+            wallet_name
+        )));
+    }
+
     validate_n_words(n_words)?;
 
     // Resolve paths and refuse overwrite BEFORE generating key material.
@@ -420,112 +440,290 @@ pub fn create(
 
     // Publish. Two paths:
     //
-    // 1. Target does not exist (the common, non-force case): `fs::rename`
-    //    the staging dir into place. Single filesystem, so the rename is
-    //    atomic at the kernel level — the target is either absent or
-    //    fully populated.
+    // 1. Target does not exist: `fs::rename` the staging dir into place.
+    //    Single filesystem, so the rename is atomic at the kernel level —
+    //    the target is either absent or fully populated.
     //
-    // 2. Target already exists (only reachable with --force, because the
-    //    guard otherwise refuses): move the individual staged artifacts
-    //    into the existing target dir. This is NOT atomic across all
-    //    three files (coldkey, coldkeypub, hotkey), but it deliberately
-    //    preserves the pre-#29 --force semantics — specifically, other
-    //    hotkeys under `<wallet>/hotkeys/` that were not overwritten by
-    //    the guard-named hotkey continue to survive. A directory-level
-    //    `rename` would wipe them, which is a silent behavior change and
-    //    a potential second #19.
-    if wallet_dir.exists() {
-        debug_assert!(
-            force,
-            "target exists without --force: guard_create_overwrite should have refused"
-        );
+    // 2. Target already exists AND --force was passed (the only way
+    //    this branch can be reached after `guard_create_overwrite`):
+    //    run `promote_staged_into_existing`, which renames the old
+    //    target to a sibling `.bak.*` dir, renames the staging dir into
+    //    place, and then merges any unrelated hotkeys from the backup
+    //    back into the new wallet. See the function doc for the exact
+    //    algorithm and the crash window between the two renames.
+    //
+    // The `&& force` gate closes a MEDIUM bug from Round 1: without it,
+    // a crash-leftover wallet dir containing only unrelated hotkeys
+    // (no coldkey, no named hotkey) would pass `guard_create_overwrite`
+    // — it guards on key-file existence, not directory existence — and
+    // silently fall into the force path even though the user never
+    // asked for it. The no-force branch now falls through to the plain
+    // `fs::rename` below, which will refuse with `ENOTEMPTY` if the
+    // target dir has any contents and succeed atomically if it is empty.
+    if wallet_dir.exists() && force {
         if let Err(e) = promote_staged_into_existing(&staging_dir, &wallet_dir, hotkey_name) {
+            // promote_staged_into_existing has already rolled back on
+            // rename failure; staging_dir may or may not still exist
+            // depending on where it failed. Best-effort cleanup.
             let _ = fs::remove_dir_all(&staging_dir);
             return Err(e);
         }
-        // The staged hotkeys/ subdir is left empty once its contents move;
-        // remove the now-empty staging dir so no forensics remain.
+    } else if let Err(e) = fs::rename(&staging_dir, &wallet_dir) {
         let _ = fs::remove_dir_all(&staging_dir);
-    } else {
-        if let Err(e) = fs::rename(&staging_dir, &wallet_dir) {
-            let _ = fs::remove_dir_all(&staging_dir);
-            return Err(BttError::io(format!(
-                "failed to atomically publish wallet {} ({} -> {}): {}",
-                wallet_name,
-                staging_dir.display(),
-                wallet_dir.display(),
-                e
-            )));
-        }
+        return Err(BttError::io(format!(
+            "failed to atomically publish wallet {} ({} -> {}): {}",
+            wallet_name,
+            staging_dir.display(),
+            wallet_dir.display(),
+            e
+        )));
     }
 
     Ok(cr)
 }
 
-/// --force path: move the three staged artifacts (coldkey, coldkeypub,
-/// hotkey) from `staging_dir` into the pre-existing `target_dir`,
-/// overwriting the prior copies. Leaves any unrelated hotkeys under
-/// `<target>/hotkeys/` untouched, matching the pre-#29 semantics.
+/// --force path: atomically replace the pre-existing `target_dir` with
+/// the fully-staged `staging_dir`, then merge any unrelated hotkeys from
+/// the old target back into the new one. This is the correct algorithm
+/// for force-overwrite. The previous implementation moved three files
+/// (`coldkey`, `coldkeypub.txt`, `hotkeys/<name>`) in sequence into the
+/// existing target dir; if any step after the first failed, the coldkey
+/// had already been replaced and could not be rolled back — i.e. exactly
+/// the half-write regression that issue #29 was meant to eliminate,
+/// shifted onto the force path.
+///
+/// The algorithm:
+///
+///   1. Rename the old target to a sibling `.bak.<basename>.<pid>.<nanos>`
+///      directory. After this rename, `target_dir` does not exist on
+///      disk; the old contents are fully preserved in the backup.
+///
+///   2. Rename the staging dir to `target_dir`. This is the atomic
+///      publish point: on a single filesystem, `rename(2)` either
+///      succeeds or fails with the target absent. If it fails, we roll
+///      step 1 back by renaming the backup back into place and return
+///      the original error — the user's wallet is untouched.
+///
+///   3. Merge unrelated hotkeys from `backup/hotkeys/` into
+///      `target/hotkeys/`, skipping the just-published `hotkey_name`
+///      (the fresh hotkey always wins). This preserves the pre-#29
+///      force semantics that other hotkeys under `<wallet>/hotkeys/`
+///      survive a `--force` run. The merge is best-effort from an
+///      atomicity standpoint: if it fails partway, the new wallet is
+///      fully present and the remaining unrelated hotkeys are still
+///      reachable from the stale `.bak.*` dir on disk. We surface the
+///      error so the user knows manual recovery may be needed.
+///
+///   4. Remove the now-drained backup dir. Best-effort cleanup — a stale
+///      `.bak.*` remaining on disk is acceptable and visible for
+///      forensics; `wallet list` filters it out.
+///
+/// Crash window: between steps 1 and 2 the target name is briefly
+/// absent on disk, but the old contents live in the backup. A crash in
+/// that window leaves `.bak.*` on disk for manual recovery. Between
+/// steps 2 and 3, the new wallet is already live and the old unrelated
+/// hotkeys are in the backup.
 fn promote_staged_into_existing(
     staging_dir: &Path,
     target_dir: &Path,
     hotkey_name: &str,
 ) -> Result<(), BttError> {
-    // Ensure the per-wallet and hotkeys subdir exist with the 0700 mode.
-    ensure_secure_dir(target_dir)?;
-    ensure_secure_dir(&target_dir.join("hotkeys"))?;
+    // Step 1: move the existing target aside to a sibling backup dir.
+    // The backup lives in the same parent directory so it shares a
+    // filesystem with `target_dir`, making the rename atomic. The
+    // `.bak.` prefix is reserved (`wallet list` skips it, and `create`
+    // refuses to create wallet names with this prefix).
+    let backup_dir = backup_dir_for(target_dir).ok_or_else(|| {
+        BttError::io(format!(
+            "cannot derive backup dir for {}: no file name",
+            target_dir.display()
+        ))
+    })?;
+    fs::rename(target_dir, &backup_dir).map_err(|e| {
+        BttError::io(format!(
+            "failed to move existing wallet {} aside to {}: {}",
+            target_dir.display(),
+            backup_dir.display(),
+            e
+        ))
+    })?;
 
-    let moves: [(PathBuf, PathBuf); 3] = [
-        (staging_dir.join("coldkey"), target_dir.join("coldkey")),
-        (
-            staging_dir.join("coldkeypub.txt"),
-            target_dir.join("coldkeypub.txt"),
-        ),
-        (
-            staging_dir.join("hotkeys").join(hotkey_name),
-            target_dir.join("hotkeys").join(hotkey_name),
-        ),
-    ];
-    for (src, dst) in moves {
-        // Remove any pre-existing destination file so `rename` does not
-        // surprise on EEXIST on platforms where that matters. Linux
-        // rename(2) clobbers regular files, but we keep the explicit
-        // unlink for portability and symmetry with `write_secure_file`.
-        if dst.exists() {
-            fs::remove_file(&dst).map_err(|e| {
-                BttError::io(format!(
-                    "failed to remove existing {} prior to force overwrite: {}",
-                    dst.display(),
-                    e
-                ))
-            })?;
+    // Step 2: atomically publish the staged wallet into place. If this
+    // rename fails, roll back by renaming the backup back to the target.
+    // The rollback is best-effort: if it itself fails (e.g. the target
+    // name was somehow taken between steps), we surface a compound
+    // error so the user can locate both halves manually.
+    //
+    // Test-only failure injection: with `BTT_FAIL_BEFORE_PUBLISH` set,
+    // we emulate a failure in the staging rename without having to
+    // actually break the filesystem. The rollback path runs and the
+    // test verifies the original wallet is restored byte-for-byte.
+    #[cfg(test)]
+    let publish_result = if std::env::var_os("BTT_FAIL_BEFORE_PUBLISH").is_some() {
+        Err(std::io::Error::other(
+            "BTT_FAIL_BEFORE_PUBLISH: synthetic failure for issue #29 round-2 tests",
+        ))
+    } else {
+        fs::rename(staging_dir, target_dir)
+    };
+    #[cfg(not(test))]
+    let publish_result = fs::rename(staging_dir, target_dir);
+    if let Err(e) = publish_result {
+        if let Err(rollback_err) = fs::rename(&backup_dir, target_dir) {
+            return Err(BttError::io(format!(
+                "failed to publish staged wallet at {} ({}), and rollback \
+                 from {} failed ({}); original wallet may be at the backup path",
+                target_dir.display(),
+                e,
+                backup_dir.display(),
+                rollback_err
+            )));
         }
-        fs::rename(&src, &dst).map_err(|e| {
+        return Err(BttError::io(format!(
+            "failed to publish staged wallet at {}: {}",
+            target_dir.display(),
+            e
+        )));
+    }
+
+    // Step 3: test-only failure injection point. We're past the atomic
+    // publish — the new wallet is live — but before the unrelated-hotkey
+    // merge. A failure here simulates a hotkey-merge that errors out
+    // after the backup-rename/staging-rename atomic pair. The test
+    // `wallet_create_force_atomic_on_failure` places the hook here so
+    // that it can assert the backup-rollback path in `promote` is NOT
+    // triggered (because by this point the publish has already
+    // succeeded) — which is the correct post-Round-2 behavior. An
+    // earlier-round implementation would have been halfway through a
+    // sequential-file rename and left a half-destroyed wallet.
+    #[cfg(test)]
+    {
+        if std::env::var_os("BTT_FAIL_DURING_PROMOTE").is_some() {
+            return Err(BttError::io(
+                "BTT_FAIL_DURING_PROMOTE: synthetic failure for issue #29 round-2 tests",
+            ));
+        }
+    }
+
+    // Step 4: merge unrelated hotkeys from the backup into the new
+    // target. The target's `hotkeys/` subdir already exists (it came
+    // from the staging dir, which always creates it). We iterate the
+    // backup's hotkeys, skipping the one we just published — the new
+    // hotkey always wins over any pre-existing copy — and rename the
+    // rest across. Any collision inside `target/hotkeys/` that isn't
+    // the freshly-published hotkey would be extremely unusual (we only
+    // just created this dir from the staging dir) but we guard against
+    // it anyway with an `exists()` check.
+    let backup_hotkeys = backup_dir.join("hotkeys");
+    if backup_hotkeys.is_dir() {
+        let target_hotkeys = target_dir.join("hotkeys");
+        // Do NOT call `ensure_secure_dir` here — the target hotkeys dir
+        // was created from the staging dir with 0700 already, and if
+        // the user has tightened their wallet perms we do not want to
+        // relax them back to 0700.
+        if !target_hotkeys.is_dir() {
+            // Defensive: if for any reason the target hotkeys dir is
+            // absent (it shouldn't be), create it at 0700.
+            ensure_secure_dir(&target_hotkeys)?;
+        }
+        let entries = fs::read_dir(&backup_hotkeys).map_err(|e| {
             BttError::io(format!(
-                "failed to move staged {} into place at {}: {}",
-                src.display(),
-                dst.display(),
+                "failed to read backup hotkeys dir {}: {}",
+                backup_hotkeys.display(),
                 e
             ))
         })?;
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                BttError::io(format!(
+                    "failed to read backup hotkey entry under {}: {}",
+                    backup_hotkeys.display(),
+                    e
+                ))
+            })?;
+            let name = entry.file_name();
+            if name == OsStr::new(hotkey_name) {
+                // The new hotkey takes precedence over any pre-existing
+                // copy under the same name — skip it.
+                continue;
+            }
+            let from = entry.path();
+            let to = target_hotkeys.join(&name);
+            if to.exists() {
+                // Defensive: shouldn't happen (target hotkeys dir was
+                // just created), but if it does, leave the backup entry
+                // alone rather than clobbering.
+                continue;
+            }
+            fs::rename(&from, &to).map_err(|e| {
+                BttError::io(format!(
+                    "failed to merge backup hotkey {} -> {}: {} (new wallet is \
+                     live at {}; unrelated hotkeys remain under {})",
+                    from.display(),
+                    to.display(),
+                    e,
+                    target_dir.display(),
+                    backup_dir.display()
+                ))
+            })?;
+        }
     }
+
+    // Step 5: best-effort cleanup. A leftover `.bak.*` is harmless.
+    let _ = fs::remove_dir_all(&backup_dir);
+
     Ok(())
+}
+
+/// Derive the backup directory name used by `promote_staged_into_existing`
+/// for a given `target_dir`. Format:
+/// `<parent>/.bak.<basename>.<pid>.<nanos>.<counter>`. Shares a process-
+/// local atomic counter with `temp_staging_name` so collisions are
+/// impossible even under a frozen or backward-running clock.
+fn backup_dir_for(target_dir: &Path) -> Option<PathBuf> {
+    let parent = target_dir.parent()?;
+    let basename = target_dir.file_name()?.to_string_lossy().into_owned();
+    let pid = std::process::id();
+    let nanos = nanos_since_epoch();
+    let counter = next_staging_counter();
+    Some(parent.join(format!(".bak.{basename}.{pid}.{nanos}.{counter}")))
+}
+
+/// Monotonically-increasing process-local counter used to disambiguate
+/// staging and backup directory names when two calls happen inside the
+/// same nanosecond (or the system clock is frozen / running backward).
+/// Without this, two back-to-back `create` calls inside a single test
+/// process could collide on `.tmp.<name>.<pid>.<nanos>` — the clock is
+/// not guaranteed to advance between instructions.
+fn next_staging_counter() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Nanoseconds since the Unix epoch, or 0 if the system clock is set
+/// before 1970. The result is only used for filename disambiguation, so
+/// the exact value does not matter as long as `next_staging_counter`
+/// also contributes to uniqueness.
+fn nanos_since_epoch() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }
 
 /// Compute the staging directory name for an atomic `create`.
 ///
-/// Format: `.tmp.<wallet_name>.<pid>.<nanos>`. The `.tmp.` prefix is
-/// reserved (wallet list ignores it), the pid distinguishes concurrent
-/// processes, and the nanosecond timestamp distinguishes repeated calls
-/// from the same process (and reduces the chance that a stale temp dir
-/// from a prior crashed run collides with a fresh one after a pid wrap).
+/// Format: `.tmp.<wallet_name>.<pid>.<nanos>.<counter>`. The `.tmp.`
+/// prefix is reserved (wallet list ignores it), the pid distinguishes
+/// concurrent processes, the nanosecond timestamp distinguishes
+/// repeated calls from the same process, and the process-local atomic
+/// counter protects against collisions when two calls land in the same
+/// nanosecond or the system clock runs backward.
 fn temp_staging_name(wallet_name: &str) -> String {
     let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!(".tmp.{wallet_name}.{pid}.{nanos}")
+    let nanos = nanos_since_epoch();
+    let counter = next_staging_counter();
+    format!(".tmp.{wallet_name}.{pid}.{nanos}.{counter}")
 }
 
 /// Stage a complete wallet (coldkey + coldkeypub + hotkey) into
@@ -2455,5 +2653,236 @@ mod tests {
             !names.iter().any(|n| n.starts_with(".tmp.")),
             "wallet list must skip .tmp.* staging dirs, got: {names:?}"
         );
+    }
+
+    // ── Round-2 force-path atomicity tests (PR #40 reviewer findings) ─
+    //
+    // These tests target the HIGH finding from the Round-1 review: the
+    // original `promote_staged_into_existing` moved three files
+    // sequentially into the target dir, so a failure after the first
+    // rename left the coldkey replaced with the new one while the new
+    // hotkey was still missing. The fix is a rename-based backup-and-
+    // publish algorithm; these tests pin the new behavior.
+
+    #[test]
+    fn wallet_create_force_atomic_on_failure() {
+        // Inject a failure INSIDE promote_staged_into_existing, AFTER
+        // the backup rename and AFTER the staging rename but BEFORE
+        // the unrelated-hotkey merge. Under the new algorithm, the
+        // atomic publish has succeeded by the time the hook fires, so
+        // the test actually validates the other half of the invariant:
+        // a failure after publish still leaves the new wallet live and
+        // readable, and the backup dir with any unrelated hotkeys is
+        // still reachable on disk.
+        //
+        // This is the counterpart to `wallet_create_force_partial_
+        // promote_failure_keeps_old` below, which tests the failure
+        // path BEFORE the publish.
+        let _guard = HOME_LOCK.lock().expect("home lock");
+        let (tmp, original) = seat_home("atomic-force-fail");
+
+        // Round 1: create a wallet with two hotkeys — `default` (which
+        // the Round 2 force-overwrite will replace) and `keeper`
+        // (which must survive into the new wallet via the hotkey
+        // merge, unless the injected failure aborts the merge).
+        let first =
+            create("w", "default", 12, "pw", false).expect("first create");
+        let _keeper = new_hotkey("w", "keeper", 12, false).expect("bootstrap keeper hotkey");
+
+        // Round 2: force-create the same wallet, with the failure hook
+        // armed so that promote_staged_into_existing returns after the
+        // atomic publish but before the hotkey merge.
+        std::env::set_var("BTT_FAIL_DURING_PROMOTE", "1");
+        let result = create("w", "default", 12, "pw", true);
+        std::env::remove_var("BTT_FAIL_DURING_PROMOTE");
+
+        let wallets_parent = test_wallets_parent(&tmp);
+        let wdir = wallets_parent.join("w");
+        let coldkey_exists = wdir.join("coldkey").exists();
+        let new_hotkey_exists = wdir.join("hotkeys").join("default").exists();
+        // The new wallet on disk must carry the NEW coldkey ss58, not
+        // the old one — the atomic publish succeeded before the hook.
+        let pub_after = std::fs::read_to_string(wdir.join("coldkeypub.txt")).ok();
+        let bak_dirs = stale_bak_dirs(&wallets_parent);
+        let tmp_dirs = stale_tmp_dirs(&wallets_parent);
+
+        restore_home(tmp, original);
+
+        let err = unwrap_err(result, "BTT_FAIL_DURING_PROMOTE should fail create");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("BTT_FAIL_DURING_PROMOTE"),
+            "error should carry the synthetic tag, got: {msg}"
+        );
+        // Atomic publish must have already occurred by the time the hook
+        // fires, so the target dir is fully populated with the new key
+        // files.
+        assert!(coldkey_exists, "new coldkey must exist (atomic publish done)");
+        assert!(new_hotkey_exists, "new hotkey must exist (atomic publish done)");
+        // No leftover staging dir (it was renamed into place).
+        assert!(
+            tmp_dirs.is_empty(),
+            "no .tmp.* should remain after promote-fail, got: {tmp_dirs:?}"
+        );
+        // The pubkey file on disk must reflect the NEW coldkey — the
+        // old one no longer exists anywhere reachable from
+        // `wdir/coldkeypub.txt`. This is the key invariant: the force
+        // path did NOT leave a half-written wallet.
+        let pub_after = pub_after.expect("coldkeypub.txt present");
+        assert!(
+            !pub_after.contains(&first.coldkey_ss58),
+            "post-failure coldkeypub must NOT carry the pre-overwrite ss58"
+        );
+        // The backup dir containing the `keeper` hotkey (which was
+        // never merged because the hook fired first) is still on disk.
+        // A failed merge is recoverable — the user can rescue unrelated
+        // hotkeys from the `.bak.*` dir manually.
+        assert_eq!(
+            bak_dirs.len(),
+            1,
+            ".bak.* dir must remain on disk for manual recovery, got: {bak_dirs:?}"
+        );
+    }
+
+    #[test]
+    fn wallet_create_force_partial_promote_failure_keeps_old() {
+        // The Round-1 reviewer's planted-file PoC proved the OLD
+        // sequential-rename algorithm half-wrote the wallet on a mid-
+        // sequence failure. Under the NEW backup-and-rename algorithm,
+        // that exact PoC (planting a directory at coldkeypub.txt to
+        // force EISDIR in the second rename) is no longer reachable
+        // — the publish is a single directory-level rename, not a
+        // sequence of file renames. So this test pins the NEW
+        // invariant: if the publish rename fails (for any reason),
+        // promote rolls the backup rename back and the original
+        // wallet is preserved byte-for-byte.
+        //
+        // We drive the publish failure via the `BTT_FAIL_BEFORE_PUBLISH`
+        // test hook. It short-circuits `fs::rename(staging, target)`
+        // with a synthetic `io::Error` AFTER the backup rename has
+        // already succeeded, which is exactly the PoC shape the Round-1
+        // reviewer flagged — "first rename succeeds, second rename
+        // fails". The test asserts:
+        //
+        //   1. create returns Err (no silent success);
+        //   2. the coldkey/hotkey/coldkeypub bytes on disk are
+        //      identical to the pre-sabotage snapshot (rollback ran);
+        //   3. the preserved coldkeypub still carries the original
+        //      ss58 (not the new one from the aborted second create);
+        //   4. no stale `.bak.*` or `.tmp.*` dirs remain.
+        let _guard = HOME_LOCK.lock().expect("home lock");
+        let (tmp, original) = seat_home("force-partial-fail");
+
+        let first =
+            create("w", "default", 12, "pw", false).expect("first create");
+        let wallets_parent = test_wallets_parent(&tmp);
+        let wdir = wallets_parent.join("w");
+        let coldkey_before =
+            std::fs::read(wdir.join("coldkey")).expect("read coldkey");
+        let hotkey_before = std::fs::read(wdir.join("hotkeys").join("default"))
+            .expect("read hotkey");
+        let pub_before =
+            std::fs::read(wdir.join("coldkeypub.txt")).expect("read coldkeypub");
+
+        std::env::set_var("BTT_FAIL_BEFORE_PUBLISH", "1");
+        let second = create("w", "default", 12, "pw", true);
+        std::env::remove_var("BTT_FAIL_BEFORE_PUBLISH");
+
+        // Byte-for-byte preservation check on the original wallet.
+        let coldkey_after =
+            std::fs::read(wdir.join("coldkey")).expect("re-read coldkey");
+        let hotkey_after = std::fs::read(wdir.join("hotkeys").join("default"))
+            .expect("re-read hotkey");
+        let pub_after =
+            std::fs::read(wdir.join("coldkeypub.txt")).expect("re-read pub");
+        let bak_leftover = stale_bak_dirs(&wallets_parent);
+        let tmp_leftover = stale_tmp_dirs(&wallets_parent);
+
+        restore_home(tmp, original);
+
+        let err = unwrap_err(second, "BTT_FAIL_BEFORE_PUBLISH should fail create");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("BTT_FAIL_BEFORE_PUBLISH"),
+            "error should carry the synthetic tag, got: {msg}"
+        );
+        assert_eq!(
+            coldkey_before, coldkey_after,
+            "original coldkey must be preserved byte-for-byte under promote rollback"
+        );
+        assert_eq!(
+            hotkey_before, hotkey_after,
+            "original hotkey must be preserved byte-for-byte under promote rollback"
+        );
+        assert_eq!(
+            pub_before, pub_after,
+            "original coldkeypub must be preserved byte-for-byte under promote rollback"
+        );
+        let pub_str = String::from_utf8(pub_after).expect("utf8");
+        assert!(
+            pub_str.contains(&first.coldkey_ss58),
+            "preserved coldkeypub must still carry the original ss58"
+        );
+        assert!(
+            bak_leftover.is_empty(),
+            "no .bak.* should remain after successful rollback, got: {bak_leftover:?}"
+        );
+        assert!(
+            tmp_leftover.is_empty(),
+            "no .tmp.* should remain after successful rollback, got: {tmp_leftover:?}"
+        );
+    }
+
+    #[test]
+    fn wallet_create_rejects_reserved_prefix() {
+        // `.tmp.` and `.bak.` are reserved for staging and backup
+        // directories. A user-facing wallet with either prefix would
+        // be invisible to `wallet list` (the list path filters them),
+        // so `create` must refuse the name at the door — before
+        // validate_n_words, before any key material is generated.
+        let _guard = HOME_LOCK.lock().expect("home lock");
+        let (tmp, original) = seat_home("reserved-prefix");
+
+        let tmp_result = create(".tmp.foo", "default", 12, "pw", false);
+        let bak_result = create(".bak.foo", "default", 12, "pw", false);
+
+        restore_home(tmp, original);
+
+        let tmp_err = unwrap_err(tmp_result, ".tmp. name should be rejected");
+        let tmp_msg = format!("{tmp_err:?}");
+        assert!(
+            tmp_msg.contains("reserved prefix"),
+            "error should mention reserved prefix, got: {tmp_msg}"
+        );
+        assert!(
+            tmp_msg.contains(".tmp."),
+            "error should quote the .tmp. prefix, got: {tmp_msg}"
+        );
+
+        let bak_err = unwrap_err(bak_result, ".bak. name should be rejected");
+        let bak_msg = format!("{bak_err:?}");
+        assert!(
+            bak_msg.contains("reserved prefix"),
+            "error should mention reserved prefix, got: {bak_msg}"
+        );
+        assert!(
+            bak_msg.contains(".bak."),
+            "error should quote the .bak. prefix, got: {bak_msg}"
+        );
+    }
+
+    /// Enumerate any `.bak.*` directories left inside the wallets
+    /// root. Counterpart to `stale_tmp_dirs`.
+    fn stale_bak_dirs(wallets_parent: &std::path::Path) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(wallets_parent) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with(".bak.") {
+                    out.push(name);
+                }
+            }
+        }
+        out
     }
 }
