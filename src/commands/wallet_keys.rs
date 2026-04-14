@@ -9,6 +9,7 @@ use sp_core::crypto::{Pair as TraitPair, Ss58Codec};
 use sp_core::sr25519::{Pair, Public, Signature};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+use crate::commands::paths;
 use crate::error::BttError;
 
 /// One TAO equals 1e9 RAO.
@@ -45,7 +46,8 @@ pub fn rao_to_tao_string(rao: u64) -> String {
 }
 
 /// Resolve a coldkey SS58 address from a wallet name.
-/// Reads `~/.bittensor/wallets/<name>/coldkeypub.txt`.
+/// Reads `<config_dir>/wallets/<name>/coldkeypub.txt` — see
+/// [`crate::commands::paths::config_dir`] for the per-OS location.
 pub fn resolve_coldkey_address(wallet_name: &str) -> Result<String, BttError> {
     let wdir = wallet_path(wallet_name)?;
     if !wdir.exists() {
@@ -701,21 +703,16 @@ fn validate_n_words(n: u32) -> Result<(), BttError> {
 }
 
 fn wallet_path(name: &str) -> Result<PathBuf, BttError> {
-    let home =
-        std::env::var("HOME").map_err(|_| BttError::io("HOME environment variable not set"))?;
-    Ok(PathBuf::from(home)
-        .join(".bittensor")
-        .join("wallets")
-        .join(name))
+    paths::wallet_dir(name)
 }
 
-/// Ensure `~/.bittensor` and `~/.bittensor/wallets` exist at mode 0700.
+/// Ensure the config directory and its `wallets/` subdirectory exist at
+/// mode 0700. The exact path is OS-dependent — see
+/// [`crate::commands::paths::config_dir`].
 fn ensure_wallets_root() -> Result<(), BttError> {
-    let home =
-        std::env::var("HOME").map_err(|_| BttError::io("HOME environment variable not set"))?;
-    let bittensor = PathBuf::from(&home).join(".bittensor");
-    ensure_secure_dir(&bittensor)?;
-    ensure_secure_dir(&bittensor.join("wallets"))?;
+    let root = paths::config_dir()?;
+    ensure_secure_dir(&root)?;
+    ensure_secure_dir(&root.join("wallets"))?;
     Ok(())
 }
 
@@ -1044,13 +1041,80 @@ pub fn read_password(prompt: &str) -> Result<Zeroizing<String>, BttError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::paths::ENV_LOCK;
     use sp_core::Pair as TraitPairAlias;
-    use std::sync::Mutex;
 
-    // Tests that mutate `HOME` cannot run in parallel because env vars are
-    // process-global. Take this mutex at the start of any test that calls
-    // `std::env::set_var("HOME", ...)`.
-    static HOME_LOCK: Mutex<()> = Mutex::new(());
+    // Tests that mutate the config-dir env vars cannot run in parallel
+    // because env vars are process-global. `HOME_LOCK` is an alias onto
+    // the shared `paths::ENV_LOCK` so we serialize against the resolver
+    // tests in `paths::tests` as well.
+    static HOME_LOCK: &std::sync::Mutex<()> = &ENV_LOCK;
+
+    /// Pin the btt config directory to `<tmp>` for the duration of the
+    /// currently running test. Sets the per-OS env vars that
+    /// [`crate::commands::paths::config_dir`] consults so the resolver
+    /// returns a path inside `tmp`, and ensures the directory tree exists
+    /// so the legacy-fallback branch is never taken.
+    ///
+    /// Returns the `<tmp>/.../wallets` path — i.e., exactly the parent of
+    /// `<wallet_name>` that `wallet_path(name)` will produce.
+    ///
+    /// Caller must hold `HOME_LOCK`.
+    fn seat_home_env(tmp: &std::path::Path) -> PathBuf {
+        // Always set HOME (macOS resolver needs it, linux fallback needs
+        // it, and some surrounding test code reads it directly).
+        std::env::set_var("HOME", tmp.to_str().expect("valid path"));
+
+        // On linux (and BSDs, via the fallback arm), pin
+        // XDG_CONFIG_HOME inside tmp so the resolver never looks at the
+        // real `$HOME/.config`.
+        #[cfg(any(
+            target_os = "linux",
+            not(any(target_os = "macos", target_os = "windows"))
+        ))]
+        {
+            let xdg = tmp.join("xdg");
+            std::env::set_var("XDG_CONFIG_HOME", xdg.to_str().expect("valid path"));
+        }
+
+        // On windows, pin APPDATA inside tmp.
+        #[cfg(target_os = "windows")]
+        {
+            let appdata = tmp.join("AppData").join("Roaming");
+            std::env::set_var("APPDATA", appdata.to_str().expect("valid path"));
+        }
+
+        // Compute what `paths::config_dir()` will now return, and make
+        // sure it exists so the legacy-fallback branch (which checks for
+        // `$HOME/.bittensor`) is never taken.
+        let parent = test_wallets_parent(tmp);
+        std::fs::create_dir_all(&parent).expect("create wallets parent");
+        parent
+    }
+
+    /// Compute the `wallets/` parent dir that `paths::config_dir()` will
+    /// resolve to for a given test tmp root, on the host OS.
+    fn test_wallets_parent(tmp: &std::path::Path) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        {
+            tmp.join("xdg").join("btt").join("wallets")
+        }
+        #[cfg(target_os = "macos")]
+        {
+            tmp.join("Library")
+                .join("Application Support")
+                .join("btt")
+                .join("wallets")
+        }
+        #[cfg(target_os = "windows")]
+        {
+            tmp.join("AppData").join("Roaming").join("btt").join("wallets")
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            tmp.join("xdg").join("btt").join("wallets")
+        }
+    }
 
     #[test]
     fn generate_12_word_keypair() {
@@ -1218,13 +1282,13 @@ mod tests {
         let wallet_name = "perm-test";
 
         let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", tmp.to_str().expect("valid path"));
         let _ = std::fs::create_dir_all(&tmp);
+        let wallets_parent = seat_home_env(&tmp);
 
         let result = create(wallet_name, "default", 12, "perm-pw", false);
 
         // Capture paths before cleanup
-        let wdir = tmp.join(".bittensor").join("wallets").join(wallet_name);
+        let wdir = wallets_parent.join(wallet_name);
         let coldkey = wdir.join("coldkey");
         let hotkey = wdir.join("hotkeys").join("default");
 
@@ -1381,9 +1445,8 @@ mod tests {
         let wallet_name = "load-zero-test";
 
         let original_home = std::env::var("HOME").ok();
-        let wallets_parent = tmp.join(".bittensor").join("wallets");
-        std::fs::create_dir_all(&wallets_parent).expect("create temp dir");
-        std::env::set_var("HOME", tmp.to_str().expect("valid path"));
+        std::fs::create_dir_all(&tmp).expect("create tmp root");
+        let _wallets_parent = seat_home_env(&tmp);
 
         let password = "load-zero-pw";
         let cr = create(wallet_name, "default", 12, password, false).expect("create");
@@ -1441,19 +1504,15 @@ mod tests {
     #[test]
     fn create_wallet_roundtrip() {
         let _guard = HOME_LOCK.lock().expect("home lock");
-        // Use a temp directory to avoid polluting ~/.bittensor
+        // Use a temp directory to avoid polluting the real config dir.
         let tmp = std::env::temp_dir().join(format!("btt-test-{}", std::process::id()));
         let wallet_name = "test-wallet";
         let _wallet_dir = tmp.join(wallet_name);
 
-        // Override HOME for this test
+        // Override the config-dir env vars for this test.
         let original_home = std::env::var("HOME").ok();
-        let _bittensor_dir = tmp.clone();
-        // We need to set up the path structure: tmp/.bittensor/wallets/test-wallet
-        let wallets_parent = tmp.join(".bittensor").join("wallets");
-        std::fs::create_dir_all(&wallets_parent).expect("create temp dir");
-
-        std::env::set_var("HOME", tmp.to_str().expect("valid path"));
+        std::fs::create_dir_all(&tmp).expect("create tmp root");
+        let _wallets_parent = seat_home_env(&tmp);
 
         let password = "test-password";
         let result = create(wallet_name, "default", 12, password, false);
@@ -1569,10 +1628,8 @@ mod tests {
         let wallet_name = "sign-test";
 
         let original_home = std::env::var("HOME").ok();
-        let wallets_parent = tmp.join(".bittensor").join("wallets");
-        std::fs::create_dir_all(&wallets_parent).expect("create temp dir");
-
-        std::env::set_var("HOME", tmp.to_str().expect("valid path"));
+        std::fs::create_dir_all(&tmp).expect("create tmp root");
+        let _wallets_parent = seat_home_env(&tmp);
 
         let password = "sign-test-pw";
         let cr = create(wallet_name, "default", 12, password, false).expect("create should work");
@@ -1618,8 +1675,9 @@ mod tests {
     // covered by case 3 — guard_overwrite short-circuits when the file
     // is absent regardless of the force flag.
 
-    /// Helper: seat HOME at a fresh temp dir and return the temp path.
-    /// The caller is responsible for restoring HOME and removing the dir.
+    /// Helper: seat the config-dir env vars at a fresh temp dir and
+    /// return the temp path. The caller is responsible for restoring
+    /// HOME and removing the dir.
     fn seat_home(tag: &str) -> (PathBuf, Option<String>) {
         let tmp = std::env::temp_dir().join(format!(
             "btt-force-{}-{}-{}",
@@ -1633,9 +1691,8 @@ mod tests {
                 .unwrap_or(0)
         ));
         let original_home = std::env::var("HOME").ok();
-        let wallets_parent = tmp.join(".bittensor").join("wallets");
-        std::fs::create_dir_all(&wallets_parent).expect("create temp dir");
-        std::env::set_var("HOME", tmp.to_str().expect("valid path"));
+        std::fs::create_dir_all(&tmp).expect("create tmp root");
+        let _ = seat_home_env(&tmp);
         (tmp, original_home)
     }
 
@@ -1681,7 +1738,7 @@ mod tests {
         // original ss58 is untouched.
         let second = new_coldkey("w", 12, "pw", false);
 
-        let wdir = tmp.join(".bittensor").join("wallets").join("w");
+        let wdir = test_wallets_parent(&tmp).join("w");
         let coldkey_exists = wdir.join("coldkey").exists();
         let pub_after = std::fs::read_to_string(wdir.join("coldkeypub.txt")).ok();
 
@@ -1747,7 +1804,7 @@ mod tests {
         let first = new_hotkey("w", "default", 12, false).expect("first hotkey");
         let second = new_hotkey("w", "default", 12, false);
 
-        let wdir = tmp.join(".bittensor").join("wallets").join("w");
+        let wdir = test_wallets_parent(&tmp).join("w");
         let hotkey_file = wdir.join("hotkeys").join("default");
         let preserved = std::fs::read_to_string(&hotkey_file).ok();
 
@@ -1912,7 +1969,7 @@ mod tests {
 
         // Snapshot the on-disk wallet files BEFORE the second call so we
         // can prove byte-for-byte preservation if the guard fires.
-        let wdir = tmp.join(".bittensor").join("wallets").join("w");
+        let wdir = test_wallets_parent(&tmp).join("w");
         let coldkey_path = wdir.join("coldkey");
         let hotkey_path = wdir.join("hotkeys").join("default");
         let pub_path = wdir.join("coldkeypub.txt");
@@ -2013,7 +2070,7 @@ mod tests {
         let _cr = new_coldkey("w", 12, "pw", false).expect("bootstrap coldkey");
         let _hk = new_hotkey("w", "default", 12, false).expect("bootstrap hotkey");
         // Delete the coldkey so only the hotkey remains.
-        let wdir = tmp.join(".bittensor").join("wallets").join("w");
+        let wdir = test_wallets_parent(&tmp).join("w");
         std::fs::remove_file(wdir.join("coldkey")).expect("rm coldkey");
         std::fs::remove_file(wdir.join("coldkeypub.txt")).expect("rm coldkeypub");
 
@@ -2039,10 +2096,8 @@ mod tests {
         let wallet_name = "regen-test";
 
         let original_home = std::env::var("HOME").ok();
-        let wallets_parent = tmp.join(".bittensor").join("wallets");
-        std::fs::create_dir_all(&wallets_parent).expect("create temp dir");
-
-        std::env::set_var("HOME", tmp.to_str().expect("valid path"));
+        std::fs::create_dir_all(&tmp).expect("create tmp root");
+        let _wallets_parent = seat_home_env(&tmp);
 
         let password = "regen-pw";
         let cr = create(wallet_name, "default", 12, password, false).expect("create should work");

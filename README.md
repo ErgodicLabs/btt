@@ -26,6 +26,40 @@ btt skill
 
 All commands output JSON to stdout. Use `--pretty` for human-readable formatting.
 
+## Config and wallet directory
+
+btt stores wallets and other per-user state under a single OS-dependent
+config directory:
+
+| OS      | Path                                                      |
+| ------- | --------------------------------------------------------- |
+| linux   | `$XDG_CONFIG_HOME/btt` if set, else `$HOME/.config/btt`   |
+| macOS   | `$HOME/Library/Application Support/btt`                   |
+| windows | `%APPDATA%\btt`                                           |
+
+Wallets live at `<config_dir>/wallets/<wallet_name>/` and hold a `coldkey`,
+`coldkeypub.txt`, and `hotkeys/<hotkey_name>` by the same layout that
+btcli uses.
+
+### Legacy path fallback
+
+Earlier versions of btt stored wallets at `$HOME/.bittensor/wallets/` (the
+btcli location). If that directory still exists on disk and the new
+config directory does not, btt continues to read and write the legacy
+location so existing wallets keep working, and prints a one-time warning
+to stderr the first time a command resolves the path:
+
+```
+btt: legacy wallet directory at /home/alice/.bittensor detected.
+     Move it to /home/alice/.config/btt to use the new location:
+         mv /home/alice/.bittensor /home/alice/.config/btt
+     btt will continue to use the legacy location until the move is performed.
+```
+
+btt never moves wallet material on your behalf. Run the `mv` yourself
+when you are ready — if you keep a parallel btcli install, you may prefer
+to leave the legacy location in place and let both tools share it.
+
 ## Non-interactive automation
 
 Commands that prompt for the coldkey password (`wallet create`, `wallet

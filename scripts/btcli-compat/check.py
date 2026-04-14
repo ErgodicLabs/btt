@@ -202,6 +202,15 @@ class BttDriver:
         self.home = home
         self.verbose = verbose
         self.home.mkdir(parents=True, exist_ok=True)
+        # Pin XDG_CONFIG_HOME so btt's OS-dependent config resolver lands
+        # inside our sandbox on linux. On other platforms we fall through
+        # to HOME-relative paths (macOS: $HOME/Library/..., windows:
+        # %APPDATA%), which btcli-compat does not run on today. The CI
+        # runners are linux-only.
+        self.xdg_config_home = self.home / "xdg"
+        self.xdg_config_home.mkdir(parents=True, exist_ok=True)
+        # Resolved btt config root for this sandbox.
+        self.btt_config_dir = self.xdg_config_home / "btt"
 
     def _run(
         self,
@@ -212,6 +221,7 @@ class BttDriver:
         env = {
             **os.environ,
             "HOME": str(self.home),
+            "XDG_CONFIG_HOME": str(self.xdg_config_home),
             **(env_extra or {}),
         }
         cmd = [str(self.binary), *args]
@@ -287,7 +297,9 @@ class BttDriver:
         return json.loads(proc.stdout.decode("utf-8"))
 
     def coldkey_path(self, wallet_name: str) -> Path:
-        return self.home / ".bittensor" / "wallets" / wallet_name / "coldkey"
+        # Matches `crate::commands::paths::config_dir` on linux with
+        # XDG_CONFIG_HOME set.
+        return self.btt_config_dir / "wallets" / wallet_name / "coldkey"
 
 
 # ── Password file helper (tmpfs-aware, mode 0600) ───────────────────────
@@ -462,7 +474,7 @@ def run_direction_b(
     the inner JSON. btt builds it; we just repack the envelope.
     """
     wallet_name = f"py2btt-{vector.index}"
-    wallet_dir = driver.home / ".bittensor" / "wallets" / wallet_name
+    wallet_dir = driver.btt_config_dir / "wallets" / wallet_name
 
     # Step 1: let btt create the wallet with a known password.
     bootstrap_pw = b"bootstrap-password-not-secret"
