@@ -2431,16 +2431,29 @@ mod tests {
         let (tmp, original) = seat_home("rc-refuse");
 
         let first = new_coldkey("w", 12, "pw", false).expect("first create");
-        // Use the freshly generated mnemonic to drive regen; we don't care
-        // about the identity it produces, only that regen refuses.
+        // Snapshot the on-disk coldkey BEFORE the second call so we can
+        // assert byte-for-byte preservation across the refusal — the
+        // load-bearing "guard is non-destructive" assertion that #20
+        // observed was missing on the regen side. (Symmetric with the
+        // new_coldkey_no_flag_existing_file_errors check.)
+        let coldkey_path = test_wallets_parent(&tmp).join("w").join("coldkey");
+        let coldkey_before = std::fs::read(&coldkey_path).expect("read coldkey");
+
         let phrase = first.mnemonic.clone();
         let second = regen_coldkey("w", Some(&phrase), None, "pw", false);
+
+        // Re-read after the call to compare byte-for-byte.
+        let coldkey_after = std::fs::read(&coldkey_path).expect("re-read coldkey");
 
         restore_home(tmp, original);
         let err = unwrap_err(second, "existing coldkey + no force (regen)");
         let msg = format!("{err:?}");
         assert!(msg.contains("coldkey"), "error should mention coldkey: {msg}");
         assert!(msg.contains("--force"), "error should mention --force: {msg}");
+        assert_eq!(
+            coldkey_before, coldkey_after,
+            "regen-coldkey refusal must not modify the existing coldkey file"
+        );
     }
 
     #[test]
@@ -2485,13 +2498,32 @@ mod tests {
 
         let _cr = new_coldkey("w", 12, "pw", false).expect("bootstrap coldkey");
         let first = new_hotkey("w", "default", 12, false).expect("first hotkey");
+
+        // Snapshot the on-disk hotkey BEFORE the second call so we can
+        // assert byte-for-byte preservation across the refusal — the
+        // load-bearing "guard is non-destructive" assertion that #20
+        // observed was missing on the regen side. (Symmetric with the
+        // new_hotkey_no_flag_existing_file_errors check.)
+        let hotkey_path = test_wallets_parent(&tmp)
+            .join("w")
+            .join("hotkeys")
+            .join("default");
+        let hotkey_before = std::fs::read(&hotkey_path).expect("read hotkey");
+
         let second = regen_hotkey("w", "default", Some(&first.mnemonic), None, false);
+
+        // Re-read after the call to compare byte-for-byte.
+        let hotkey_after = std::fs::read(&hotkey_path).expect("re-read hotkey");
 
         restore_home(tmp, original);
         let err = unwrap_err(second, "existing hotkey + no force (regen)");
         let msg = format!("{err:?}");
         assert!(msg.contains("hotkey"), "error should mention hotkey: {msg}");
         assert!(msg.contains("--force"), "error should mention --force: {msg}");
+        assert_eq!(
+            hotkey_before, hotkey_after,
+            "regen-hotkey refusal must not modify the existing hotkey file"
+        );
     }
 
     #[test]
