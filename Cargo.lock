@@ -739,6 +739,7 @@ dependencies = [
  "sp-core",
  "subxt",
  "tokio",
+ "url",
  "xsalsa20poly1305",
  "zeroize",
 ]

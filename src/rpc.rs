@@ -48,24 +48,73 @@ pub fn resolve_endpoint(url: Option<&str>, network: Option<&str>) -> Result<Stri
     }
 }
 
-/// Validate that a URL uses the `ws://` or `wss://` scheme.
+/// Validate that a URL uses `wss://` or a loopback `ws://` endpoint.
 ///
-/// **Scope**: this check is scheme-only. It accepts any `ws://<host>` URL,
-/// including remote hosts — it does NOT require TLS for non-loopback hosts.
-/// A user who supplies `ws://entrypoint-finney.opentensor.ai` via config
-/// will get a plaintext connection to mainnet.
+/// Policy:
+/// - `wss://<any host>` is accepted.
+/// - `ws://<loopback host>` is accepted. Loopback means `localhost`,
+///   any IP in the `127.0.0.0/8` block, or `::1` / `[::1]`.
+/// - `ws://<remote host>` is REJECTED. Users who want plaintext to a
+///   non-loopback host must opt in via the explicit `local` network
+///   shorthand or fix their config to use `wss://`.
+/// - Any other scheme (http, https, file, ...) is REJECTED.
+/// - Malformed URLs are REJECTED via `url::Url::parse`.
 ///
-/// Tightening this policy to host-aware (require `wss://` for all
-/// non-loopback hosts) is tracked in ErgodicLabs/btt#69. Until that lands,
-/// the guarantee of this function is narrow: it rejects `http://`,
-/// `https://`, `file://`, and the empty string, not much more.
+/// This closes the scheme-only gap documented in #69, left over from the
+/// PR #57 subxt 0.50 upgrade and the PR #68 defense-in-depth pass.
 pub fn validate_url(url: &str) -> Result<(), BttError> {
-    if !url.starts_with("ws://") && !url.starts_with("wss://") {
-        return Err(BttError::connection(
-            "endpoint URL must use ws:// or wss:// scheme",
-        ));
+    let parsed = url::Url::parse(url)
+        .map_err(|e| BttError::connection(format!("endpoint URL is not a valid URL: {}", e)))?;
+    match parsed.scheme() {
+        "wss" => Ok(()),
+        "ws" => {
+            let host = parsed.host_str().unwrap_or("");
+            // Only accept ws:// for loopback hosts; require wss:// for remote.
+            if is_loopback_host(host) {
+                Ok(())
+            } else {
+                Err(BttError::connection(format!(
+                    "plaintext ws:// is only allowed for loopback hosts; use wss:// for remote connections (got host {:?})",
+                    host
+                )))
+            }
+        }
+        other => Err(BttError::connection(format!(
+            "endpoint URL must use ws:// or wss:// scheme (got {:?})",
+            other
+        ))),
     }
-    Ok(())
+}
+
+/// Is `host` a loopback host?
+///
+/// Matches:
+/// - `localhost` (case-insensitive)
+/// - Any IPv4 in `127.0.0.0/8` (RFC-5735 loopback block)
+/// - IPv6 `::1`, including the `[::1]` bracketed form that `url::Url`
+///   returns from `host_str()` for IPv6 literals.
+///
+/// The check is structural: it operates on the parsed host, not a
+/// substring of the raw URL, so hostile inputs like
+/// `ws://localhost.attacker.com` are rejected.
+fn is_loopback_host(host: &str) -> bool {
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" {
+        return true;
+    }
+    // IPv4 / IPv6 literal: delegate to std's is_loopback.
+    if let Ok(ip) = lower.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    // url::Url::host_str() returns IPv6 literals wrapped in brackets,
+    // e.g. "[::1]". Strip brackets and re-parse.
+    if lower.starts_with('[') && lower.ends_with(']') && lower.len() >= 2 {
+        let inner = &lower[1..lower.len() - 1];
+        if let Ok(ip) = inner.parse::<std::net::IpAddr>() {
+            return ip.is_loopback();
+        }
+    }
+    false
 }
 
 /// Connect to a substrate node and return an OnlineClient.
@@ -76,13 +125,12 @@ pub fn validate_url(url: &str) -> Result<(), BttError> {
 /// `from_url` rejects non-TLS endpoints outright.
 ///
 /// This function calls [`validate_url`] as belt-and-suspenders for callers
-/// that bypass [`resolve_endpoint`]. Read the scope note on
-/// [`validate_url`]: the check is scheme-only and does not prevent a
-/// `wss://` → `ws://` downgrade against a remote host. Host-aware policy
-/// is tracked in ErgodicLabs/btt#69.
+/// that bypass [`resolve_endpoint`]. The policy is host-aware: remote
+/// hosts require `wss://`, and plaintext `ws://` is only accepted for
+/// loopback targets. See [`validate_url`] for the full policy.
 pub async fn connect(endpoint: &str) -> Result<OnlineClient<PolkadotConfig>, BttError> {
-    // Defense-in-depth, narrow: rejects http://, https://, file://, and the
-    // empty string. Does NOT enforce TLS for remote hosts (see #69).
+    // Host-aware defense-in-depth: rejects non-ws(s) schemes, malformed
+    // URLs, and plaintext ws:// to any non-loopback host.
     validate_url(endpoint)?;
     tokio::time::timeout(
         CONNECT_TIMEOUT,
@@ -98,10 +146,9 @@ pub async fn connect(endpoint: &str) -> Result<OnlineClient<PolkadotConfig>, Btt
 pub async fn connect_full(
     endpoint: &str,
 ) -> Result<(OnlineClient<PolkadotConfig>, LegacyRpc), BttError> {
-    // See note on `connect`: the validate_url guard is scheme-only and
-    // narrow. It rejects http://, https://, file://, and the empty string.
-    // It does NOT prevent a wss://→ws:// downgrade against a remote host;
-    // host-aware policy is tracked in #69.
+    // See note on `connect`: the validate_url guard is host-aware. It
+    // rejects non-ws(s) schemes, malformed URLs, and plaintext ws:// to
+    // any non-loopback host, closing the downgrade gap from #69.
     validate_url(endpoint)?;
     let rpc_client = tokio::time::timeout(
         CONNECT_TIMEOUT,
@@ -190,18 +237,67 @@ mod tests {
     }
 
     #[test]
-    fn validate_url_ws_to_remote_host_is_accepted_by_design() {
-        // Pin the current scheme-only policy: `ws://` to a REMOTE host
-        // is accepted. This is not ideal (a plaintext connection to a
-        // mainnet mirror passes the check), but it is the documented
-        // current behavior. When #69 lands and validate_url becomes
-        // host-aware, this test should be updated to assert rejection.
-        // Until then, removing or flipping this assertion without also
-        // tightening the policy would hide the gap.
+    fn validate_url_ws_to_remote_host_rejects() {
+        // The flipped version of the old by-design test. `ws://` to a
+        // remote host is now rejected; the host-aware policy (#69) closes
+        // the plaintext-to-mainnet gap that the scheme-only check left
+        // open.
+        let err = validate_url("ws://entrypoint-finney.opentensor.ai")
+            .expect_err("ws:// to a remote host must be rejected");
+        let msg = format!("{}", err);
         assert!(
-            validate_url("ws://entrypoint-finney.opentensor.ai").is_ok(),
-            "scheme-only guard accepts ws:// to any host (see #69 for host-aware policy)"
+            msg.contains("loopback"),
+            "error should explain the loopback policy, got: {}",
+            msg
         );
+    }
+
+    #[test]
+    fn validate_url_wss_to_remote_host_accepts() {
+        assert!(validate_url("wss://entrypoint-finney.opentensor.ai").is_ok());
+    }
+
+    #[test]
+    fn validate_url_ws_127_loopback_accepts() {
+        assert!(validate_url("ws://127.0.0.1:9944").is_ok());
+    }
+
+    #[test]
+    fn validate_url_ws_127_non_canonical_loopback_accepts() {
+        // RFC-5735 declares the entire 127.0.0.0/8 block as loopback, not
+        // only 127.0.0.1. An admin who has bound a local node to
+        // 127.0.0.42 for whatever reason should still be able to connect.
+        assert!(validate_url("ws://127.0.0.42:9944").is_ok());
+    }
+
+    #[test]
+    fn validate_url_ws_ipv6_loopback_accepts() {
+        assert!(validate_url("ws://[::1]:9944").is_ok());
+    }
+
+    #[test]
+    fn validate_url_ws_uppercase_localhost_accepts() {
+        // Belt-and-suspenders: url::Url::parse lowercases the host for us,
+        // but we still normalize case in `is_loopback_host` so that any
+        // future path that skips the url crate stays consistent.
+        assert!(validate_url("ws://LOCALHOST:9944").is_ok());
+    }
+
+    #[test]
+    fn validate_url_ws_malicious_subdomain_rejects() {
+        // Structural host match, not substring. `localhost.attacker.com`
+        // must NOT slip through because its host string happens to start
+        // with "localhost".
+        assert!(
+            validate_url("ws://localhost.attacker.com:9944").is_err(),
+            "host match must be structural, not substring"
+        );
+    }
+
+    #[test]
+    fn validate_url_malformed_returns_error() {
+        // url::Url::parse rejects strings with no scheme / no authority.
+        assert!(validate_url("not a url").is_err());
     }
 
     // -- connect/connect_full defense-in-depth tests --
