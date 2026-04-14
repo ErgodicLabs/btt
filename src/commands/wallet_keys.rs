@@ -1414,13 +1414,17 @@ fn build_pub_key_json(pair: &Pair) -> PubKeyFileData {
     }
 }
 
-/// Derive a 32-byte NaCl secretbox key from a password using libsodium's
-/// `argon2i13::derive_key` parameters (Argon2i, v0x13, t=8, m=512 MiB, p=1,
-/// hardcoded `NACL_SALT`). Byte-for-byte compatible with btwallet/btcli in
-/// release builds; under `cfg(test)` the params drop to a minimal profile
-/// (see `ARGON2_*` constants) so test runs are fast. Anything that cares
-/// about matching the on-disk envelope format should call
-/// `derive_key_with_params` with `PROD_*` values directly.
+/// In release builds, produces a 32-byte NaCl secretbox key byte-for-byte
+/// compatible with btwallet/btcli (libsodium's `argon2i13::derive_key` with
+/// the SENSITIVE profile: Argon2i, v0x13, t=8, m=512 MiB, p=1, hardcoded
+/// `NACL_SALT`).
+///
+/// **Under `cfg(test)`**, this function uses a weakened 1 MiB / t=1 profile
+/// (see the `ARGON2_*` constants) so test runs are fast. Tests that assert
+/// on-the-wire compatibility with external libsodium implementations must
+/// call [`derive_key_with_params`] directly with the `PROD_ARGON2_*`
+/// constants instead; see `derive_key_matches_libsodium_reference` and
+/// `decrypts_btwallet_reference_vector` for examples.
 fn derive_key(password: &[u8]) -> Result<Zeroizing<[u8; NACL_KEY_LEN]>, BttError> {
     derive_key_with_params(
         password,
@@ -1972,8 +1976,39 @@ mod tests {
     #[test]
     #[ignore = "helper for producing hex blobs consumed by external libsodium"]
     fn dump_blob_for_python() {
+        // Emit a blob the python libsodium reference will decrypt. Under
+        // cfg(test), `encrypt_key_data` would route through the weakened
+        // argon2 profile (1 MiB / t=1) and the blob would fail to open
+        // under libsodium's SENSITIVE profile. Inline the envelope
+        // construction here with `derive_key_with_params` pinned to the
+        // PROD_* constants, mirroring `decrypts_btwallet_reference_vector`.
+        use rand::RngCore;
+        use xsalsa20poly1305::aead::Aead;
+        use xsalsa20poly1305::{KeyInit, XSalsa20Poly1305};
+
         let pt = b"btt-to-btwallet-interop-check";
-        let enc = encrypt_key_data(pt, "roundtrip-pw").expect("encrypt");
+        let password = "roundtrip-pw";
+
+        let key = derive_key_with_params(
+            password.as_bytes(),
+            PROD_ARGON2_M_COST_KIB,
+            PROD_ARGON2_T_COST,
+            PROD_ARGON2_PARALLELISM,
+        )
+        .expect("argon2 derive");
+
+        let mut nonce_bytes = [0u8; NACL_NONCE_LEN];
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let nonce = xsalsa20poly1305::Nonce::from(nonce_bytes);
+
+        let cipher = XSalsa20Poly1305::new(xsalsa20poly1305::Key::from_slice(key.as_slice()));
+        let ciphertext = cipher.encrypt(&nonce, pt.as_slice()).expect("encrypt");
+
+        let mut enc = Vec::with_capacity(NACL_MAGIC.len() + NACL_NONCE_LEN + ciphertext.len());
+        enc.extend_from_slice(NACL_MAGIC);
+        enc.extend_from_slice(&nonce_bytes);
+        enc.extend_from_slice(&ciphertext);
+
         eprintln!("BTT_ENC_BLOB={}", hex::encode(&enc));
     }
 

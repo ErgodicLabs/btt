@@ -48,6 +48,28 @@
 // condition. See issue #55 and the btcli reference for the canonical
 // endpoint list.
 
+//! # Testnet safety
+//!
+//! The faucet command refuses to submit unless THREE independent safety
+//! checks all pass:
+//!
+//! 1. **URL blocklist** — rejects substring matches against known mainnet
+//!    endpoints (see [`check_url_is_not_mainnet`]).
+//! 2. **Genesis-hash check** — rejects the finney mainnet genesis hash
+//!    fetched via `chain_getBlockHash(0)` after connect (see
+//!    [`check_genesis_is_not_mainnet`]).
+//! 3. **Signature binding (implicit)** — the signed extrinsic embeds the
+//!    genesis hash it was signed against. A malicious RPC that lies about
+//!    genesis at handshake time produces an extrinsic whose signature
+//!    fails validation on real mainnet, so even a two-guard bypass cannot
+//!    materialize a valid mainnet transaction.
+//!
+//! All three would have to fail for a mainnet extrinsic to submit
+//! successfully. The first two are explicit code checks. The third falls
+//! out of substrate's extrinsic signing protocol and does not require any
+//! btt-side code — it is documented here so future readers understand
+//! why the explicit guards are sufficient rather than insufficient.
+
 use std::io::Write as _;
 use std::time::{Duration, Instant};
 
@@ -201,6 +223,16 @@ pub async fn run(params: FaucetParams<'_>) -> Result<FaucetResult, BttError> {
         return Err(BttError::invalid_input(
             "--update-interval must be >= 1",
         ));
+    }
+
+    // The solver is strictly single-threaded today; `num_processes` only
+    // strides the nonce space so a future parallel implementation can be
+    // dropped in without changing the command surface (see `solve_pow`).
+    // Warn users who pass >1 expecting multi-core throughput.
+    if num_processes > 1 {
+        eprintln!(
+            "note: --num-processes > 1 strides the nonce space for future parallelism but the current solver is single-threaded"
+        );
     }
 
     // Decrypt the coldkey EARLY so a bad password fails before we open
@@ -491,14 +523,17 @@ pub(crate) fn solve_pow(
             });
         }
 
-        // Cap checks run every `update_interval` iterations so they
-        // don't dominate the hot loop. `update_interval` must be >= 1.
+        // Iteration cap is checked every iteration so the ceiling is
+        // hard — a simple u64 compare is not worth batching. The
+        // wall-time check (Instant::now syscall) and the progress
+        // report stay batched on `update_interval` boundaries to keep
+        // the hot loop lean. `update_interval` must be >= 1.
+        if iterations >= max_iterations {
+            return Err(BttError::invalid_input(format!(
+                "pow timed out: iteration cap {max_iterations} reached after {iterations} attempts"
+            )));
+        }
         if iterations.is_multiple_of(update_interval) {
-            if iterations >= max_iterations {
-                return Err(BttError::invalid_input(format!(
-                    "pow timed out: iteration cap {max_iterations} reached after {iterations} attempts"
-                )));
-            }
             if start.elapsed() >= max_duration {
                 return Err(BttError::invalid_input(format!(
                     "pow timed out: wall-clock cap {}s reached after {iterations} attempts",
