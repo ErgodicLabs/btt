@@ -246,6 +246,34 @@ pub fn decrypt_coldkey_interactive(wallet_name: &str) -> Result<Pair, BttError> 
     Ok(pair)
 }
 
+/// Decrypt a coldkey using a caller-supplied password. Used by commands
+/// that receive the password out of band (e.g. `--password-file`) rather
+/// than prompting the terminal. Performs the same envelope sniff as
+/// [`decrypt_coldkey_interactive`] so a mis-pathed file fails loudly
+/// before any KDF work.
+pub fn decrypt_coldkey_with_password(
+    wallet_name: &str,
+    password: &str,
+) -> Result<Pair, BttError> {
+    let wdir = wallet_path(wallet_name)?;
+    if !wdir.exists() {
+        return Err(BttError::wallet_not_found(format!(
+            "wallet '{wallet_name}' not found at {}",
+            wdir.display()
+        )));
+    }
+
+    let coldkey_path = wdir.join("coldkey");
+    if !coldkey_path.exists() {
+        return Err(BttError::wallet_not_found(format!(
+            "coldkey file not found for wallet '{wallet_name}'"
+        )));
+    }
+
+    sniff_nacl_envelope(&coldkey_path)?;
+    load_coldkey(&wdir, password)
+}
+
 /// Extract an SS58 address from key file content.
 fn extract_ss58_from_content(content: &str) -> Option<String> {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
