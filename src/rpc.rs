@@ -64,8 +64,14 @@ pub fn validate_url(url: &str) -> Result<(), BttError> {
 /// Uses [`OnlineClient::from_insecure_url`] because the `local` network
 /// shorthand points at a plain `ws://127.0.0.1:9944`; subxt 0.50's
 /// `from_url` rejects non-TLS endpoints outright. Scheme validation for
-/// explicit user input is enforced by [`validate_url`] above.
+/// explicit user input is enforced by [`validate_url`] above, and this
+/// function also calls it as defense-in-depth so any future internal caller
+/// that skips [`resolve_endpoint`] still gets scheme enforcement.
 pub async fn connect(endpoint: &str) -> Result<OnlineClient<PolkadotConfig>, BttError> {
+    // Defense-in-depth: redundant with resolve_endpoint for user-supplied
+    // URLs, but the check costs nothing and catches internal callers that
+    // construct endpoints directly without going through resolve_endpoint.
+    validate_url(endpoint)?;
     tokio::time::timeout(
         CONNECT_TIMEOUT,
         OnlineClient::<PolkadotConfig>::from_insecure_url(endpoint),
@@ -81,7 +87,10 @@ pub async fn connect_full(
     endpoint: &str,
 ) -> Result<(OnlineClient<PolkadotConfig>, LegacyRpc), BttError> {
     // See note on `connect`: we accept `ws://` for the `local` shorthand
-    // and validate scheme ourselves in `validate_url`.
+    // and validate scheme ourselves in `validate_url`. This redundant
+    // guard is defense-in-depth for internal callers that bypass
+    // `resolve_endpoint`.
+    validate_url(endpoint)?;
     let rpc_client = tokio::time::timeout(
         CONNECT_TIMEOUT,
         RpcClient::from_insecure_url(endpoint),
@@ -166,5 +175,43 @@ mod tests {
     #[test]
     fn validate_url_https_returns_error() {
         assert!(validate_url("https://example.com").is_err());
+    }
+
+    // -- connect/connect_full defense-in-depth tests --
+    //
+    // These tests lock the guarantee that `rpc::connect*` reject non-ws/wss
+    // URLs *before* handing them to subxt. The check is redundant with
+    // `resolve_endpoint` for user-facing paths, but is the last line of
+    // TLS-enforcement defense for any internal caller that constructs a
+    // raw string (see issue #59). The test is synchronous because the
+    // guard fires before any network I/O.
+
+    #[test]
+    fn connect_rejects_http_scheme_without_network_io() {
+        // Build a tokio runtime locally so we can drive the async fn to
+        // completion. The validate_url guard runs before any socket is
+        // touched, so this is network-free.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = rt.block_on(connect("http://untrusted.example.com"));
+        assert!(
+            result.is_err(),
+            "connect must reject non-ws/wss schemes via validate_url"
+        );
+    }
+
+    #[test]
+    fn connect_full_rejects_http_scheme_without_network_io() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = rt.block_on(connect_full("https://untrusted.example.com"));
+        assert!(
+            result.is_err(),
+            "connect_full must reject non-ws/wss schemes via validate_url"
+        );
     }
 }
