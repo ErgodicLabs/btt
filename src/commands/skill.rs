@@ -89,6 +89,16 @@ btt wallet sign --name <name> --message "<msg>" [--use-hotkey] \
 
 # Verify a signature against an SS58 address
 btt wallet verify --message "<msg>" --signature 0x... --ss58 <address>
+
+# Reap stale `.tmp.*`, `.bak.*`, and `.lock.*` entries left under the
+# wallets directory by crashed or interrupted `wallet create` runs.
+# Uses a strict reserved-prefix grammar match, never follows symlinks,
+# and probes `.lock.*` files with a non-blocking `flock(LOCK_NB)` so a
+# held lock (e.g. from a concurrent `wallet create`) is never unlinked.
+# Emits a JSON array of `{path, kind, action}` entries where `kind` is
+# `tmp` / `bak` / `lock` and `action` is `reaped` / `kept-dry-run` /
+# `skipped-held` / `skipped-too-young` / `skipped-no-match`.
+btt wallet cleanup [--dry-run] [--wallet <name>] [--older-than <duration>]
 ```
 
 Coldkeys are encrypted with the btwallet/btcli `$NACL` envelope
