@@ -61,7 +61,11 @@ pub enum ChainAction {
 
 #[derive(Subcommand, Debug)]
 pub enum WalletAction {
-    /// List wallets in ~/.bittensor/wallets/
+    /// List wallets in the btt config directory (linux:
+    /// $XDG_CONFIG_HOME/btt/wallets or $HOME/.config/btt/wallets; macOS:
+    /// $HOME/Library/Application Support/btt/wallets; windows:
+    /// %APPDATA%\btt\wallets). Legacy $HOME/.bittensor/wallets is used
+    /// automatically if present and the new location is not.
     List,
 
     /// Create a new wallet (coldkey + hotkey pair)

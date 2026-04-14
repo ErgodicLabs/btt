@@ -34,8 +34,21 @@ btt chain balance <ss58_address>
 
 ### Wallet
 
+btt stores wallets under an OS-dependent config directory:
+
+| OS      | Path                                                    |
+| ------- | ------------------------------------------------------- |
+| linux   | `$XDG_CONFIG_HOME/btt` if set, else `$HOME/.config/btt` |
+| macOS   | `$HOME/Library/Application Support/btt`                 |
+| windows | `%APPDATA%\btt`                                         |
+
+Wallets live at `<config_dir>/wallets/<wallet_name>/`. If the legacy
+`$HOME/.bittensor/` directory still exists and the new config dir does
+not, btt falls back to the legacy path and prints a one-time migration
+warning to stderr. btt never auto-migrates wallet material.
+
 ```bash
-# List local wallets (reads ~/.bittensor/wallets/)
+# List local wallets
 btt wallet list
 
 # Create a new wallet (coldkey + hotkey pair). Prompts for coldkey password

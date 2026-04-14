@@ -10,11 +10,11 @@
 //! ----------------
 //! - On unix, we refuse to read a file whose mode is group- or world-readable
 //!   (`mode & 0o077 != 0`). This check is not TOCTOU hardening — the expected
-//!   password file lives at `$HOME/.btt/pwd`, mode 0600, inside a 0700 parent,
-//!   and that posture already closes the TOCTOU window: any file reachable
-//!   under that posture is already one of the user's own files. The check
-//!   exists as a guard against the user pointing `--password-file` at
-//!   something like `/etc/passwd` by accident. Fail-closed. The caller is
+//!   password file lives on a user-controlled tmpfs (`/dev/shm/btt-pw`) at
+//!   mode 0600, and that posture already closes the TOCTOU window: any file
+//!   reachable under that posture is already one of the user's own files.
+//!   The check exists as a guard against the user pointing `--password-file`
+//!   at something like `/etc/passwd` by accident. Fail-closed. The caller is
 //!   instructed to `chmod 600 <path>`.
 //! - We refuse anything that is not a regular file. No FIFOs, no character
 //!   devices, no directories. A password file is a tiny thing on a tmpfs;

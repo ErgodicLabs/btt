@@ -23,7 +23,8 @@ pub struct KeyInfo {
     pub path: String,
 }
 
-/// List wallets found in ~/.bittensor/wallets/.
+/// List wallets found under `<config_dir>/wallets/` — see
+/// [`crate::commands::paths::config_dir`] for the per-OS location.
 /// Each wallet is a directory containing a `coldkeypub.txt` and `hotkeys/` subdirectory.
 pub fn list() -> Result<WalletList, BttError> {
     let wallets_dir = wallets_path()?;
@@ -107,11 +108,10 @@ pub fn list() -> Result<WalletList, BttError> {
     Ok(WalletList { wallets })
 }
 
-/// Get the wallets directory path.
+/// Get the wallets directory path. Per-OS location — see
+/// [`crate::commands::paths::config_dir`].
 fn wallets_path() -> Result<PathBuf, BttError> {
-    let home = std::env::var("HOME")
-        .map_err(|_| BttError::io("HOME environment variable not set"))?;
-    Ok(PathBuf::from(home).join(".bittensor").join("wallets"))
+    crate::commands::paths::wallets_dir()
 }
 
 /// Read a Bittensor key file (JSON) and extract the SS58 address.
