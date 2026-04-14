@@ -1,8 +1,16 @@
 use std::time::Duration;
 
-use subxt::backend::rpc::RpcClient;
-use subxt::backend::legacy::LegacyRpcMethods;
+use subxt::config::RpcConfigFor;
+use subxt::rpcs::{LegacyRpcMethods, RpcClient};
 use subxt::{OnlineClient, PolkadotConfig};
+
+/// Legacy RPC methods bound to the `PolkadotConfig` chain types.
+///
+/// subxt 0.50 separated [`subxt::Config`] (used by online-client types) from
+/// [`subxt_rpcs::RpcConfig`] (used by the legacy RPC helpers). The
+/// [`RpcConfigFor<T>`] phantom type bridges the two so we can still talk to
+/// a `PolkadotConfig`-flavoured chain via the legacy method set.
+pub type LegacyRpc = LegacyRpcMethods<RpcConfigFor<PolkadotConfig>>;
 
 use crate::error::BttError;
 
@@ -52,10 +60,15 @@ pub fn validate_url(url: &str) -> Result<(), BttError> {
 
 /// Connect to a substrate node and return an OnlineClient.
 /// Applies a connection timeout.
+///
+/// Uses [`OnlineClient::from_insecure_url`] because the `local` network
+/// shorthand points at a plain `ws://127.0.0.1:9944`; subxt 0.50's
+/// `from_url` rejects non-TLS endpoints outright. Scheme validation for
+/// explicit user input is enforced by [`validate_url`] above.
 pub async fn connect(endpoint: &str) -> Result<OnlineClient<PolkadotConfig>, BttError> {
     tokio::time::timeout(
         CONNECT_TIMEOUT,
-        OnlineClient::<PolkadotConfig>::from_url(endpoint),
+        OnlineClient::<PolkadotConfig>::from_insecure_url(endpoint),
     )
     .await
     .map_err(|_| BttError::connection(format!("connection to {} timed out after {}s", endpoint, CONNECT_TIMEOUT.as_secs())))?
@@ -66,10 +79,12 @@ pub async fn connect(endpoint: &str) -> Result<OnlineClient<PolkadotConfig>, Btt
 /// the same underlying WebSocket transport.
 pub async fn connect_full(
     endpoint: &str,
-) -> Result<(OnlineClient<PolkadotConfig>, LegacyRpcMethods<PolkadotConfig>), BttError> {
+) -> Result<(OnlineClient<PolkadotConfig>, LegacyRpc), BttError> {
+    // See note on `connect`: we accept `ws://` for the `local` shorthand
+    // and validate scheme ourselves in `validate_url`.
     let rpc_client = tokio::time::timeout(
         CONNECT_TIMEOUT,
-        RpcClient::from_url(endpoint),
+        RpcClient::from_insecure_url(endpoint),
     )
     .await
     .map_err(|_| BttError::connection(format!("connection to {} timed out after {}s", endpoint, CONNECT_TIMEOUT.as_secs())))?

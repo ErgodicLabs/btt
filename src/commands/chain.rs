@@ -3,6 +3,7 @@ use std::time::Duration;
 use serde::Serialize;
 use sp_core::crypto::{AccountId32, Ss58Codec};
 use subxt::dynamic::{At, Value};
+use subxt::ext::scale_value::Value as SValue;
 
 use crate::error::BttError;
 use crate::rpc;
@@ -29,23 +30,24 @@ pub struct BalanceInfo {
 pub async fn info(endpoint: &str) -> Result<ChainInfo, BttError> {
     let (api, legacy) = rpc::connect_full(endpoint).await?;
 
-    // Get chain name via legacy RPC
+    // Chain name still comes from the legacy `system_chain` RPC; the
+    // subxt client does not expose it directly.
     let chain = tokio::time::timeout(RPC_TIMEOUT, legacy.system_chain())
         .await
         .map_err(|_| BttError::query("system_chain RPC call timed out"))?
         .map_err(|e| BttError::query(format!("failed to get chain name: {}", e)))?;
 
-    // Runtime version from the client
-    let runtime_version = api.runtime_version();
-    let spec_version = runtime_version.spec_version;
-    let transaction_version = runtime_version.transaction_version;
-
-    // Current block number
-    let block = tokio::time::timeout(RPC_TIMEOUT, api.blocks().at_latest())
+    // In subxt 0.50 the block-scoped client exposes block number, spec
+    // version and transaction version uniformly. Resolve the head block
+    // once and read everything off that snapshot.
+    let at_block = tokio::time::timeout(RPC_TIMEOUT, api.at_current_block())
         .await
         .map_err(|_| BttError::query("fetch latest block timed out"))?
         .map_err(|e| BttError::query(format!("failed to fetch latest block: {}", e)))?;
-    let block_number: u64 = block.number().into();
+
+    let block_number: u64 = at_block.block_number();
+    let spec_version = at_block.spec_version();
+    let transaction_version = at_block.transaction_version();
 
     Ok(ChainInfo {
         chain,
@@ -63,24 +65,21 @@ pub async fn balance(endpoint: &str, address: &str) -> Result<BalanceInfo, BttEr
     // We keep the original address string for output to preserve the user's SS58 prefix.
     let account_id_bytes = parse_ss58(address)?;
 
-    // Build a dynamic storage query for System.Account
-    let storage_query = subxt::dynamic::storage(
-        "System",
-        "Account",
-        vec![Value::from_bytes(account_id_bytes)],
-    );
+    // Dynamic storage address in subxt 0.50 is a 2-arg constructor;
+    // key parts are supplied at `fetch` time.
+    let storage_query =
+        subxt::dynamic::storage::<Vec<SValue>, SValue>("System", "Account");
 
-    let storage = tokio::time::timeout(
-        RPC_TIMEOUT,
-        api.storage().at_latest(),
-    )
-    .await
-    .map_err(|_| BttError::query("storage query timed out"))?
-    .map_err(|e| BttError::query(format!("failed to get storage: {}", e)))?;
+    let at_block = tokio::time::timeout(RPC_TIMEOUT, api.at_current_block())
+        .await
+        .map_err(|_| BttError::query("storage query timed out"))?
+        .map_err(|e| BttError::query(format!("failed to get block: {}", e)))?;
+
+    let storage = at_block.storage();
 
     let result = tokio::time::timeout(
         RPC_TIMEOUT,
-        storage.fetch(&storage_query),
+        storage.try_fetch(&storage_query, vec![SValue::from_bytes(account_id_bytes)]),
     )
     .await
     .map_err(|_| BttError::query("account info fetch timed out"))?
@@ -89,7 +88,7 @@ pub async fn balance(endpoint: &str, address: &str) -> Result<BalanceInfo, BttEr
     match result {
         Some(value) => {
             let decoded = value
-                .to_value()
+                .decode()
                 .map_err(|e| BttError::parse(format!("failed to decode account info: {}", e)))?;
 
             let free = extract_balance_field(&decoded, "data", "free")?;
@@ -126,8 +125,8 @@ pub fn parse_ss58(address: &str) -> Result<Vec<u8>, BttError> {
 
 /// Extract a balance field from a decoded dynamic Value.
 /// Returns an error if the field cannot be found or parsed.
-fn extract_balance_field(
-    value: &Value<u32>,
+fn extract_balance_field<C>(
+    value: &Value<C>,
     outer_field: &str,
     inner_field: &str,
 ) -> Result<String, BttError> {
@@ -138,16 +137,14 @@ fn extract_balance_field(
         ))
     })?;
 
-    let inner: &Value<u32> = outer;
-    let inner_val = inner.at(inner_field).ok_or_else(|| {
+    let inner_val = outer.at(inner_field).ok_or_else(|| {
         BttError::parse(format!(
             "missing '{}.{}' field in account data",
             outer_field, inner_field
         ))
     })?;
 
-    let inner_ref: &Value<u32> = inner_val;
-    inner_ref.as_u128().map(|n| n.to_string()).ok_or_else(|| {
+    inner_val.as_u128().map(|n| n.to_string()).ok_or_else(|| {
         BttError::parse(format!(
             "'{}.{}' is not a valid u128 balance",
             outer_field, inner_field

@@ -33,8 +33,49 @@ use sp_core::crypto::{AccountId32, Ss58Codec};
 use sp_core::sr25519;
 use sp_core::Pair as PairTrait;
 use subxt::dynamic::{At, Value};
-use subxt::tx::PairSigner;
+use subxt::ext::scale_value::Value as SValue;
+use subxt::utils::{AccountId32 as SubxtAccountId32, MultiSignature as SubxtMultiSignature};
 use subxt::{OnlineClient, PolkadotConfig};
+
+/// Adapter implementing [`subxt::tx::Signer<PolkadotConfig>`] for an
+/// sp-core `sr25519::Pair`.
+///
+/// subxt 0.38 provided `PairSigner` as part of the `substrate-compat`
+/// feature, which wrapped an sp-core pair directly. That feature (and the
+/// wasmtime-heavy sp-core path that came with it) was dropped in 0.50;
+/// the recommended replacement is either the new `subxt-signer` crate or
+/// a local impl of the [`subxt::tx::Signer`] trait. We pick the latter
+/// because the wallet layer is already built on sp-core's Pair (for BIP39
+/// derivation, Zeroize, and the existing encrypted coldkey.json format),
+/// so cloning into a new keypair type would duplicate secret material for
+/// no benefit. Keeping sp-core on the owning side means the decrypted key
+/// still lives behind sp-core's drop semantics.
+pub(crate) struct Sr25519Signer {
+    pair: sr25519::Pair,
+    account_id: SubxtAccountId32,
+}
+
+impl Sr25519Signer {
+    pub(crate) fn new(pair: sr25519::Pair) -> Self {
+        let pub_bytes: [u8; 32] = PairTrait::public(&pair).0;
+        Self {
+            pair,
+            account_id: SubxtAccountId32::from(pub_bytes),
+        }
+    }
+}
+
+impl subxt::tx::Signer<PolkadotConfig> for Sr25519Signer {
+    fn account_id(&self) -> SubxtAccountId32 {
+        self.account_id.clone()
+    }
+
+    fn sign(&self, signer_payload: &[u8]) -> SubxtMultiSignature {
+        // sp_core::sr25519::Pair::sign yields a 64-byte sr25519 signature.
+        let sig = PairTrait::sign(&self.pair, signer_payload);
+        SubxtMultiSignature::Sr25519(sig.0)
+    }
+}
 
 use crate::commands::chain::parse_ss58;
 use crate::commands::wallet_keys::{
@@ -113,43 +154,46 @@ pub async fn list(
 
     let api = rpc::connect(endpoint).await?;
 
-    // Dynamic runtime API call: StakeInfoRuntimeApi::get_stake_info_for_coldkey
-    let call = subxt::dynamic::runtime_api_call(
+    // subxt 0.50 pins storage and runtime-api views to a single block
+    // snapshot via `at_current_block`; the returned `ClientAtBlock` then
+    // exposes `.runtime_apis()` and `.storage()`. We resolve it once up
+    // front so the list + the per-netuid price fetches below share one
+    // consistent view of chain state.
+    let at_block = tokio::time::timeout(RPC_TIMEOUT, api.at_current_block())
+        .await
+        .map_err(|_| BttError::query("at_current_block() timed out"))?
+        .map_err(|e| BttError::query(format!("failed to resolve client at head: {e}")))?;
+
+    // Dynamic runtime API call: StakeInfoRuntimeApi::get_stake_info_for_coldkey.
+    // The return type turbofish tells subxt to decode the raw SCALE
+    // response into a dynamic `scale_value::Value` for introspection.
+    let call = subxt::dynamic::runtime_api_call::<Vec<SValue>, SValue>(
         "StakeInfoRuntimeApi",
         "get_stake_info_for_coldkey",
-        vec![Value::from_bytes(account_bytes)],
+        vec![SValue::from_bytes(account_bytes)],
     );
 
-    let runtime_api = tokio::time::timeout(RPC_TIMEOUT, api.runtime_api().at_latest())
-        .await
-        .map_err(|_| BttError::query("runtime_api().at_latest() timed out"))?
-        .map_err(|e| BttError::query(format!("failed to resolve runtime api at head: {e}")))?;
-
-    let result = tokio::time::timeout(RPC_TIMEOUT, runtime_api.call(call))
+    let decoded = tokio::time::timeout(RPC_TIMEOUT, at_block.runtime_apis().call(call))
         .await
         .map_err(|_| BttError::query("get_stake_info_for_coldkey timed out"))?
         .map_err(|e| {
             BttError::query(format!("get_stake_info_for_coldkey runtime call failed: {e}"))
         })?;
 
-    let decoded = result
-        .to_value()
-        .map_err(|e| BttError::parse(format!("failed to decode StakeInfo list: {e}")))?;
-
     let raw = parse_stake_info_list(&decoded)?;
 
     // For TAO valuation we need per-netuid pool prices. Batch-fetch them so
     // we make at most one RPC per distinct netuid, with a per-call timeout.
-    let storage = tokio::time::timeout(RPC_TIMEOUT, api.storage().at_latest())
-        .await
-        .map_err(|_| BttError::query("storage().at_latest() timed out"))?
-        .map_err(|e| BttError::query(format!("failed to resolve storage at head: {e}")))?;
+    let storage = at_block.storage();
 
     let mut prices: BTreeMap<u16, Option<f64>> = BTreeMap::new();
     for entry in &raw {
         if let std::collections::btree_map::Entry::Vacant(slot) = prices.entry(entry.netuid) {
             // Failure of one price fetch must not drop the whole list.
-            let price = fetch_subnet_price(&storage, entry.netuid).await.ok().flatten();
+            let price = fetch_subnet_price(&storage, entry.netuid)
+                .await
+                .ok()
+                .flatten();
             slot.insert(price);
         }
     }
@@ -238,43 +282,55 @@ fn parse_stake_info_list<C: Clone>(value: &Value<C>) -> Result<Vec<RawStakeRow>,
 /// Fetch the current spot price of a subnet (TAO per alpha) from the pool
 /// reserves: `SubnetTAO[netuid] / SubnetAlphaIn[netuid]`. Returns `Ok(None)`
 /// if either reserve is zero or unset. Root (netuid 0) is fixed at 1.0.
-async fn fetch_subnet_price<C: subxt::Config>(
-    storage: &subxt::storage::Storage<C, OnlineClient<C>>,
+///
+/// The storage handle is taken generically over the `ClientT` parameter so
+/// this helper is compatible with both the owned
+/// `OnlineClientAtBlock<PolkadotConfig>` from `at_current_block` and any
+/// borrowed variant; the lifetime is elided to let the caller pick.
+async fn fetch_subnet_price<ClientT>(
+    storage: &subxt::storage::StorageClient<'_, PolkadotConfig, ClientT>,
     netuid: u16,
-) -> Result<Option<f64>, BttError> {
+) -> Result<Option<f64>, BttError>
+where
+    ClientT: subxt::client::OnlineClientAtBlockT<PolkadotConfig>,
+{
     if netuid == 0 {
         return Ok(Some(1.0));
     }
 
-    let tao_query = subxt::dynamic::storage(
-        "SubtensorModule",
-        "SubnetTAO",
-        vec![Value::u128(netuid as u128)],
-    );
-    let alpha_query = subxt::dynamic::storage(
-        "SubtensorModule",
-        "SubnetAlphaIn",
-        vec![Value::u128(netuid as u128)],
-    );
+    // 0.50 decouples address-of-entry from key-parts: the address names
+    // the pallet + entry, and the keys are supplied at fetch time. Reuse
+    // a single address for both maps — same shape, different entry name.
+    let tao_addr =
+        subxt::dynamic::storage::<Vec<SValue>, SValue>("SubtensorModule", "SubnetTAO");
+    let alpha_addr =
+        subxt::dynamic::storage::<Vec<SValue>, SValue>("SubtensorModule", "SubnetAlphaIn");
+    let key = vec![SValue::u128(netuid as u128)];
 
-    let tao_raw = tokio::time::timeout(PER_CALL_TIMEOUT, storage.fetch(&tao_query))
-        .await
-        .map_err(|_| BttError::query(format!("SubnetTAO[{netuid}] fetch timed out")))?
-        .map_err(|e| BttError::query(format!("SubnetTAO[{netuid}] fetch failed: {e}")))?;
-    let alpha_raw = tokio::time::timeout(PER_CALL_TIMEOUT, storage.fetch(&alpha_query))
-        .await
-        .map_err(|_| BttError::query(format!("SubnetAlphaIn[{netuid}] fetch timed out")))?
-        .map_err(|e| BttError::query(format!("SubnetAlphaIn[{netuid}] fetch failed: {e}")))?;
+    let tao_raw = tokio::time::timeout(
+        PER_CALL_TIMEOUT,
+        storage.try_fetch(&tao_addr, key.clone()),
+    )
+    .await
+    .map_err(|_| BttError::query(format!("SubnetTAO[{netuid}] fetch timed out")))?
+    .map_err(|e| BttError::query(format!("SubnetTAO[{netuid}] fetch failed: {e}")))?;
+    let alpha_raw = tokio::time::timeout(
+        PER_CALL_TIMEOUT,
+        storage.try_fetch(&alpha_addr, key),
+    )
+    .await
+    .map_err(|_| BttError::query(format!("SubnetAlphaIn[{netuid}] fetch timed out")))?
+    .map_err(|e| BttError::query(format!("SubnetAlphaIn[{netuid}] fetch failed: {e}")))?;
 
     let tao_in = match tao_raw {
-        Some(v) => match v.to_value() {
+        Some(v) => match v.decode() {
             Ok(dv) => value_to_u64(&dv).unwrap_or(0),
             Err(_) => return Ok(None),
         },
         None => 0,
     };
     let alpha_in = match alpha_raw {
-        Some(v) => match v.to_value() {
+        Some(v) => match v.decode() {
             Ok(dv) => value_to_u64(&dv).unwrap_or(0),
             Err(_) => return Ok(None),
         },
@@ -326,7 +382,7 @@ pub async fn add(
     let hotkey_bytes = parse_ss58(hotkey)?;
 
     let pair = decrypt_coldkey_interactive(wallet)?;
-    let signer = PairSigner::<PolkadotConfig, sr25519::Pair>::new(pair);
+    let signer = Sr25519Signer::new(pair);
 
     let api = rpc::connect(endpoint).await?;
 
@@ -334,9 +390,9 @@ pub async fn add(
         "SubtensorModule",
         "add_stake",
         vec![
-            Value::from_bytes(hotkey_bytes),
-            Value::u128(netuid as u128),
-            Value::u128(amount_rao as u128),
+            SValue::from_bytes(hotkey_bytes),
+            SValue::u128(netuid as u128),
+            SValue::u128(amount_rao as u128),
         ],
     );
 
@@ -399,7 +455,7 @@ pub async fn remove(
     }
     let coldkey_bytes = PairTrait::public(&pair).0.to_vec();
 
-    let signer = PairSigner::<PolkadotConfig, sr25519::Pair>::new(pair);
+    let signer = Sr25519Signer::new(pair);
 
     let api = rpc::connect(endpoint).await?;
 
@@ -414,12 +470,13 @@ pub async fn remove(
             rao
         }
         RemoveAmount::Tao(tao) => {
-            let storage = tokio::time::timeout(RPC_TIMEOUT, api.storage().at_latest())
+            let at_block = tokio::time::timeout(RPC_TIMEOUT, api.at_current_block())
                 .await
-                .map_err(|_| BttError::query("storage().at_latest() timed out"))?
+                .map_err(|_| BttError::query("at_current_block() timed out"))?
                 .map_err(|e| {
-                    BttError::query(format!("failed to resolve storage at head: {e}"))
+                    BttError::query(format!("failed to resolve client at head: {e}"))
                 })?;
+            let storage = at_block.storage();
             let price = fetch_subnet_price(&storage, netuid).await?.ok_or_else(|| {
                 BttError::query(format!(
                     "could not resolve subnet {netuid} pool price for --amount-tao conversion"
@@ -461,9 +518,9 @@ pub async fn remove(
         "SubtensorModule",
         "remove_stake",
         vec![
-            Value::from_bytes(hotkey_bytes),
-            Value::u128(netuid as u128),
-            Value::u128(amount_alpha_rao as u128),
+            SValue::from_bytes(hotkey_bytes),
+            SValue::u128(netuid as u128),
+            SValue::u128(amount_alpha_rao as u128),
         ],
     );
 
@@ -491,29 +548,25 @@ async fn lookup_alpha_balance(
     hotkey_bytes: &[u8],
     netuid: u16,
 ) -> Result<u64, BttError> {
-    let call = subxt::dynamic::runtime_api_call(
+    let call = subxt::dynamic::runtime_api_call::<Vec<SValue>, SValue>(
         "StakeInfoRuntimeApi",
         "get_stake_info_for_hotkey_coldkey_netuid",
         vec![
-            Value::from_bytes(hotkey_bytes),
-            Value::from_bytes(coldkey_bytes),
-            Value::u128(netuid as u128),
+            SValue::from_bytes(hotkey_bytes),
+            SValue::from_bytes(coldkey_bytes),
+            SValue::u128(netuid as u128),
         ],
     );
 
-    let runtime_api = tokio::time::timeout(RPC_TIMEOUT, api.runtime_api().at_latest())
+    let at_block = tokio::time::timeout(RPC_TIMEOUT, api.at_current_block())
         .await
-        .map_err(|_| BttError::query("runtime_api().at_latest() timed out"))?
-        .map_err(|e| BttError::query(format!("failed to resolve runtime api at head: {e}")))?;
+        .map_err(|_| BttError::query("at_current_block() timed out"))?
+        .map_err(|e| BttError::query(format!("failed to resolve client at head: {e}")))?;
 
-    let result = tokio::time::timeout(RPC_TIMEOUT, runtime_api.call(call))
+    let decoded = tokio::time::timeout(RPC_TIMEOUT, at_block.runtime_apis().call(call))
         .await
         .map_err(|_| BttError::query("get_stake_info_for_hotkey_coldkey_netuid timed out"))?
         .map_err(|e| BttError::query(format!("runtime call failed: {e}")))?;
-
-    let decoded = result
-        .to_value()
-        .map_err(|e| BttError::parse(format!("failed to decode StakeInfo: {e}")))?;
 
     // The pallet wraps the result in Option<StakeInfo>. Dynamically decoded,
     // this shows up as a Variant (Some/None) wrapping the struct. Fall
@@ -542,13 +595,24 @@ struct StakeTxMeta<'a> {
 /// `StakeTxResult` envelope.
 async fn submit_stake_tx(
     api: &OnlineClient<PolkadotConfig>,
-    tx: &subxt::tx::DynamicPayload,
-    signer: &PairSigner<PolkadotConfig, sr25519::Pair>,
+    tx: &subxt::tx::DynamicPayload<Vec<SValue>>,
+    signer: &Sr25519Signer,
     meta: StakeTxMeta<'_>,
 ) -> Result<StakeTxResult, BttError> {
+    // `OnlineClient::tx()` became async in 0.50 — it resolves a
+    // `TransactionsClient` bound to the head block so the submit can build
+    // the extrinsic extensions (genesis hash, spec version, nonce, etc.)
+    // against a concrete metadata snapshot.
+    let mut tx_client = tokio::time::timeout(Duration::from_secs(120), api.tx())
+        .await
+        .map_err(|_| BttError::submission_failed("resolving transaction client timed out"))?
+        .map_err(|e| {
+            BttError::submission_failed(format!("failed to resolve transaction client: {e}"))
+        })?;
+
     let progress = tokio::time::timeout(
         Duration::from_secs(120),
-        api.tx().sign_and_submit_then_watch_default(tx, signer),
+        tx_client.sign_and_submit_then_watch_default(tx, signer),
     )
     .await
     .map_err(|_| BttError::submission_failed("transaction submission timed out"))?
