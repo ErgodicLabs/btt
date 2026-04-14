@@ -358,6 +358,17 @@ fn guard_create_overwrite(
 /// and caused a second invocation of `wallet create --name <same>` to
 /// silently destroy an irrecoverable wallet. See also PR #18 (issue #7)
 /// for the same fix on `new-coldkey` / `new-hotkey` / `regen-*`.
+///
+/// Issue #29 (atomic creation): all three wallet artifacts (coldkey,
+/// coldkeypub.txt, hotkey) are staged into a sibling temp directory
+/// `<wallets>/.tmp.<name>.<pid>.<nanos>/` and then moved into place with
+/// a single `fs::rename`. The rename is atomic on a single filesystem
+/// (both paths live under `<wallets>/`), so the target `<wallets>/<name>`
+/// directory is either absent or fully populated — never half-written.
+/// On any error during staging, the temp dir is removed and the user's
+/// wallet directory is never touched. The `.tmp.` prefix is excluded from
+/// `wallet list`, so a stale temp dir from a crashed run remains visible
+/// on disk (for forensics) without leaking into the user-facing listing.
 pub fn create(
     wallet_name: &str,
     hotkey_name: &str,
@@ -378,6 +389,156 @@ pub fn create(
     let hotkey_path = wallet_dir.join("hotkeys").join(hotkey_name);
     guard_create_overwrite(wallet_name, &coldkey_path, &hotkey_path, force)?;
 
+    // Stage into a sibling temp dir so the final rename is atomic.
+    // The temp dir lives inside `<wallets>/` (same filesystem as the
+    // target) and uses the `.tmp.` prefix reserved for staging. The
+    // `<pid>.<nanos>` suffix keeps concurrent `create` invocations from
+    // colliding in the same process and reduces the chance that a stale
+    // temp dir from an earlier crashed run collides with a fresh one
+    // after a PID wrap. Stale temp dirs are deliberately left on disk —
+    // they're intended forensics, not to be auto-cleaned on startup.
+    ensure_wallets_root()?;
+    let wallets_root = paths::wallets_dir()?;
+    let staging_dir = wallets_root.join(temp_staging_name(wallet_name));
+
+    // Drive the staged writes through a helper so the `?` propagation is
+    // funneled through a single cleanup point. On any error, remove the
+    // staging dir and return the original error.
+    let cr = match create_into_staging(
+        wallet_name,
+        hotkey_name,
+        n_words,
+        password,
+        &staging_dir,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&staging_dir);
+            return Err(e);
+        }
+    };
+
+    // Publish. Two paths:
+    //
+    // 1. Target does not exist (the common, non-force case): `fs::rename`
+    //    the staging dir into place. Single filesystem, so the rename is
+    //    atomic at the kernel level — the target is either absent or
+    //    fully populated.
+    //
+    // 2. Target already exists (only reachable with --force, because the
+    //    guard otherwise refuses): move the individual staged artifacts
+    //    into the existing target dir. This is NOT atomic across all
+    //    three files (coldkey, coldkeypub, hotkey), but it deliberately
+    //    preserves the pre-#29 --force semantics — specifically, other
+    //    hotkeys under `<wallet>/hotkeys/` that were not overwritten by
+    //    the guard-named hotkey continue to survive. A directory-level
+    //    `rename` would wipe them, which is a silent behavior change and
+    //    a potential second #19.
+    if wallet_dir.exists() {
+        debug_assert!(
+            force,
+            "target exists without --force: guard_create_overwrite should have refused"
+        );
+        if let Err(e) = promote_staged_into_existing(&staging_dir, &wallet_dir, hotkey_name) {
+            let _ = fs::remove_dir_all(&staging_dir);
+            return Err(e);
+        }
+        // The staged hotkeys/ subdir is left empty once its contents move;
+        // remove the now-empty staging dir so no forensics remain.
+        let _ = fs::remove_dir_all(&staging_dir);
+    } else {
+        if let Err(e) = fs::rename(&staging_dir, &wallet_dir) {
+            let _ = fs::remove_dir_all(&staging_dir);
+            return Err(BttError::io(format!(
+                "failed to atomically publish wallet {} ({} -> {}): {}",
+                wallet_name,
+                staging_dir.display(),
+                wallet_dir.display(),
+                e
+            )));
+        }
+    }
+
+    Ok(cr)
+}
+
+/// --force path: move the three staged artifacts (coldkey, coldkeypub,
+/// hotkey) from `staging_dir` into the pre-existing `target_dir`,
+/// overwriting the prior copies. Leaves any unrelated hotkeys under
+/// `<target>/hotkeys/` untouched, matching the pre-#29 semantics.
+fn promote_staged_into_existing(
+    staging_dir: &Path,
+    target_dir: &Path,
+    hotkey_name: &str,
+) -> Result<(), BttError> {
+    // Ensure the per-wallet and hotkeys subdir exist with the 0700 mode.
+    ensure_secure_dir(target_dir)?;
+    ensure_secure_dir(&target_dir.join("hotkeys"))?;
+
+    let moves: [(PathBuf, PathBuf); 3] = [
+        (staging_dir.join("coldkey"), target_dir.join("coldkey")),
+        (
+            staging_dir.join("coldkeypub.txt"),
+            target_dir.join("coldkeypub.txt"),
+        ),
+        (
+            staging_dir.join("hotkeys").join(hotkey_name),
+            target_dir.join("hotkeys").join(hotkey_name),
+        ),
+    ];
+    for (src, dst) in moves {
+        // Remove any pre-existing destination file so `rename` does not
+        // surprise on EEXIST on platforms where that matters. Linux
+        // rename(2) clobbers regular files, but we keep the explicit
+        // unlink for portability and symmetry with `write_secure_file`.
+        if dst.exists() {
+            fs::remove_file(&dst).map_err(|e| {
+                BttError::io(format!(
+                    "failed to remove existing {} prior to force overwrite: {}",
+                    dst.display(),
+                    e
+                ))
+            })?;
+        }
+        fs::rename(&src, &dst).map_err(|e| {
+            BttError::io(format!(
+                "failed to move staged {} into place at {}: {}",
+                src.display(),
+                dst.display(),
+                e
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// Compute the staging directory name for an atomic `create`.
+///
+/// Format: `.tmp.<wallet_name>.<pid>.<nanos>`. The `.tmp.` prefix is
+/// reserved (wallet list ignores it), the pid distinguishes concurrent
+/// processes, and the nanosecond timestamp distinguishes repeated calls
+/// from the same process (and reduces the chance that a stale temp dir
+/// from a prior crashed run collides with a fresh one after a pid wrap).
+fn temp_staging_name(wallet_name: &str) -> String {
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(".tmp.{wallet_name}.{pid}.{nanos}")
+}
+
+/// Stage a complete wallet (coldkey + coldkeypub + hotkey) into
+/// `staging_dir`. Caller owns the lifecycle of `staging_dir`: on any
+/// error returned from this helper, the caller must `remove_dir_all`
+/// the staging dir before surfacing the error.
+fn create_into_staging(
+    wallet_name: &str,
+    hotkey_name: &str,
+    n_words: u32,
+    password: &str,
+    staging_dir: &Path,
+) -> Result<CreateResult, BttError> {
     let (cold_pair, mut cold_phrase, mut cold_seed) = generate_keypair(n_words)?;
     let cold_ss58 = cold_pair.public().to_ss58check();
     let cold_seed_hex = format!("0x{}", hex::encode(cold_seed));
@@ -387,20 +548,25 @@ pub fn create(
     let mut cold_json_str = serde_json::to_string(&cold_json)
         .map_err(|e| BttError::io(format!("failed to serialize coldkey: {}", e)))?;
 
-    // Encrypt and write coldkey into a 0700 wallet directory
-    ensure_wallets_root()?;
-    ensure_secure_dir(&wallet_dir)?;
+    // 0700 staging dir inside the wallets root. The staging dir inherits
+    // the same perms the final wallet directory will carry, so the
+    // rename-into-place does not have to chmod afterward.
+    ensure_secure_dir(staging_dir)?;
 
+    // Encrypt and write the coldkey into the staging dir.
     let mut encrypted = encrypt_key_data(cold_json_str.as_bytes(), password)?;
-    write_secure_file(&coldkey_path, &encrypted)?;
+    let staged_coldkey = staging_dir.join("coldkey");
+    write_secure_file(&staged_coldkey, &encrypted)?;
     encrypted.zeroize();
     cold_json_str.zeroize();
 
-    // Write coldkeypub.txt (unencrypted public info)
+    // Write coldkeypub.txt into the staging dir (unencrypted public
+    // info). This must also live in the staging dir so it appears (or
+    // not) atomically with the secret files.
     let pub_data = build_pub_key_json(&cold_pair);
     let pub_json_str = serde_json::to_string(&pub_data)
         .map_err(|e| BttError::io(format!("failed to serialize coldkeypub: {}", e)))?;
-    fs::write(wallet_dir.join("coldkeypub.txt"), &pub_json_str)
+    fs::write(staging_dir.join("coldkeypub.txt"), &pub_json_str)
         .map_err(|e| BttError::io(format!("failed to write coldkeypub.txt: {}", e)))?;
 
     // Generate hotkey
@@ -412,11 +578,33 @@ pub fn create(
     let mut hot_json_str = serde_json::to_string(&hot_json)
         .map_err(|e| BttError::io(format!("failed to serialize hotkey: {}", e)))?;
 
-    // Write hotkey as an unencrypted file with 0600 perms inside a 0700 dir.
-    let hotkeys_dir = wallet_dir.join("hotkeys");
-    ensure_secure_dir(&hotkeys_dir)?;
-    write_secure_file(&hotkey_path, hot_json_str.as_bytes())?;
+    // Write hotkey as an unencrypted file with 0600 perms inside a 0700
+    // `hotkeys/` subdir — both inside the staging dir.
+    let staged_hotkeys_dir = staging_dir.join("hotkeys");
+    ensure_secure_dir(&staged_hotkeys_dir)?;
+    let staged_hotkey = staged_hotkeys_dir.join(hotkey_name);
+    write_secure_file(&staged_hotkey, hot_json_str.as_bytes())?;
     hot_json_str.zeroize();
+
+    // Issue #29 test-only failure injection. Gate on `cfg(test)` so the
+    // release binary has no trace of this knob. The value is read from
+    // the process environment so an individual test case can toggle the
+    // injection without affecting unrelated wallet_keys tests running in
+    // parallel. The scrub below (`cold_phrase`/`cold_seed`/`hot_phrase`/
+    // `hot_seed`) runs regardless because `?` / early-return short-circuit
+    // here — the caller's cleanup path still unlinks the staging dir.
+    #[cfg(test)]
+    {
+        if std::env::var_os("BTT_FAIL_AFTER_HOTKEY_WRITE").is_some() {
+            cold_phrase.zeroize();
+            cold_seed.zeroize();
+            hot_phrase.zeroize();
+            hot_seed.zeroize();
+            return Err(BttError::io(
+                "BTT_FAIL_AFTER_HOTKEY_WRITE: synthetic failure for issue #29 tests",
+            ));
+        }
+    }
 
     let mnemonic_out = cold_phrase.clone();
 
@@ -2121,5 +2309,151 @@ mod tests {
             std::env::set_var("HOME", &h);
         }
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── Atomic wallet create tests (issue #29) ────────────────────────
+    //
+    // The stage-and-rename path writes all three wallet artifacts into a
+    // `<wallets>/.tmp.<name>.<pid>.<nanos>/` staging directory and then
+    // `rename`s that directory into place. These tests cover:
+    //
+    //   1. Success path leaves a fully-populated target dir and no
+    //      leftover staging dirs.
+    //   2. Failure path (synthetic, via BTT_FAIL_AFTER_HOTKEY_WRITE) leaves
+    //      neither the target dir nor any leftover staging dir on disk.
+    //      The test only asserts the target-dir-absence invariant; the
+    //      staging dir itself gets `remove_dir_all`'d on the error path.
+    //   3. `wallet list` skips `.tmp.*` entries so a stale staging dir
+    //      does not surface as a real wallet in the CLI listing.
+    //
+    // All three tests share the HOME_LOCK because they mutate HOME /
+    // XDG_CONFIG_HOME. BTT_FAIL_AFTER_HOTKEY_WRITE is also a process-
+    // global env var, so holding HOME_LOCK implicitly serializes access
+    // to that too.
+
+    /// Enumerate any `.tmp.*` directories that were left inside the
+    /// wallets root. Used by the post-success assertion and the
+    /// post-failure assertion to prove the staging dir was removed.
+    fn stale_tmp_dirs(wallets_parent: &std::path::Path) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(wallets_parent) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with(".tmp.") {
+                    out.push(name);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn wallet_create_atomic_on_success() {
+        // Sanity: the atomic stage-and-rename path still produces the
+        // expected three files in the target dir, and only those files.
+        let _guard = HOME_LOCK.lock().expect("home lock");
+        let (tmp, original) = seat_home("atomic-ok");
+
+        let result = create("atomic-ok", "default", 12, "pw", false);
+
+        let wallets_parent = test_wallets_parent(&tmp);
+        let wdir = wallets_parent.join("atomic-ok");
+        let coldkey_exists = wdir.join("coldkey").exists();
+        let coldkeypub_exists = wdir.join("coldkeypub.txt").exists();
+        let hotkey_exists = wdir.join("hotkeys").join("default").exists();
+
+        restore_home(tmp, original);
+        result.expect("create should work");
+        assert!(coldkey_exists, "coldkey must exist after success");
+        assert!(coldkeypub_exists, "coldkeypub.txt must exist after success");
+        assert!(hotkey_exists, "hotkey must exist after success");
+    }
+
+    #[test]
+    fn wallet_create_no_temp_dir_after_success() {
+        // After a successful create, the sibling `.tmp.*` staging dir
+        // must have been renamed into place — there should be nothing
+        // starting with `.tmp.` left under `<wallets>/`.
+        let _guard = HOME_LOCK.lock().expect("home lock");
+        let (tmp, original) = seat_home("atomic-clean");
+
+        let _cr = create("atomic-clean", "default", 12, "pw", false)
+            .expect("create should work");
+
+        let wallets_parent = test_wallets_parent(&tmp);
+        let leftover = stale_tmp_dirs(&wallets_parent);
+
+        restore_home(tmp, original);
+        assert!(
+            leftover.is_empty(),
+            "no .tmp.* staging dirs should remain after success, found: {leftover:?}"
+        );
+    }
+
+    #[test]
+    fn wallet_create_failure_leaves_no_partial() {
+        // Inject a failure after the hotkey write via the
+        // BTT_FAIL_AFTER_HOTKEY_WRITE env var (test-only hook). The
+        // staging dir is fully populated by the time the synthetic
+        // error fires, and we must observe:
+        //   1. the target `<wallets>/<name>` dir does NOT exist, and
+        //   2. no `.tmp.*` staging dir is left behind.
+        let _guard = HOME_LOCK.lock().expect("home lock");
+        let (tmp, original) = seat_home("atomic-fail");
+
+        std::env::set_var("BTT_FAIL_AFTER_HOTKEY_WRITE", "1");
+        let result = create("atomic-fail", "default", 12, "pw", false);
+        std::env::remove_var("BTT_FAIL_AFTER_HOTKEY_WRITE");
+
+        let wallets_parent = test_wallets_parent(&tmp);
+        let wdir = wallets_parent.join("atomic-fail");
+        let target_exists = wdir.exists();
+        let leftover = stale_tmp_dirs(&wallets_parent);
+
+        restore_home(tmp, original);
+        let err = unwrap_err(result, "BTT_FAIL_AFTER_HOTKEY_WRITE should fail create");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("BTT_FAIL_AFTER_HOTKEY_WRITE"),
+            "error should carry the synthetic tag, got: {msg}"
+        );
+        assert!(
+            !target_exists,
+            "target wallet dir must not exist after a staged-create failure"
+        );
+        assert!(
+            leftover.is_empty(),
+            "no .tmp.* staging dirs should remain after failure, found: {leftover:?}"
+        );
+    }
+
+    #[test]
+    fn wallet_list_skips_temp_dirs() {
+        // Plant a `.tmp.*` directory manually inside `<wallets>/` and
+        // confirm `wallet::list` does not surface it. This guards against
+        // a future refactor that stops filtering dotfile-prefixed
+        // entries.
+        let _guard = HOME_LOCK.lock().expect("home lock");
+        let (tmp, original) = seat_home("atomic-list");
+
+        // Create a real wallet so `list` has at least one entry to
+        // compare against, and a sibling `.tmp.*` dir that should be
+        // invisible to `list`.
+        let _cr = create("real", "default", 12, "pw", false).expect("create");
+        let wallets_parent = test_wallets_parent(&tmp);
+        let stale = wallets_parent.join(".tmp.real.99999.123456789");
+        std::fs::create_dir_all(&stale).expect("plant stale tmp dir");
+        std::fs::write(stale.join("coldkeypub.txt"), "{}")
+            .expect("plant stale coldkeypub");
+
+        let listing = crate::commands::wallet::list().expect("wallet list");
+        let names: Vec<&str> = listing.wallets.iter().map(|w| w.name.as_str()).collect();
+
+        restore_home(tmp, original);
+        assert!(names.contains(&"real"), "real wallet should be listed: {names:?}");
+        assert!(
+            !names.iter().any(|n| n.starts_with(".tmp.")),
+            "wallet list must skip .tmp.* staging dirs, got: {names:?}"
+        );
     }
 }

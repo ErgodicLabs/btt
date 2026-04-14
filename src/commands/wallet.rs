@@ -55,6 +55,16 @@ pub fn list() -> Result<WalletList, BttError> {
             .to_string_lossy()
             .to_string();
 
+        // Skip staging directories left behind by `wallet create`
+        // (issue #29). The atomic-create path writes a sibling temp dir
+        // named `.tmp.<wallet>.<pid>.<nanos>` inside `<wallets>/` and
+        // renames it into place on success. A stale `.tmp.*` from a
+        // crashed run is left on disk deliberately (forensics), but must
+        // not appear in `wallet list` as if it were a real wallet.
+        if wallet_name.starts_with(".tmp.") {
+            continue;
+        }
+
         // Read coldkeypub.txt
         let coldkey_path = path.join("coldkeypub.txt");
         let coldkey = if coldkey_path.exists() {
