@@ -57,7 +57,7 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           # For workflow_dispatch with a `ref` input, check that out;
           # otherwise pin to the exact commit that triggered this run
@@ -74,7 +74,7 @@ jobs:
         uses: dtolnay/rust-toolchain@1.94.1
 
       - name: Cargo cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/bin/
@@ -115,7 +115,7 @@ jobs:
 
       - name: Upload test output
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-output-${{ github.run_id }}
           path: test-output.log

@@ -36,7 +36,7 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Rust toolchain
         # Pinned to match rust-toolchain.toml. When bumping, update both.
@@ -45,7 +45,7 @@ jobs:
           components: clippy
 
       - name: Cargo cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/bin/
