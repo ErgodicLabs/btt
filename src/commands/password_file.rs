@@ -131,9 +131,36 @@ fn read_password_file_inner(path: &Path) -> Result<Zeroizing<String>, BttError> 
         )));
     }
 
-    let mut buf = Zeroizing::new(Vec::<u8>::with_capacity(md.len() as usize));
-    file.read_to_end(&mut buf)
+    // Enforce a HARD ceiling on the read itself, independent of the advisory
+    // `metadata().len()` check above. If the file grows between the stat and
+    // the read (a TOCTOU that's not exploitable here — the file is 0600,
+    // owned by the caller's uid — but removing the footgun is one line),
+    // `Read::take` will stop at `MAX_FILE_BYTES + 1` and we error out.
+    // Issue #27.
+    let cap = md.len().min(MAX_FILE_BYTES) as usize;
+    let mut buf = Zeroizing::new(Vec::<u8>::with_capacity(cap));
+    (&mut file)
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut buf)
         .map_err(|e| BttError::io(format!("failed to read password file: {}", e)))?;
+    if buf.len() as u64 > MAX_FILE_BYTES {
+        return Err(BttError::invalid_input(format!(
+            "password file {} exceeds {} bytes (possibly growing under us); refusing to read",
+            path.display(),
+            MAX_FILE_BYTES
+        )));
+    }
+
+    // Strip a leading UTF-8 BOM if present. PowerShell's `Out-File -Encoding
+    // utf8` emits a BOM; without this, the BOM bytes get prepended to the
+    // password fed to argon2 and the user sees a "wrong password" error with
+    // no obvious cause. Byte-level check so no utf-8 validation runs first.
+    // Only the leading BOM is special; a BOM later in the file is left alone.
+    // Issue #28.
+    const UTF8_BOM: &[u8] = &[0xef, 0xbb, 0xbf];
+    if buf.starts_with(UTF8_BOM) {
+        buf.drain(..UTF8_BOM.len());
+    }
 
     // Take everything up to the first `\n`.
     let first_line_end = buf.iter().position(|&b| b == b'\n').unwrap_or(buf.len());
@@ -290,6 +317,79 @@ mod tests {
 
         fs::remove_file(&link).ok();
         fs::remove_file(&target).ok();
+    }
+
+    // ---- issue #27: hard ceiling via Read::take ----
+
+    #[cfg(unix)]
+    #[test]
+    fn oversize_file_errors() {
+        // File of MAX_FILE_BYTES + 100. The advisory `md.len()` gate catches
+        // this on the first check, but the Read::take path is also exercised:
+        // even if the gate were somehow bypassed (file growing under us), the
+        // take(MAX+1) + len check would still error.
+        let p = tmp_path("oversize");
+        let n: usize = 64 * 1024 + 100;
+        let payload = vec![b'a'; n];
+        write_mode(&p, &payload, 0o600);
+        let err = read_password_file_inner(&p).expect_err("should refuse");
+        assert!(
+            err.message.contains("larger than")
+                || err.message.contains("exceeds"),
+            "msg: {}",
+            err.message
+        );
+        fs::remove_file(&p).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn at_size_limit_succeeds() {
+        // File of exactly MAX_FILE_BYTES. The first byte is the password
+        // 'x' followed by '\n', then filler. We should get "x" back and no
+        // size error. Exercises the take(MAX+1) path returning exactly MAX.
+        let p = tmp_path("atlimit");
+        let n: usize = 64 * 1024;
+        let mut payload = Vec::with_capacity(n);
+        payload.extend_from_slice(b"x\n");
+        payload.resize(n, b'y');
+        write_mode(&p, &payload, 0o600);
+        let pw = read_password_file_inner(&p).expect("read at limit");
+        assert_eq!(&*pw, "x");
+        fs::remove_file(&p).ok();
+    }
+
+    // ---- issue #28: strip leading UTF-8 BOM ----
+
+    #[cfg(unix)]
+    #[test]
+    fn bom_is_stripped() {
+        // PowerShell's `Out-File -Encoding utf8` writes \xef\xbb\xbf + bytes.
+        // The BOM must not appear in the password we feed to argon2.
+        let p = tmp_path("bom");
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0xef, 0xbb, 0xbf]);
+        payload.extend_from_slice(b"password\n");
+        write_mode(&p, &payload, 0o600);
+        let pw = read_password_file_inner(&p).expect("read");
+        assert_eq!(&*pw, "password");
+        fs::remove_file(&p).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bom_only_at_start() {
+        // A BOM later in the file is a real character and must NOT be
+        // stripped. Only a leading BOM is special.
+        let p = tmp_path("bom-mid");
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"password");
+        payload.extend_from_slice(&[0xef, 0xbb, 0xbf]);
+        payload.extend_from_slice(b"\n");
+        write_mode(&p, &payload, 0o600);
+        let pw = read_password_file_inner(&p).expect("read");
+        assert_eq!(pw.as_bytes(), b"password\xef\xbb\xbf");
+        fs::remove_file(&p).ok();
     }
 
     #[test]

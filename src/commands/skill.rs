@@ -107,6 +107,11 @@ On unix, btt refuses to read the file if its mode is other-readable
 (`/dev/shm`) so the bytes never hit a physical disk. Shred the file
 immediately after the command exits.
 
+The file is capped at 64 KiB and a leading UTF-8 BOM (`\xef\xbb\xbf`) is
+stripped on read — PowerShell's `Out-File -Encoding utf8` writes a BOM, so
+without the strip the password fed to argon2 would not match the one used
+at wallet creation.
+
 Do not use `--password-file` with mainnet wallets unless your filesystem,
 process listing, and shell history are all under your control.
 
