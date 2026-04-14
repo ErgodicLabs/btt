@@ -31,17 +31,28 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded runs on the same ref. If a new push lands while an
+# earlier run is still going, the earlier run gets cancelled — its test
+# verdict would be stale anyway. Saves runner minutes on rapid iteration.
+# Per barbarian review on PR #60.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
-    # Raised from 30 to 60 on 2026-04-14 after the first PR #60 run hit
-    # the 30-min cap. Root cause: the wallet_keys module's tests each
-    # exercise real argon2id KDF at production work factor, taking 60-120s
-    # per test. On ubuntu-latest's 2 vCPU runner with --test-threads=2,
-    # the wallet_keys module alone needs ~30-40 min. A proper fix (a
-    # test-only KDF profile with a low work factor) is tracked separately;
-    # the 60-min ceiling is the pragmatic stopgap.
-    timeout-minutes: 60
+    # 15 min is a generous ceiling for the post-#61 world: the wallet_keys
+    # tests no longer run the SENSITIVE argon2id profile under cfg(test)
+    # (see `ARGON2_*` constants in src/commands/wallet_keys.rs), so the
+    # module drops from ~30-40 min to well under a minute. Cold cache
+    # `cargo build --tests --workspace` is the dominant cost at 2-5 min.
+    #
+    # History: raised from 30 to 60 on 2026-04-14 after PR #60 hit the
+    # 30-min cap when the test suite was still doing real argon2 at
+    # t=8/m=512MiB. Lowered to 15 on 2026-04-14 once #61 shipped the
+    # test-only KDF profile.
+    timeout-minutes: 15
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -49,8 +60,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           # For workflow_dispatch with a `ref` input, check that out;
-          # otherwise fall back to the event's default ref.
-          ref: ${{ github.event.inputs.ref || github.ref }}
+          # otherwise pin to the exact commit that triggered this run
+          # (`github.sha`). Prefer sha over ref so a concurrent push
+          # to the same branch can't shift the checked-out commit
+          # between the event firing and the checkout running — on
+          # pull_request events `github.sha` is the merge commit,
+          # which is what we want. Per barbarian review on PR #60.
+          ref: ${{ github.event.inputs.ref || github.sha }}
 
       - name: Setup Rust toolchain
         # Pinned to match rust-toolchain.toml and btcli-compat.yml.
