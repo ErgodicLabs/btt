@@ -188,26 +188,14 @@ pub fn decrypt_coldkey_interactive(wallet_name: &str) -> Result<Pair, BttError> 
         )));
     }
 
-    // Try reading as unencrypted JSON first (development/testing keys).
-    // The plaintext contents still hold a mnemonic, so funnel it through
-    // a `Zeroizing<Vec<u8>>` instead of `fs::read_to_string`, which would
-    // leak the bytes to an unscrubbed `String` allocation.
-    //
-    // We skip the old `serde_json::Value` pre-check (which itself would
-    // allocate unscrubbed owned `String`s for every JSON string node) and
-    // go straight to `pair_from_key_json`, which routes the data through
-    // the zeroizing `LoadedKeyFile`. On an encrypted `$NACL` envelope the
-    // UTF-8 check fails and we fall through to the decrypt branch.
-    if let Ok(raw) = fs::read(&coldkey_path) {
-        let raw: Zeroizing<Vec<u8>> = Zeroizing::new(raw);
-        if let Ok(content) = std::str::from_utf8(&raw) {
-            if let Ok(pair) = pair_from_key_json(content) {
-                return Ok(pair);
-            }
-        }
-    }
-
-    // Encrypted: prompt for password and decrypt
+    // Every btt-produced coldkey on disk is a binary `$NACL` envelope written
+    // by `encrypt_key_data` + `write_secure_file`, so the older
+    // "try unencrypted JSON first" branch cannot reach any real caller: the
+    // UTF-8 check on a `$NACL` blob fails at the first non-ASCII byte of the
+    // nonce. The dead branch was a leftover from a pre-encryption prototype
+    // and is deleted per NEW-I1 of the PR #3 round-2 review (issue #9).
+    // Testing keys that need an unencrypted round-trip go through the private
+    // `load_coldkey` / `pair_from_key_json` helpers directly.
     let password = read_password("Enter coldkey password: ")?;
     let pair = load_coldkey(&wdir, &password)?;
     Ok(pair)
@@ -901,8 +889,7 @@ fn create_into_staging(
     let pub_data = build_pub_key_json(&cold_pair);
     let pub_json_str = serde_json::to_string(&pub_data)
         .map_err(|e| BttError::io(format!("failed to serialize coldkeypub: {}", e)))?;
-    fs::write(staging_dir.join("coldkeypub.txt"), &pub_json_str)
-        .map_err(|e| BttError::io(format!("failed to write coldkeypub.txt: {}", e)))?;
+    write_public_file(&staging_dir.join("coldkeypub.txt"), pub_json_str.as_bytes())?;
 
     // Generate hotkey
     let (hot_pair, mut hot_phrase, mut hot_seed) = generate_keypair(n_words)?;
@@ -995,8 +982,7 @@ pub fn new_coldkey(
     let pub_data = build_pub_key_json(&pair);
     let pub_json_str = serde_json::to_string(&pub_data)
         .map_err(|e| BttError::io(format!("failed to serialize coldkeypub: {}", e)))?;
-    fs::write(wallet_dir.join("coldkeypub.txt"), &pub_json_str)
-        .map_err(|e| BttError::io(format!("failed to write coldkeypub.txt: {}", e)))?;
+    write_public_file(&wallet_dir.join("coldkeypub.txt"), pub_json_str.as_bytes())?;
 
     let mnemonic_out = phrase.clone();
 
@@ -1098,8 +1084,7 @@ pub fn regen_coldkey(
     let pub_data = build_pub_key_json(&pair);
     let pub_json_str = serde_json::to_string(&pub_data)
         .map_err(|e| BttError::io(format!("failed to serialize coldkeypub: {}", e)))?;
-    fs::write(wallet_dir.join("coldkeypub.txt"), &pub_json_str)
-        .map_err(|e| BttError::io(format!("failed to write coldkeypub.txt: {}", e)))?;
+    write_public_file(&wallet_dir.join("coldkeypub.txt"), pub_json_str.as_bytes())?;
 
     Ok(RegenResult {
         wallet_name: wallet_name.to_string(),
@@ -1405,6 +1390,13 @@ fn decrypt_key_data(encrypted: &[u8], password: &str) -> Result<Zeroizing<Vec<u8
 /// write `data`, fsync, and close. Fails if the file already exists unless the
 /// existing file can be removed first (callers that intend to overwrite should
 /// delete first). No TOCTOU window at 0644.
+///
+/// After the file's own `sync_all()` returns, the parent directory is also
+/// opened and `sync_all()`d so the new dirent reaches stable storage. Without
+/// this second fsync a power loss between the file's inode checkpoint and
+/// the directory's dirent checkpoint can leave the file either orphaned
+/// (content on disk, name not visible) or invisible (name gone, content
+/// still linked). NEW-L1 from the PR #3 round-2 review (issue #9).
 fn write_secure_file(path: &Path, data: &[u8]) -> Result<(), BttError> {
     // If the file exists, remove it first; we want to replace atomically.
     if path.exists() {
@@ -1425,6 +1417,78 @@ fn write_secure_file(path: &Path, data: &[u8]) -> Result<(), BttError> {
         .map_err(|e| BttError::io(format!("failed to write {}: {}", path.display(), e)))?;
     f.sync_all()
         .map_err(|e| BttError::io(format!("failed to sync {}: {}", path.display(), e)))?;
+    sync_parent_dir(path)?;
+    Ok(())
+}
+
+/// Create a file at `path` with mode 0644 (unix) and write `data`. Used for
+/// public-data files (`coldkeypub.txt`) that must be readable by anything on
+/// the host but should still carry an explicit, predictable mode rather than
+/// whatever the caller's umask happened to produce. NEW-L3 from the PR #3
+/// round-2 review (issue #9): the rest of the wallet dir has an explicit-perms
+/// posture, and `fs::write` alone leaves the pub file at umask-default
+/// (typically 0664 on a user shell). The contents are public so the bit that
+/// matters is consistency, not confidentiality.
+///
+/// As with [`write_secure_file`], the file is fsynced and the parent dir
+/// dirent is fsynced afterwards.
+fn write_public_file(path: &Path, data: &[u8]) -> Result<(), BttError> {
+    if path.exists() {
+        fs::remove_file(path)
+            .map_err(|e| BttError::io(format!("failed to remove {}: {}", path.display(), e)))?;
+    }
+
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o644);
+    }
+    let mut f = opts
+        .open(path)
+        .map_err(|e| BttError::io(format!("failed to create {}: {}", path.display(), e)))?;
+    f.write_all(data)
+        .map_err(|e| BttError::io(format!("failed to write {}: {}", path.display(), e)))?;
+    f.sync_all()
+        .map_err(|e| BttError::io(format!("failed to sync {}: {}", path.display(), e)))?;
+    sync_parent_dir(path)?;
+    Ok(())
+}
+
+/// Open the parent directory of `path` and `sync_all()` it, so the dirent
+/// pointing at the freshly written file reaches stable storage. Silently
+/// no-ops if `path` has no parent (a root-level path, which none of our
+/// wallet paths are). See [`write_secure_file`] for the durability rationale.
+fn sync_parent_dir(path: &Path) -> Result<(), BttError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    // `File::open` on a directory is legal on unix and returns an fd that
+    // supports `fsync`. On windows, `File::open` on a directory fails with
+    // `ERROR_ACCESS_DENIED`, so gate the call to unix targets. The PR #3
+    // durability finding is unix-specific; windows' own crash model is
+    // different and not in scope.
+    #[cfg(unix)]
+    {
+        let dir = fs::File::open(parent).map_err(|e| {
+            BttError::io(format!(
+                "failed to open parent directory {} for fsync: {}",
+                parent.display(),
+                e
+            ))
+        })?;
+        dir.sync_all().map_err(|e| {
+            BttError::io(format!(
+                "failed to fsync parent directory {}: {}",
+                parent.display(),
+                e
+            ))
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+    }
     Ok(())
 }
 
@@ -1800,7 +1864,7 @@ mod tests {
     fn create_writes_secure_file_perms() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("btt-perm-{}", std::process::id()));
         let wallet_name = "perm-test";
 
@@ -1963,7 +2027,7 @@ mod tests {
         // ss58 matches the create-time ss58. This exercises
         // `decrypt_key_data`, `load_coldkey`, and `pair_from_key_json`
         // on the zeroized code path.
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("btt-load-zeroize-{}", std::process::id()));
         let wallet_name = "load-zero-test";
 
@@ -2026,7 +2090,7 @@ mod tests {
 
     #[test]
     fn create_wallet_roundtrip() {
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Use a temp directory to avoid polluting the real config dir.
         let tmp = std::env::temp_dir().join(format!("btt-test-{}", std::process::id()));
         let wallet_name = "test-wallet";
@@ -2146,7 +2210,7 @@ mod tests {
 
     #[test]
     fn create_and_sign_roundtrip() {
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("btt-test-sign-{}", std::process::id()));
         let wallet_name = "sign-test";
 
@@ -2239,7 +2303,7 @@ mod tests {
 
     #[test]
     fn new_coldkey_no_flag_no_file_succeeds() {
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("nc-ok");
 
         let result = new_coldkey("w", 12, "pw", false);
@@ -2251,7 +2315,7 @@ mod tests {
 
     #[test]
     fn new_coldkey_no_flag_existing_file_errors() {
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("nc-refuse");
 
         let first = new_coldkey("w", 12, "pw", false).expect("first create");
@@ -2288,7 +2352,7 @@ mod tests {
 
     #[test]
     fn new_coldkey_force_replaces_existing() {
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("nc-force");
 
         let first = new_coldkey("w", 12, "pw", false).expect("first create");
@@ -2305,7 +2369,7 @@ mod tests {
 
     #[test]
     fn new_hotkey_no_flag_no_file_succeeds() {
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("nh-ok");
 
         // new_hotkey needs the wallet dir to exist, so bootstrap with a
@@ -2320,7 +2384,7 @@ mod tests {
 
     #[test]
     fn new_hotkey_no_flag_existing_file_errors() {
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("nh-refuse");
 
         let _cr = new_coldkey("w", 12, "pw", false).expect("bootstrap coldkey");
@@ -2346,7 +2410,7 @@ mod tests {
 
     #[test]
     fn new_hotkey_force_replaces_existing() {
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("nh-force");
 
         let _cr = new_coldkey("w", 12, "pw", false).expect("bootstrap coldkey");
@@ -2363,7 +2427,7 @@ mod tests {
 
     #[test]
     fn regen_coldkey_no_flag_existing_file_errors() {
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("rc-refuse");
 
         let first = new_coldkey("w", 12, "pw", false).expect("first create");
@@ -2381,7 +2445,7 @@ mod tests {
 
     #[test]
     fn regen_coldkey_force_replaces_existing() {
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("rc-force");
 
         let first = new_coldkey("w", 12, "pw", false).expect("first create");
@@ -2401,7 +2465,7 @@ mod tests {
 
     #[test]
     fn regen_coldkey_no_flag_no_file_succeeds() {
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("rc-ok");
 
         // Produce a mnemonic outside the HOME-scoped wallet dir so we can
@@ -2416,7 +2480,7 @@ mod tests {
 
     #[test]
     fn regen_hotkey_no_flag_existing_file_errors() {
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("rh-refuse");
 
         let _cr = new_coldkey("w", 12, "pw", false).expect("bootstrap coldkey");
@@ -2432,7 +2496,7 @@ mod tests {
 
     #[test]
     fn regen_hotkey_force_replaces_existing() {
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("rh-force");
 
         let _cr = new_coldkey("w", 12, "pw", false).expect("bootstrap coldkey");
@@ -2449,7 +2513,7 @@ mod tests {
 
     #[test]
     fn regen_hotkey_no_flag_no_file_succeeds() {
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("rh-ok");
 
         let _cr = new_coldkey("w", 12, "pw", false).expect("bootstrap coldkey");
@@ -2472,7 +2536,7 @@ mod tests {
 
     #[test]
     fn wallet_create_no_flag_no_file_succeeds() {
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("wc-ok");
 
         let result = create("w", "default", 12, "pw", false);
@@ -2485,7 +2549,7 @@ mod tests {
 
     #[test]
     fn wallet_create_no_flag_existing_wallet_errors_and_preserves_bytes() {
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("wc-refuse");
 
         let first = create("w", "default", 12, "pw", false).expect("first create");
@@ -2556,7 +2620,7 @@ mod tests {
 
     #[test]
     fn wallet_create_force_replaces_existing() {
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("wc-force");
 
         let first = create("w", "default", 12, "pw", false).expect("first create");
@@ -2586,7 +2650,7 @@ mod tests {
         // wallet from an aborted new-hotkey run, or user-side tampering)
         // the guard must still fire. This documents that `wallet create`
         // refuses on ANY pre-existing key file, not just a coldkey.
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("wc-hotonly");
 
         // Bootstrap: make a wallet dir with only a hotkey, no coldkey.
@@ -2614,7 +2678,7 @@ mod tests {
 
     #[test]
     fn regen_coldkey_from_mnemonic() {
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("btt-test-regen-{}", std::process::id()));
         let wallet_name = "regen-test";
 
@@ -2686,7 +2750,7 @@ mod tests {
     fn wallet_create_atomic_on_success() {
         // Sanity: the atomic stage-and-rename path still produces the
         // expected three files in the target dir, and only those files.
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("atomic-ok");
 
         let result = create("atomic-ok", "default", 12, "pw", false);
@@ -2709,7 +2773,7 @@ mod tests {
         // After a successful create, the sibling `.tmp.*` staging dir
         // must have been renamed into place — there should be nothing
         // starting with `.tmp.` left under `<wallets>/`.
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("atomic-clean");
 
         let _cr = create("atomic-clean", "default", 12, "pw", false)
@@ -2733,7 +2797,7 @@ mod tests {
         // error fires, and we must observe:
         //   1. the target `<wallets>/<name>` dir does NOT exist, and
         //   2. no `.tmp.*` staging dir is left behind.
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("atomic-fail");
 
         std::env::set_var("BTT_FAIL_AFTER_HOTKEY_WRITE", "1");
@@ -2768,7 +2832,7 @@ mod tests {
         // confirm `wallet::list` does not surface it. This guards against
         // a future refactor that stops filtering dotfile-prefixed
         // entries.
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("atomic-list");
 
         // Create a real wallet so `list` has at least one entry to
@@ -2815,7 +2879,7 @@ mod tests {
         // This is the counterpart to `wallet_create_force_partial_
         // promote_failure_keeps_old` below, which tests the failure
         // path BEFORE the publish.
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("atomic-force-fail");
 
         // Round 1: create a wallet with two hotkeys — `default` (which
@@ -2907,7 +2971,7 @@ mod tests {
         //   3. the preserved coldkeypub still carries the original
         //      ss58 (not the new one from the aborted second create);
         //   4. no stale `.bak.*` or `.tmp.*` dirs remain.
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("force-partial-fail");
 
         let first =
@@ -2978,7 +3042,7 @@ mod tests {
         // (the list path filters them), so `create` must refuse the
         // name at the door — before validate_n_words, before any key
         // material is generated.
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("reserved-prefix");
 
         let tmp_result = create(".tmp.foo", "default", 12, "pw", false);
@@ -3062,7 +3126,7 @@ mod tests {
         use std::sync::Barrier;
         use std::time::{Duration, Instant};
 
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("flock-acquires");
 
         let wallet_name = "w-flock-acq";
@@ -3109,7 +3173,7 @@ mod tests {
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
 
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("flock-release-ok");
 
         let wallet_name = "w-flock-rel-ok";
@@ -3151,7 +3215,7 @@ mod tests {
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
 
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("flock-release-err");
 
         let wallet_name = "w-flock-rel-err";
@@ -3200,7 +3264,7 @@ mod tests {
         // filter (`!path.is_dir()`) is the first line of defense, but
         // we still keep the explicit `.lock.*` skip for defense in
         // depth.
-        let _guard = HOME_LOCK.lock().expect("home lock");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, original) = seat_home("flock-list-skip");
 
         // Create a real wallet so `list` has at least one entry.
@@ -3236,5 +3300,132 @@ mod tests {
             }
         }
         out
+    }
+
+    // ── Issue #9 hygiene regression tests ────────────────────────────────
+    //
+    // NEW-L1 / L2 / L3 from the PR #3 round-2 review. These pin three small
+    // but distinct behaviors:
+    //   1. `write_secure_file` succeeds end-to-end with the parent-dir fsync
+    //      addition (we cannot directly assert durability without a crash
+    //      injection harness, so we settle for "the happy path still works").
+    //   2. A poisoned `HOME_LOCK` does not wedge subsequent tests.
+    //   3. `coldkeypub.txt` lands at exactly 0644 regardless of umask.
+
+    /// NEW-L1: `write_secure_file` must still return `Ok` on a basic write
+    /// after the parent-directory fsync addition. We cannot test actual
+    /// durability under power loss without a crash injection harness; this
+    /// test only covers the success path so a regression in `sync_parent_dir`
+    /// (e.g., a missing parent, a permission error on the dir open) cannot
+    /// silently break the main write routine.
+    #[test]
+    fn write_secure_file_success_path_with_parent_fsync() {
+        let tmp = std::env::temp_dir().join(format!(
+            "btt-wsf-parent-fsync-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).expect("create tmp");
+
+        let target = tmp.join("secret.bin");
+        let data = b"hygiene-regression-payload";
+        write_secure_file(&target, data).expect("write_secure_file must succeed");
+
+        let round_trip = std::fs::read(&target).expect("read back");
+        assert_eq!(round_trip, data, "written bytes must round-trip");
+
+        #[cfg(unix)]
+        {
+            let mode = std::fs::metadata(&target)
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "secure file must land at 0600");
+        }
+
+        // Writing the same path a second time must also succeed (the
+        // remove-then-create-new branch + fsync must both hold together).
+        write_secure_file(&target, b"second-write").expect("second write");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// NEW-L2: if a test panics while holding `HOME_LOCK`, the lock becomes
+    /// poisoned; the canonical Rust pattern is `.unwrap_or_else(|e|
+    /// e.into_inner())` so the next acquisition ignores the poison flag and
+    /// proceeds. This test deliberately poisons the lock from a sub-thread
+    /// and then asserts a subsequent acquisition still works.
+    #[test]
+    fn home_lock_recovers_from_poisoning() {
+        // Poison the lock by panicking inside a thread that holds it.
+        let handle = std::thread::spawn(|| {
+            let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            panic!("deliberate poison for NEW-L2 regression test");
+        });
+        // The thread must have panicked; join() returns Err.
+        let join_result = handle.join();
+        assert!(
+            join_result.is_err(),
+            "helper thread must panic to poison the lock"
+        );
+
+        // The lock is now poisoned. The old `.expect("home lock")` pattern
+        // would panic here with `PoisonError`. The new pattern recovers.
+        let poisoned = HOME_LOCK.lock();
+        assert!(
+            poisoned.is_err(),
+            "lock must actually be poisoned after the helper's panic, \
+             otherwise this test is not exercising the recovery path"
+        );
+        let _recovered = poisoned.unwrap_or_else(|e| e.into_inner());
+        // If we got here, the recovery pattern works: the next test that
+        // grabs HOME_LOCK via the standard idiom will not panic.
+    }
+
+    /// NEW-L3: `coldkeypub.txt` must be written at explicit mode 0644
+    /// regardless of the host's umask. The contents are public so the
+    /// bit that matters is consistency with the rest of the wallet dir's
+    /// explicit-perms posture.
+    #[cfg(unix)]
+    #[test]
+    fn coldkeypub_txt_mode_is_0644() {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Force a loose umask so the default-umask path would land at 0666
+        // and fail this assertion if `write_public_file` ever regresses
+        // to `fs::write`.
+        //
+        // SAFETY: `umask(2)` is async-signal-safe and unconditionally
+        // succeeds; no FFI safety preconditions. We declare the symbol
+        // directly to avoid a `libc` dep (see PR #21 dep-discipline).
+        extern "C" {
+            fn umask(mask: u32) -> u32;
+        }
+        let old_mask = unsafe { umask(0) };
+
+        let (tmp, original) = seat_home("coldkeypub-mode");
+        let result = create("w-pub-mode", "default", 12, "pw", false);
+
+        // Restore the umask before any assertions so a failed assertion
+        // does not leak the relaxed mask to sibling tests in the same
+        // process. HOME_LOCK serializes HOME-mutating tests so no other
+        // test is running concurrently here, but umask is process-global.
+        let _ = unsafe { umask(old_mask) };
+
+        let _ = result.expect("wallet create must succeed");
+        let wdir = wallet_path("w-pub-mode").expect("wallet_path");
+        let pub_path = wdir.join("coldkeypub.txt");
+        let meta = std::fs::metadata(&pub_path).expect("stat coldkeypub.txt");
+        let mode = meta.permissions().mode() & 0o777;
+
+        restore_home(tmp, original);
+
+        assert_eq!(
+            mode, 0o644,
+            "coldkeypub.txt must land at exactly 0644, found 0o{mode:o}"
+        );
     }
 }
