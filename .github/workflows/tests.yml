@@ -34,7 +34,14 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Raised from 30 to 60 on 2026-04-14 after the first PR #60 run hit
+    # the 30-min cap. Root cause: the wallet_keys module's tests each
+    # exercise real argon2id KDF at production work factor, taking 60-120s
+    # per test. On ubuntu-latest's 2 vCPU runner with --test-threads=2,
+    # the wallet_keys module alone needs ~30-40 min. A proper fix (a
+    # test-only KDF profile with a low work factor) is tracked separately;
+    # the 60-min ceiling is the pragmatic stopgap.
+    timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
     steps:
