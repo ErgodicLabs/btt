@@ -10,7 +10,7 @@
 # matrix runs, so regressions in the renderers fail fast and loud
 # instead of bleeding into the audit jobs as "missing advisory" errors.
 
-set -uo pipefail
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RENDER_IGNORES="${SCRIPT_DIR}/render-ignores.sh"

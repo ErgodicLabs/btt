@@ -60,6 +60,8 @@ fi
 
 # Validate the jsonl up front so a malformed line fails loudly with a
 # line number instead of silently producing a short ignore list.
+# blank lines and lines parsing to null are tolerated; non-blank lines
+# must parse as JSON with a non-empty "id" field (#56 NIT 56.3).
 if ! jq -e 'has("id")' "${JSONL}" >/dev/null 2>&1; then
   # jq -e over a jsonl stream returns false only if the last value is
   # false/null; a parse error exits non-zero. Either way, re-run with a
