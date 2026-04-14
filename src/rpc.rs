@@ -48,7 +48,17 @@ pub fn resolve_endpoint(url: Option<&str>, network: Option<&str>) -> Result<Stri
     }
 }
 
-/// Validate that a URL uses ws:// or wss:// scheme.
+/// Validate that a URL uses the `ws://` or `wss://` scheme.
+///
+/// **Scope**: this check is scheme-only. It accepts any `ws://<host>` URL,
+/// including remote hosts — it does NOT require TLS for non-loopback hosts.
+/// A user who supplies `ws://entrypoint-finney.opentensor.ai` via config
+/// will get a plaintext connection to mainnet.
+///
+/// Tightening this policy to host-aware (require `wss://` for all
+/// non-loopback hosts) is tracked in ErgodicLabs/btt#69. Until that lands,
+/// the guarantee of this function is narrow: it rejects `http://`,
+/// `https://`, `file://`, and the empty string, not much more.
 pub fn validate_url(url: &str) -> Result<(), BttError> {
     if !url.starts_with("ws://") && !url.starts_with("wss://") {
         return Err(BttError::connection(
@@ -63,14 +73,16 @@ pub fn validate_url(url: &str) -> Result<(), BttError> {
 ///
 /// Uses [`OnlineClient::from_insecure_url`] because the `local` network
 /// shorthand points at a plain `ws://127.0.0.1:9944`; subxt 0.50's
-/// `from_url` rejects non-TLS endpoints outright. Scheme validation for
-/// explicit user input is enforced by [`validate_url`] above, and this
-/// function also calls it as defense-in-depth so any future internal caller
-/// that skips [`resolve_endpoint`] still gets scheme enforcement.
+/// `from_url` rejects non-TLS endpoints outright.
+///
+/// This function calls [`validate_url`] as belt-and-suspenders for callers
+/// that bypass [`resolve_endpoint`]. Read the scope note on
+/// [`validate_url`]: the check is scheme-only and does not prevent a
+/// `wss://` → `ws://` downgrade against a remote host. Host-aware policy
+/// is tracked in ErgodicLabs/btt#69.
 pub async fn connect(endpoint: &str) -> Result<OnlineClient<PolkadotConfig>, BttError> {
-    // Defense-in-depth: redundant with resolve_endpoint for user-supplied
-    // URLs, but the check costs nothing and catches internal callers that
-    // construct endpoints directly without going through resolve_endpoint.
+    // Defense-in-depth, narrow: rejects http://, https://, file://, and the
+    // empty string. Does NOT enforce TLS for remote hosts (see #69).
     validate_url(endpoint)?;
     tokio::time::timeout(
         CONNECT_TIMEOUT,
@@ -86,10 +98,10 @@ pub async fn connect(endpoint: &str) -> Result<OnlineClient<PolkadotConfig>, Btt
 pub async fn connect_full(
     endpoint: &str,
 ) -> Result<(OnlineClient<PolkadotConfig>, LegacyRpc), BttError> {
-    // See note on `connect`: we accept `ws://` for the `local` shorthand
-    // and validate scheme ourselves in `validate_url`. This redundant
-    // guard is defense-in-depth for internal callers that bypass
-    // `resolve_endpoint`.
+    // See note on `connect`: the validate_url guard is scheme-only and
+    // narrow. It rejects http://, https://, file://, and the empty string.
+    // It does NOT prevent a wss://→ws:// downgrade against a remote host;
+    // host-aware policy is tracked in #69.
     validate_url(endpoint)?;
     let rpc_client = tokio::time::timeout(
         CONNECT_TIMEOUT,
@@ -175,6 +187,21 @@ mod tests {
     #[test]
     fn validate_url_https_returns_error() {
         assert!(validate_url("https://example.com").is_err());
+    }
+
+    #[test]
+    fn validate_url_ws_to_remote_host_is_accepted_by_design() {
+        // Pin the current scheme-only policy: `ws://` to a REMOTE host
+        // is accepted. This is not ideal (a plaintext connection to a
+        // mainnet mirror passes the check), but it is the documented
+        // current behavior. When #69 lands and validate_url becomes
+        // host-aware, this test should be updated to assert rejection.
+        // Until then, removing or flipping this assertion without also
+        // tightening the policy would hide the gap.
+        assert!(
+            validate_url("ws://entrypoint-finney.opentensor.ai").is_ok(),
+            "scheme-only guard accepts ws:// to any host (see #69 for host-aware policy)"
+        );
     }
 
     // -- connect/connect_full defense-in-depth tests --
