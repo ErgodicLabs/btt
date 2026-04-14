@@ -131,18 +131,27 @@ fn read_password_file_inner(path: &Path) -> Result<Zeroizing<String>, BttError> 
         )));
     }
 
-    // Enforce a HARD ceiling on the read itself, independent of the advisory
-    // `metadata().len()` check above. If the file grows between the stat and
-    // the read (a TOCTOU that's not exploitable here — the file is 0600,
-    // owned by the caller's uid — but removing the footgun is one line),
-    // `Read::take` will stop at `MAX_FILE_BYTES + 1` and we error out.
-    // Issue #27.
-    let cap = md.len().min(MAX_FILE_BYTES) as usize;
+    // `md.len() > MAX_FILE_BYTES` was rejected above, so `md.len()` is
+    // already bounded. We size the buffer from `md.len()` directly — no
+    // `.min(MAX_FILE_BYTES)` needed. (If that gate is ever removed or
+    // reordered, the `Read::take` below remains the authoritative ceiling.)
+    let cap = md.len() as usize;
     let mut buf = Zeroizing::new(Vec::<u8>::with_capacity(cap));
     (&mut file)
         .take(MAX_FILE_BYTES + 1)
         .read_to_end(&mut buf)
         .map_err(|e| BttError::io(format!("failed to read password file: {}", e)))?;
+    // TOCTOU defense-in-depth: this branch only fires if the file grew
+    // between `metadata()` and `read_to_end()` — the advisory `md.len()`
+    // gate above has already rejected files that were oversize at stat
+    // time. In safe Rust backed by a real filesystem `File`, there is no
+    // way to reach this branch from a unit test without wrapping the
+    // reader in a custom `Read` impl (which would require refactoring
+    // `read_password_file_inner` to accept a `Read` — out of scope).
+    // The property is enforced by `Read::take(MAX_FILE_BYTES + 1)`
+    // regardless of whether this branch is ever unit-test-reachable:
+    // `read_to_end` can never push more than `MAX_FILE_BYTES + 1` bytes
+    // into `buf`, so the comparison is both necessary and sufficient.
     if buf.len() as u64 > MAX_FILE_BYTES {
         return Err(BttError::invalid_input(format!(
             "password file {} exceeds {} bytes (possibly growing under us); refusing to read",
@@ -156,6 +165,11 @@ fn read_password_file_inner(path: &Path) -> Result<Zeroizing<String>, BttError> 
     // password fed to argon2 and the user sees a "wrong password" error with
     // no obvious cause. Byte-level check so no utf-8 validation runs first.
     // Only the leading BOM is special; a BOM later in the file is left alone.
+    // We strip at most ONE leading BOM by design: a file beginning with
+    // `\xef\xbb\xbf\xef\xbb\xbf` keeps the second BOM as part of the
+    // password. PowerShell never emits a double BOM, and silently eating
+    // arbitrary numbers of leading BOMs would let a crafted file coerce
+    // multiple distinct byte sequences into the same derived key.
     // Issue #28.
     const UTF8_BOM: &[u8] = &[0xef, 0xbb, 0xbf];
     if buf.starts_with(UTF8_BOM) {
@@ -168,6 +182,22 @@ fn read_password_file_inner(path: &Path) -> Result<Zeroizing<String>, BttError> 
     // Strip a trailing `\r` if the file used CRLF line endings.
     if let Some((&b'\r', rest)) = first_line.split_last() {
         first_line = rest;
+    }
+
+    // Refuse an empty password outright. This catches three classes of
+    // input that would otherwise reach argon2 with a zero-length secret:
+    //   1. a truly empty file,
+    //   2. a file containing only a UTF-8 BOM (`\xef\xbb\xbf`),
+    //   3. a file containing only a BOM followed by `\n` or `\r\n`.
+    // An empty password derives a deterministic, attacker-known key; fail
+    // loud at the file-read boundary rather than hand that key to the
+    // encryption layer. Named in the error so the user can see which file
+    // the caller was pointed at.
+    if first_line.is_empty() {
+        return Err(BttError::invalid_input(format!(
+            "password file {} is empty (or contains only a BOM and/or a trailing newline)",
+            path.display()
+        )));
     }
 
     let as_str = std::str::from_utf8(first_line).map_err(|_| {
@@ -324,19 +354,24 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn oversize_file_errors() {
-        // File of MAX_FILE_BYTES + 100. The advisory `md.len()` gate catches
-        // this on the first check, but the Read::take path is also exercised:
-        // even if the gate were somehow bypassed (file growing under us), the
-        // take(MAX+1) + len check would still error.
+        // File of MAX_FILE_BYTES + 100. This exercises the metadata-time
+        // advisory gate (`md.len() > MAX_FILE_BYTES`), NOT the read-time
+        // `Read::take` ceiling — the advisory gate fires first, so the
+        // error message is the "larger than" one, not the "exceeds" one.
+        // The read-time `exceeds` branch is a TOCTOU defense-in-depth
+        // that only fires if the file grows between `metadata()` and
+        // `read_to_end()`; it is unit-test-unreachable in safe Rust
+        // without a custom `Read` impl, and is documented as such at its
+        // definition site. The property it enforces is guaranteed by
+        // `Read::take(MAX_FILE_BYTES + 1)` regardless.
         let p = tmp_path("oversize");
         let n: usize = 64 * 1024 + 100;
         let payload = vec![b'a'; n];
         write_mode(&p, &payload, 0o600);
         let err = read_password_file_inner(&p).expect_err("should refuse");
         assert!(
-            err.message.contains("larger than")
-                || err.message.contains("exceeds"),
-            "msg: {}",
+            err.message.contains("larger than"),
+            "expected the advisory md.len() gate wording 'larger than', got: {}",
             err.message
         );
         fs::remove_file(&p).ok();
@@ -389,6 +424,61 @@ mod tests {
         write_mode(&p, &payload, 0o600);
         let pw = read_password_file_inner(&p).expect("read");
         assert_eq!(pw.as_bytes(), b"password\xef\xbb\xbf");
+        fs::remove_file(&p).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bom_only_file_errors() {
+        // A file containing ONLY a UTF-8 BOM would, without the empty-check,
+        // reach argon2 with a zero-length password and derive a
+        // deterministic, attacker-known key. Fail loud at the file-read
+        // boundary. Named in the error so the caller can identify which
+        // file was bad.
+        let p = tmp_path("bom-only");
+        let payload = vec![0xef, 0xbb, 0xbf];
+        write_mode(&p, &payload, 0o600);
+        let err = read_password_file_inner(&p).expect_err("should refuse empty");
+        assert!(
+            err.message.contains("empty") || err.message.contains("BOM"),
+            "msg: {}",
+            err.message
+        );
+        fs::remove_file(&p).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bom_then_newline_only_errors() {
+        // Same defense as bom_only_file_errors, but for the more plausible
+        // shape a user could produce accidentally: `Out-File` wrote a BOM
+        // and a newline and nothing else. Must also fail.
+        let p = tmp_path("bom-nl");
+        let payload = vec![0xef, 0xbb, 0xbf, b'\n'];
+        write_mode(&p, &payload, 0o600);
+        let err = read_password_file_inner(&p).expect_err("should refuse empty");
+        assert!(
+            err.message.contains("empty") || err.message.contains("BOM"),
+            "msg: {}",
+            err.message
+        );
+        fs::remove_file(&p).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_file_errors() {
+        // The pre-existing empty-file case — just a zero-byte file — was
+        // previously buggy and returned Ok(""). The empty-check now catches
+        // this too. Covering it here so the behavior is pinned.
+        let p = tmp_path("empty");
+        write_mode(&p, b"", 0o600);
+        let err = read_password_file_inner(&p).expect_err("should refuse empty");
+        assert!(
+            err.message.contains("empty"),
+            "msg: {}",
+            err.message
+        );
         fs::remove_file(&p).ok();
     }
 
