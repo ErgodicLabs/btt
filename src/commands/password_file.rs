@@ -191,21 +191,27 @@ fn read_password_file_inner(path: &Path) -> Result<Zeroizing<String>, BttError> 
         first_line = rest;
     }
 
-    // Refuse an empty password outright. This catches three classes of
-    // input that would otherwise reach argon2 with a zero-length secret:
-    //   1. a truly empty file,
-    //   2. a file containing only a UTF-8 BOM (`\xef\xbb\xbf`),
-    //   3. a file containing only a BOM followed by `\n` or `\r\n`.
-    // An empty password derives a deterministic, attacker-known key; fail
-    // loud at the file-read boundary rather than hand that key to the
-    // encryption layer. Named in the error so the user can see which file
-    // the caller was pointed at.
-    if first_line.is_empty() {
-        return Err(BttError::invalid_input(format!(
-            "password file {} is empty (or contains only a BOM and/or a trailing newline)",
-            path.display()
-        )));
-    }
+    // An empty `first_line` is **not** an error. btcli accepts empty
+    // password files as a deliberate "empty password" choice — the
+    // btcli-compat workflow's `[empty-password]` vector exercises exactly
+    // this. Reverting an earlier guard (PR #39 round 2) that rejected
+    // empty inputs: that guard was a btcli-compat regression, caught by
+    // the verify job on the PRs that came after it.
+    //
+    // Three input shapes all resolve to an empty password and are all
+    // legitimate user choices:
+    //   1. a truly empty (zero-byte) file
+    //   2. a file containing only a UTF-8 BOM (\xef\xbb\xbf), which is
+    //      stripped above and leaves zero bytes
+    //   3. a file containing only `\n` (or BOM + `\n`)
+    //
+    // An empty password is a weak password, but that is the user's
+    // decision and a documented btcli convention. The encryption layer
+    // does not crash on a zero-length secret — argon2id with a 0-length
+    // input still derives a deterministic key, and that key is bound to
+    // the wallet's NACL_SALT, so the result is no less recoverable than
+    // any other key derived from a known input. The cryptographic
+    // weakness is the user's to accept.
 
     let as_str = std::str::from_utf8(first_line).map_err(|_| {
         BttError::parse(format!(
@@ -436,56 +442,46 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn bom_only_file_errors() {
-        // A file containing ONLY a UTF-8 BOM would, without the empty-check,
-        // reach argon2 with a zero-length password and derive a
-        // deterministic, attacker-known key. Fail loud at the file-read
-        // boundary. Named in the error so the caller can identify which
-        // file was bad.
+    fn bom_only_file_returns_empty_password() {
+        // A file containing ONLY a UTF-8 BOM strips to zero bytes and
+        // returns an empty password. This is a deliberate user choice
+        // (matching btcli's `[empty-password]` compat vector) and is
+        // documented as a weak-but-legitimate posture — see the comment
+        // block in `read_password_file_inner` above the str::from_utf8.
         let p = tmp_path("bom-only");
         let payload = vec![0xef, 0xbb, 0xbf];
         write_mode(&p, &payload, 0o600);
-        let err = read_password_file_inner(&p).expect_err("should refuse empty");
-        assert!(
-            err.message.contains("empty") || err.message.contains("BOM"),
-            "msg: {}",
-            err.message
-        );
+        let pw = read_password_file_inner(&p).expect("BOM-only is empty pw, not an error");
+        assert_eq!(pw.as_bytes(), b"");
         fs::remove_file(&p).ok();
     }
 
     #[cfg(unix)]
     #[test]
-    fn bom_then_newline_only_errors() {
-        // Same defense as bom_only_file_errors, but for the more plausible
-        // shape a user could produce accidentally: `Out-File` wrote a BOM
-        // and a newline and nothing else. Must also fail.
+    fn bom_then_newline_only_returns_empty_password() {
+        // Same as bom_only_file_returns_empty_password but with a trailing
+        // newline (the more plausible shape PowerShell produces). After the
+        // BOM strip and the first-line cut, the result is an empty password.
         let p = tmp_path("bom-nl");
         let payload = vec![0xef, 0xbb, 0xbf, b'\n'];
         write_mode(&p, &payload, 0o600);
-        let err = read_password_file_inner(&p).expect_err("should refuse empty");
-        assert!(
-            err.message.contains("empty") || err.message.contains("BOM"),
-            "msg: {}",
-            err.message
-        );
+        let pw = read_password_file_inner(&p).expect("BOM+\\n is empty pw, not an error");
+        assert_eq!(pw.as_bytes(), b"");
         fs::remove_file(&p).ok();
     }
 
     #[cfg(unix)]
     #[test]
-    fn empty_file_errors() {
-        // The pre-existing empty-file case — just a zero-byte file — was
-        // previously buggy and returned Ok(""). The empty-check now catches
-        // this too. Covering it here so the behavior is pinned.
+    fn empty_file_returns_empty_password() {
+        // Zero-byte password file = empty password. btcli compat. The
+        // btcli-compat workflow's `[empty-password]` vector is the
+        // canonical test for this; PR #39 round 2's empty-file rejection
+        // was a regression that broke that vector. This test pins the
+        // restored behavior.
         let p = tmp_path("empty");
         write_mode(&p, b"", 0o600);
-        let err = read_password_file_inner(&p).expect_err("should refuse empty");
-        assert!(
-            err.message.contains("empty"),
-            "msg: {}",
-            err.message
-        );
+        let pw = read_password_file_inner(&p).expect("empty file is empty pw, not an error");
+        assert_eq!(pw.as_bytes(), b"");
         fs::remove_file(&p).ok();
     }
 

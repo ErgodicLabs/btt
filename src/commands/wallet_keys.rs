@@ -170,8 +170,48 @@ pub fn resolve_coldkey_address(wallet_name: &str) -> Result<String, BttError> {
     })
 }
 
+/// Sniff the first five bytes of a file and confirm they match the
+/// `$NACL` envelope magic. Returns an `invalid_input` error naming the
+/// offending path if the file is shorter than five bytes or the magic
+/// does not match. Opens the file read-only and drops the handle before
+/// returning.
+///
+/// This is an early-fail guard for [`decrypt_coldkey_interactive`]: a
+/// typo'd path or a non-encrypted file used to trigger a full
+/// `fs::read` into a `Zeroizing<Vec<u8>>` before the magic was checked.
+/// Sniffing first skips the full read and allocation on the failure
+/// path and produces a clearer error for non-envelope inputs. See issue
+/// #35 item 2.
+fn sniff_nacl_envelope(path: &Path) -> Result<(), BttError> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| BttError::io(format!("failed to open {}: {}", path.display(), e)))?;
+    let mut magic = [0u8; 5];
+    let n = file
+        .read(&mut magic)
+        .map_err(|e| BttError::io(format!("failed to read {}: {}", path.display(), e)))?;
+    if n < 5 || &magic != NACL_MAGIC {
+        return Err(BttError::invalid_input(format!(
+            "{} is not a NACL-encrypted coldkey envelope (missing $NACL magic)",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Decrypt the coldkey for a wallet and return an sr25519 keypair.
 /// Uses the existing load_coldkey infrastructure; prompts for password.
+///
+/// Load-path zeroization note (issue #35 item 1, upstream):
+/// `sp_core::sr25519::Pair::from_phrase` allocates a 64-byte BIP39
+/// PBKDF2 seed internally (`big_seed: Vec<u8>` in
+/// `sp-core-34.0.0/src/crypto.rs:848-864`), copies the first 32 bytes
+/// out, and drops without zeroization. btt cannot scrub that buffer
+/// from the outside — the fix has to land in
+/// `paritytech/substrate-bip39` (or equivalently `sp-core`'s
+/// `crypto.rs`) by wrapping `big_seed` and the BIP39 `entropy` buffer
+/// in `Zeroizing`. Tracked in issue #35; this PR does not block on the
+/// upstream change.
 pub fn decrypt_coldkey_interactive(wallet_name: &str) -> Result<Pair, BttError> {
     let wdir = wallet_path(wallet_name)?;
     if !wdir.exists() {
@@ -196,6 +236,11 @@ pub fn decrypt_coldkey_interactive(wallet_name: &str) -> Result<Pair, BttError> 
     // and is deleted per NEW-I1 of the PR #3 round-2 review (issue #9).
     // Testing keys that need an unencrypted round-trip go through the private
     // `load_coldkey` / `pair_from_key_json` helpers directly.
+    //
+    // Sniff the envelope magic before prompting for a password. A typo'd
+    // path or a non-encrypted file fails loudly here instead of after
+    // the user has typed their passphrase (issue #35 item 2).
+    sniff_nacl_envelope(&coldkey_path)?;
     let password = read_password("Enter coldkey password: ")?;
     let pair = load_coldkey(&wdir, &password)?;
     Ok(pair)
@@ -1900,6 +1945,115 @@ mod tests {
 
     #[test]
     fn loaded_key_file_zeroizes_fields() {
+        // Issue #35 item 3: the earlier formulation of this test
+        // asserted `Option::is_none()` after `zeroize()`, which proves
+        // the discriminant was reset but does NOT prove the underlying
+        // `String` heap buffer was wiped. `zeroize-1.8.2`'s
+        // `Zeroize for Option<Z>` zeroes the inner `Z` in place, THEN
+        // calls `self.take()` — which drops the `Z`, returning its
+        // heap buffer to the allocator. Reading from a saved pointer
+        // after that path is a use-after-free: the allocator may have
+        // handed the pages to an unrelated allocation before the check
+        // runs, and the test would either spuriously pass (on a cold
+        // allocator) or fail catastrophically (on a warm one).
+        //
+        // The load path we actually care about — `LoadedKeyFile`
+        // dropping at the end of `pair_from_key_json` — goes through
+        // `ZeroizeOnDrop`, which traverses `Zeroize for String`
+        // directly (not `Zeroize for Option<String>`). The inner
+        // `String` impl is:
+        //
+        //   impl Zeroize for String {
+        //       fn zeroize(&mut self) {
+        //           unsafe { self.as_mut_vec() }.zeroize();
+        //       }
+        //   }
+        //
+        // and `Vec::zeroize` overwrites the initialized bytes and the
+        // spare capacity in place, then `clear()`s the length — it
+        // does NOT free the heap buffer. So the load-path guarantee
+        // we want to pin is "a `String` under `zeroize()` has its
+        // heap bytes wiped before the allocation is released".
+        //
+        // This test exercises exactly that impl: it constructs a bare
+        // `String` (not wrapped in `Option`), snapshots pointer and
+        // length, calls `.zeroize()`, then reads back the saved bytes
+        // from the still-live heap buffer. Because the `String` is
+        // kept in scope throughout, the allocation is not freed and
+        // the raw-pointer read is sound.
+        //
+        // The weaker `Option::is_none()` check is then re-run as a
+        // separate sub-assertion on a second `LoadedKeyFile` so we
+        // also pin the `Option<String>::zeroize` discriminant-reset
+        // behavior.
+
+        // -- Part A: byte-level scrub on a bare `String` --------------
+        //
+        // Use a plaintext that is long enough to heap-allocate and has
+        // no embedded zero bytes, so "all zero after scrub" is a
+        // non-trivial assertion. `String::from` on a non-empty literal
+        // heap-allocates (stdlib `String` has no small-string
+        // optimization).
+        let mut plaintext = String::from(
+            "abracadabra-mnemonic-12345 abracadabra-mnemonic-12345 abracadabra-mnemonic-12345",
+        );
+
+        // Snapshot BEFORE the scrub.
+        let ptr = plaintext.as_ptr();
+        let len = plaintext.len();
+        assert!(len > 0, "plaintext must heap-allocate");
+
+        // Sanity: the heap currently holds the plaintext.
+        // SAFETY: `ptr` is a pointer into `plaintext`'s live heap
+        // buffer; `len` equals `plaintext.len()`; the bytes are
+        // initialized; no aliasing mutation is in flight.
+        unsafe {
+            assert_eq!(
+                std::slice::from_raw_parts(ptr, len),
+                plaintext.as_bytes(),
+            );
+        }
+
+        // Scrub in place. `Zeroize for String` zeroes the heap bytes
+        // and the spare capacity, then sets `len = 0`. The heap buffer
+        // is NOT freed — the `String` still owns it, and `plaintext`
+        // is still in scope, so the allocation remains live for the
+        // raw-pointer read below.
+        plaintext.zeroize();
+
+        // SAFETY: `plaintext` is still in scope and still owns the
+        // same heap allocation that `ptr` addresses — `Zeroize for
+        // String` calls `Vec::zeroize`, which wipes bytes and clears
+        // the length but does not reallocate or free. `len` is the
+        // length captured before the scrub, which equals the
+        // pre-scrub initialized-byte count of the allocation. Those
+        // bytes are now zeroed (that is what we're asserting) and
+        // still accessible via `ptr`. No aliasing mutation is in
+        // flight: `plaintext` is not touched between this read and
+        // the end of the borrow. We do not free or reallocate
+        // `plaintext` before it drops at end of scope, which keeps
+        // the whole sequence sound.
+        let scrubbed = unsafe { std::slice::from_raw_parts(ptr, len) };
+        assert!(
+            scrubbed.iter().all(|&b| b == 0),
+            "String heap buffer was not scrubbed: {:?}",
+            scrubbed,
+        );
+        // `plaintext` (now a zero-length `String` over a zeroed heap
+        // buffer) drops here normally, freeing the buffer.
+        drop(plaintext);
+
+        // -- Part B: LoadedKeyFile end-to-end path --------------------
+        //
+        // Drive the real code path: deserialize a JSON payload into
+        // `LoadedKeyFile`, scrub via `zeroize()`, and assert both the
+        // Option discriminant is `None` AND the inner String impl was
+        // reached. For Part B we cannot safely inspect the heap after
+        // the Option-level `take()`, so we fall back to the
+        // discriminant check — the byte-level guarantee is already
+        // pinned by Part A above, and `Zeroize for LoadedKeyFile`
+        // (auto-derived) simply forwards to each field's `Zeroize`
+        // impl in declaration order.
         let json = r#"{
             "secretPhrase": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
             "secretSeed": "0x1111111111111111111111111111111111111111111111111111111111111111"
@@ -1908,7 +2062,6 @@ mod tests {
         let mut loaded: LoadedKeyFile =
             serde_json::from_str(json).expect("LoadedKeyFile should deserialize");
 
-        // Sanity: the fields are populated before the scrub.
         assert!(loaded
             .secret_phrase
             .as_deref()
@@ -1920,13 +2073,96 @@ mod tests {
             .expect("secret_seed deserialized")
             .starts_with("0x1111"));
 
-        // Manually invoke the scrub and confirm both fields are wiped.
-        // `Zeroize for Option<String>` zeros the inner `String` buffer,
-        // drops it, and then volatile-writes the `Option` discriminant
-        // back to `None`. So after this call both fields are `None`.
         loaded.zeroize();
         assert!(loaded.secret_phrase.is_none());
         assert!(loaded.secret_seed.is_none());
+    }
+
+    #[test]
+    fn decrypt_coldkey_interactive_rejects_non_envelope() {
+        // Issue #35 item 2: a coldkey file that doesn't start with
+        // `$NACL` must be rejected BEFORE the full file read and
+        // password prompt. Construct a fake wallet whose `coldkey`
+        // file is a plain-text stub ("not a nacl envelope"), then
+        // drive `decrypt_coldkey_interactive` and assert the error
+        // message names the magic.
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir()
+            .join(format!("btt-nacl-sniff-{}", std::process::id()));
+        let wallet_name = "nacl-sniff";
+
+        std::fs::create_dir_all(&tmp).expect("create tmp root");
+        let (_env_guard, wallets_parent) = seat_home_env(&tmp);
+
+        let wdir = wallets_parent.join(wallet_name);
+        std::fs::create_dir_all(&wdir).expect("create wallet dir");
+        let coldkey_path = wdir.join("coldkey");
+        // Write a non-envelope stub. This intentionally is not even
+        // five bytes long in spirit — but we make it long enough so
+        // the short-read branch is not the one we're asserting. The
+        // point is: the magic check fails.
+        std::fs::write(&coldkey_path, b"not a nacl envelope, just plain text")
+            .expect("write stub coldkey");
+
+        let err = match decrypt_coldkey_interactive(wallet_name) {
+            Ok(_) => {
+                drop(_env_guard);
+                let _ = std::fs::remove_dir_all(&tmp);
+                panic!("decrypt should reject non-envelope coldkey");
+            }
+            Err(e) => e,
+        };
+
+        drop(_env_guard);
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("$NACL") || msg.contains("not a NACL-encrypted"),
+            "error should name the $NACL magic; got: {}",
+            msg,
+        );
+    }
+
+    #[test]
+    fn sniff_nacl_envelope_accepts_real_envelope() {
+        // Positive control: a file that starts with the real `$NACL`
+        // magic passes the sniff. We don't need a full encrypted
+        // payload — only the first five bytes matter.
+        let tmp = std::env::temp_dir()
+            .join(format!("btt-nacl-sniff-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("create tmp root");
+        let path = tmp.join("coldkey");
+        let mut body = Vec::from(&NACL_MAGIC[..]);
+        body.extend_from_slice(&[0u8; 24]); // fake nonce
+        body.extend_from_slice(&[0u8; 32]); // fake ciphertext
+        std::fs::write(&path, &body).expect("write envelope");
+
+        sniff_nacl_envelope(&path).expect("real envelope should pass sniff");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sniff_nacl_envelope_rejects_short_file() {
+        // Short-read branch: a file shorter than five bytes must be
+        // rejected with the same error shape as a magic mismatch.
+        let tmp = std::env::temp_dir()
+            .join(format!("btt-nacl-sniff-short-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("create tmp root");
+        let path = tmp.join("coldkey");
+        std::fs::write(&path, b"$NA").expect("write short stub");
+
+        let err = sniff_nacl_envelope(&path)
+            .expect_err("short file should not pass sniff");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("$NACL") || msg.contains("not a NACL-encrypted"),
+            "error should name the $NACL magic; got: {}",
+            msg,
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
