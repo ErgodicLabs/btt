@@ -413,8 +413,20 @@ def main(argv=None):
             stale.append(key)
 
     # --- report --------------------------------------------------------
+    #
+    # The body is wrapped in a collapsible <details> block so the
+    # combined dep-audit PR comment stays scannable. On a clean run the
+    # reader sees only the "dep-checksum tripwire" summary; on a
+    # mismatch, new-dep, or stale-entry result the block is emitted
+    # `<details open>` so the failure is visible without a click.
+    #
+    # GFM requires blank lines after <summary> and before </details>
+    # for the inner markdown (fenced code blocks, **bold**) to parse.
+    status_fail = bool(mismatches) or (bool(new_entries) and not args.update)
+    details_attr = " open" if (status_fail or stale) else ""
     report_lines = []
-    report_lines.append("### dep-checksum tripwire")
+    report_lines.append(f"<details{details_attr}>")
+    report_lines.append("<summary><strong>dep-checksum tripwire</strong></summary>")
     report_lines.append("")
     report_lines.append(
         f"Tracked: {len(current)} deps; DB entries: {len(db)}; "
@@ -483,8 +495,13 @@ def main(argv=None):
         report_lines.append("All deps match the committed DB. No drift.")
         report_lines.append("")
 
-    status_fail = bool(mismatches) or (bool(new_entries) and not args.update)
+    # status_fail was computed above the details-header so the opening
+    # tag could pick `<details open>` on failure; reuse it here for the
+    # inner STATUS line so the body of the <details> block still terminates
+    # in a human-readable PASS/FAIL verdict.
     report_lines.append("STATUS: " + ("FAIL" if status_fail else "PASS"))
+    report_lines.append("")
+    report_lines.append("</details>")
 
     report_text = "\n".join(report_lines) + "\n"
     sys.stdout.write(report_text)
