@@ -39,7 +39,8 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Pinned to match rust-toolchain.toml. When bumping, update both.
+        uses: dtolnay/rust-toolchain@1.94.1
         with:
           components: clippy
 
@@ -58,7 +59,10 @@ jobs:
 
       - name: Run clippy
         # --all-targets so tests, benches, and examples are linted too.
+        # --all-features so feature-gated code paths are also linted; today
+        # btt has no [features] table so this is a no-op, but the moment a
+        # feature is added the gate stays honest. Issue #33 follow-up.
         # -D warnings promotes every remaining warning to an error, which
         # is the whole point of the gate: a warning that isn't a gate is
         # a warning that accumulates.
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings

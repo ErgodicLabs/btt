@@ -50,7 +50,8 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Pinned to match rust-toolchain.toml. When bumping, update both.
+        uses: dtolnay/rust-toolchain@1.94.1
 
       - name: Cache ${{ matrix.tool }} binary
         id: tool-cache
