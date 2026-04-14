@@ -1,0 +1,100 @@
+name: tests
+
+# Workspace test suite. This workflow exists because cryptid's builder
+# subagents operate on a host where `cargo test --workspace` routinely
+# exceeds the bash-tool timeout, so they cannot locally verify that
+# their code actually works before pushing. The fix is to offload the
+# slow verification to GitHub's runners: the builder pushes its branch
+# and `gh run watch`es this workflow instead of stalling on a local
+# cargo test that will never finish. See issue #58 for the full
+# incident history (builder stall on #11/#57 phase A).
+#
+# Triggers are deliberately broad:
+#   - push on any branch: every branch you own you are responsible for,
+#     and immediate feedback matters more than runner minutes.
+#   - pull_request: mandatory merge gate. The followup to this PR asks
+#     the repo owner to add `tests / test` as a required status check
+#     on main via branch protection.
+#   - workflow_dispatch: lets a builder (or a human) re-run against an
+#     arbitrary ref without needing to push an empty commit.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or SHA to test (defaults to the default branch)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # For workflow_dispatch with a `ref` input, check that out;
+          # otherwise fall back to the event's default ref.
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Setup Rust toolchain
+        # Pinned to match rust-toolchain.toml and btcli-compat.yml.
+        # When bumping, update all three.
+        uses: dtolnay/rust-toolchain@1.94.1
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-tests-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-tests-
+
+      - name: Build tests
+        # --locked fails fast on lockfile drift so we never silently
+        # resolve a different dep graph than what's checked in.
+        run: cargo build --tests --workspace --locked
+
+      - name: Run tests
+        # --no-fail-fast so one failing test doesn't mask the others.
+        # --test-threads=2 keeps memory under control on the runner.
+        # tee to test-output.log so the summary and artifact steps can
+        # read the full transcript regardless of exit code.
+        run: |
+          set -o pipefail
+          cargo test --workspace --no-fail-fast --locked -- --test-threads=2 2>&1 | tee test-output.log
+
+      - name: Summarize failures
+        if: failure()
+        run: |
+          {
+            echo "## Test failure summary"
+            echo ""
+            echo "Last 200 lines of \`test-output.log\`:"
+            echo ""
+            echo '```'
+            tail -n 200 test-output.log || echo "(no test-output.log found)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-${{ github.run_id }}
+          path: test-output.log
+          retention-days: 30
+          if-no-files-found: warn
