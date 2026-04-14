@@ -37,6 +37,7 @@ ignore = [
     "RUSTSEC-2025-0057",
     "RUSTSEC-2025-0118",
     "RUSTSEC-2025-0141",
+    "RUSTSEC-2025-0161",  # libsecp256k1 — sp-io → xcm-simulator → polkadot-sdk, cleared by #11
     "RUSTSEC-2026-0002",
     "RUSTSEC-2026-0020",
     "RUSTSEC-2026-0021",

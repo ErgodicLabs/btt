@@ -71,6 +71,7 @@ AUDIT_IGNORES=(
   RUSTSEC-2024-0436  # paste
   RUSTSEC-2024-0442  # backoff
   RUSTSEC-2025-0057  # fxhash
+  RUSTSEC-2025-0161  # libsecp256k1 — sp-io → xcm-simulator → pallet-revive-mock-network → polkadot-sdk
   RUSTSEC-2026-0002  # derivative
   RUSTSEC-2026-0097  # instant
 )
