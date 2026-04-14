@@ -284,8 +284,44 @@ const NACL_SALT: &[u8; 16] = b"\x13q\x83\xdf\xf1Z\t\xbc\x9c\x90\xb5Q\x879\xe9\xb
 const NACL_MAGIC: &[u8; 5] = b"$NACL";
 const NACL_KEY_LEN: usize = 32;
 const NACL_NONCE_LEN: usize = 24;
-const ARGON2_T_COST: u32 = 8;
-const ARGON2_M_COST_KIB: u32 = 524_288; // 512 MiB
+
+// Production argon2id parameters matching libsodium's SENSITIVE profile.
+// These values define the on-disk btwallet envelope format and MUST NOT
+// change without a migration — existing coldkey files in the wild were
+// sealed with exactly these params.
+const PROD_ARGON2_T_COST: u32 = 8;
+const PROD_ARGON2_M_COST_KIB: u32 = 524_288; // 512 MiB
+const PROD_ARGON2_PARALLELISM: u32 = 1;
+
+// Active argon2id parameters used by `derive_key`. Under `cfg(not(test))`
+// these are the production SENSITIVE profile above. Under `cfg(test)` they
+// drop to a minimal profile (1 MiB, 1 iteration) that still exercises the
+// full Argon2i → XSalsa20Poly1305 → envelope roundtrip without paying the
+// hardness tax on every test run.
+//
+// Rationale: a single SENSITIVE-profile derivation takes 60–120s on a
+// shared GHA runner (2 vCPU, 7 GB RAM). The wallet_keys test module has
+// 70+ tests, many of which create coldkeys/hotkeys and therefore call
+// `derive_key` at least once. At production params the module alone
+// consumes ~50 min of CI wall time; at these params it finishes in
+// seconds. See issue #61.
+//
+// The two libsodium-compat tests (`derive_key_matches_libsodium_reference`
+// and `decrypts_btwallet_reference_vector`) bypass the cfg-active params
+// and call `derive_key_with_params` directly with `PROD_*` so the on-disk
+// format remains pinned even under `cargo test`.
+#[cfg(not(test))]
+const ARGON2_T_COST: u32 = PROD_ARGON2_T_COST;
+#[cfg(not(test))]
+const ARGON2_M_COST_KIB: u32 = PROD_ARGON2_M_COST_KIB;
+#[cfg(not(test))]
+const ARGON2_PARALLELISM: u32 = PROD_ARGON2_PARALLELISM;
+
+#[cfg(test)]
+const ARGON2_T_COST: u32 = 1;
+#[cfg(test)]
+const ARGON2_M_COST_KIB: u32 = 1024; // 1 MiB
+#[cfg(test)]
 const ARGON2_PARALLELISM: u32 = 1;
 
 // ── Output types ──────────────────────────────────────────────────────────
@@ -1352,17 +1388,33 @@ fn build_pub_key_json(pair: &Pair) -> PubKeyFileData {
 
 /// Derive a 32-byte NaCl secretbox key from a password using libsodium's
 /// `argon2i13::derive_key` parameters (Argon2i, v0x13, t=8, m=512 MiB, p=1,
-/// hardcoded `NACL_SALT`). Byte-for-byte compatible with btwallet/btcli.
+/// hardcoded `NACL_SALT`). Byte-for-byte compatible with btwallet/btcli in
+/// release builds; under `cfg(test)` the params drop to a minimal profile
+/// (see `ARGON2_*` constants) so test runs are fast. Anything that cares
+/// about matching the on-disk envelope format should call
+/// `derive_key_with_params` with `PROD_*` values directly.
 fn derive_key(password: &[u8]) -> Result<Zeroizing<[u8; NACL_KEY_LEN]>, BttError> {
-    use argon2::{Algorithm, Argon2, Params, Version};
-
-    let params = Params::new(
+    derive_key_with_params(
+        password,
         ARGON2_M_COST_KIB,
         ARGON2_T_COST,
         ARGON2_PARALLELISM,
-        Some(NACL_KEY_LEN),
     )
-    .map_err(|e| BttError::crypto(format!("invalid argon2 parameters: {}", e)))?;
+}
+
+/// Argon2i derivation with explicit parameters. Used by `derive_key` to
+/// apply the cfg-active params, and by the libsodium-compat tests to pin
+/// the production SENSITIVE profile regardless of cfg.
+fn derive_key_with_params(
+    password: &[u8],
+    m_cost_kib: u32,
+    t_cost: u32,
+    parallelism: u32,
+) -> Result<Zeroizing<[u8; NACL_KEY_LEN]>, BttError> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+
+    let params = Params::new(m_cost_kib, t_cost, parallelism, Some(NACL_KEY_LEN))
+        .map_err(|e| BttError::crypto(format!("invalid argon2 parameters: {}", e)))?;
     let argon2 = Argon2::new(Algorithm::Argon2i, Version::V0x13, params);
 
     let mut key = Zeroizing::new([0u8; NACL_KEY_LEN]);
@@ -1801,7 +1853,18 @@ mod tests {
         // This test pins the argon2i13 parameters to libsodium's SENSITIVE
         // profile. If it ever fails, the btwallet on-disk format will have
         // silently diverged.
-        let key = derive_key(b"hello-btcli").expect("argon2 derive");
+        //
+        // Calls `derive_key_with_params` directly with PROD_* values so the
+        // test-only `cfg(test)` argon2 profile (see ARGON2_* constants) does
+        // not weaken this invariant — this test still does the full 512 MiB
+        // / 8-iteration derivation, by design.
+        let key = derive_key_with_params(
+            b"hello-btcli",
+            PROD_ARGON2_M_COST_KIB,
+            PROD_ARGON2_T_COST,
+            PROD_ARGON2_PARALLELISM,
+        )
+        .expect("argon2 derive");
         let expected =
             hex::decode("39272631c10c56896024d406eef497421dcb6a6be0f2fb71adb7ae39f42456cd")
                 .expect("hex");
@@ -1839,10 +1902,38 @@ mod tests {
         let password = "correct horse battery staple";
 
         // btwallet -> btt: we must be able to decrypt the external blob.
-        let decoded = decrypt_key_data(&blob, password).expect("decrypt external blob");
-        assert_eq!(decoded.as_slice(), expected_plain.as_slice());
+        // The blob was sealed with libsodium's SENSITIVE profile, so we
+        // bypass the cfg(test) fast-argon2 path and derive the key using
+        // PROD_* values directly; then open the secretbox by hand. Under
+        // cfg(not(test)) the production `decrypt_key_data` path would also
+        // work, but under cfg(test) it uses the minimal test profile and
+        // would produce the wrong key.
+        {
+            use xsalsa20poly1305::aead::Aead;
+            use xsalsa20poly1305::{KeyInit, XSalsa20Poly1305};
+
+            assert!(blob.starts_with(NACL_MAGIC), "blob must have $NACL magic");
+            let body = &blob[NACL_MAGIC.len()..];
+            let (nonce_bytes, ciphertext) = body.split_at(NACL_NONCE_LEN);
+            let key = derive_key_with_params(
+                password.as_bytes(),
+                PROD_ARGON2_M_COST_KIB,
+                PROD_ARGON2_T_COST,
+                PROD_ARGON2_PARALLELISM,
+            )
+            .expect("argon2 derive");
+            let cipher =
+                XSalsa20Poly1305::new(xsalsa20poly1305::Key::from_slice(key.as_slice()));
+            let nonce = xsalsa20poly1305::Nonce::from_slice(nonce_bytes);
+            let decoded = cipher
+                .decrypt(nonce, ciphertext)
+                .expect("decrypt external blob");
+            assert_eq!(decoded.as_slice(), expected_plain.as_slice());
+        }
 
         // btt -> btt round trip: sanity check shape of our own output.
+        // Uses the cfg-active `derive_key` (fast under cfg(test)), so this
+        // exercises the envelope roundtrip without the hardness cost.
         let enc = encrypt_key_data(&expected_plain, password).expect("encrypt");
         assert!(enc.starts_with(b"$NACL"));
         assert_eq!(enc.len(), 5 + 24 + expected_plain.len() + 16);
