@@ -37,44 +37,15 @@ cd "${REPO_ROOT}"
 
 emit() { printf '%s\n' "$*"; }
 
-# Audit ignores: known advisories tracked separately. Each entry has a
-# comment naming the tracking issue. Lifted as the underlying upgrades
-# land. See ErgodicLabs/btt#11 for the wasmtime/subxt upgrade tracker.
-AUDIT_IGNORES=(
-  # wasmtime 8.0.1 vulnerabilities (transitive via subxt 0.38.1 -> sp-core);
-  # btt does not execute wasm at runtime; tracked in #11
-  RUSTSEC-2023-0091
-  RUSTSEC-2024-0438
-  RUSTSEC-2025-0118
-  RUSTSEC-2026-0020
-  RUSTSEC-2026-0021
-  RUSTSEC-2026-0085
-  RUSTSEC-2026-0086
-  RUSTSEC-2026-0087
-  RUSTSEC-2026-0088
-  RUSTSEC-2026-0089
-  RUSTSEC-2026-0091
-  RUSTSEC-2026-0092
-  RUSTSEC-2026-0093
-  RUSTSEC-2026-0094
-  RUSTSEC-2026-0095
-  RUSTSEC-2026-0096
-  # bincode 1.x EOL / wasmtime-jit transitive — #11
-  RUSTSEC-2024-0388
-  RUSTSEC-2025-0141
-  # Unmaintained crates pulled in transitively — #11
-  RUSTSEC-2020-0168  # mach
-  RUSTSEC-2022-0061  # parity-wasm
-  RUSTSEC-2022-0080  # proc-macro-error
-  RUSTSEC-2023-0037  # bigdecimal
-  RUSTSEC-2024-0370  # proc-macro-error variant
-  RUSTSEC-2024-0436  # paste
-  RUSTSEC-2024-0442  # backoff
-  RUSTSEC-2025-0057  # fxhash
-  RUSTSEC-2025-0161  # libsecp256k1 — sp-io → xcm-simulator → pallet-revive-mock-network → polkadot-sdk
-  RUSTSEC-2026-0002  # derivative
-  RUSTSEC-2026-0097  # instant
-)
+# Audit ignores: see issue #52. The single source of truth is
+# `scripts/dep-audit/rustsec-ignores.jsonl`; `render-ignores.sh --audit`
+# emits the `--ignore RUSTSEC-xxxx` pairs for cargo-audit and
+# `render-deny-toml.sh` emits the fully rendered deny.toml for
+# cargo-deny. This file no longer hardcodes the list.
+#
+# See ErgodicLabs/btt#11 for the wasmtime/subxt upgrade tracker.
+RENDER_IGNORES="${SCRIPT_DIR}/render-ignores.sh"
+RENDER_DENY_TOML="${SCRIPT_DIR}/render-deny-toml.sh"
 
 run_audit() {
   # cargo-audit section, prefixed by a direct-deps inventory so the
@@ -98,11 +69,18 @@ run_audit() {
   emit '### cargo-audit'
   emit ''
   emit '```'
+  # Pull the ignore list out of rustsec-ignores.jsonl at run time so
+  # this script never drifts from deny.toml. Each non-empty line of
+  # render output is a single CLI token (either `--ignore` or an id);
+  # mapfile preserves them as array elements without word-splitting
+  # hazards.
   local audit_ignore_args=()
-  local id
-  for id in "${AUDIT_IGNORES[@]}"; do
-    audit_ignore_args+=("--ignore" "${id}")
-  done
+  local line
+  while IFS= read -r line; do
+    [ -z "${line}" ] && continue
+    # shellcheck disable=SC2206
+    audit_ignore_args+=( ${line} )
+  done < <(bash "${RENDER_IGNORES}" --audit)
   local audit_output audit_status
   audit_output="$(cargo audit --quiet "${audit_ignore_args[@]}" 2>&1)"
   audit_status=$?
@@ -121,16 +99,23 @@ run_audit() {
 run_deny() {
   emit '### cargo-deny'
   emit ''
-  local deny_config="${SCRIPT_DIR}/deny.toml"
-  if [ ! -f "${deny_config}" ]; then
-    emit "(no deny.toml at ${deny_config}, skipping)"
-    return 0
+  # Render deny.toml from the template + jsonl into a tempfile; the
+  # committed tree never holds a generated deny.toml (see issue #52).
+  local deny_config
+  deny_config="$(mktemp -t btt-deny.XXXXXX.toml)"
+  if ! bash "${RENDER_DENY_TOML}" "${deny_config}"; then
+    rm -f "${deny_config}"
+    emit '```'
+    emit '(render-deny-toml.sh failed; cannot run cargo-deny)'
+    emit '```'
+    return 1
   fi
   emit '```'
   # cargo-deny argument order: subcommand first, options after.
   local deny_output deny_status
   deny_output="$(cargo deny check --config "${deny_config}" 2>&1)"
   deny_status=$?
+  rm -f "${deny_config}"
   emit "${deny_output}"
   emit '```'
   if [ ${deny_status} -ne 0 ]; then

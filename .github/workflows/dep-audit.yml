@@ -39,8 +39,44 @@ permissions:
   pull-requests: write
 
 jobs:
+  # Pre-check: issue #52. Exercise the render scripts against a fixture
+  # before the audit matrix runs. A regression in render-ignores.sh or
+  # render-deny-toml.sh would otherwise surface as a confusing
+  # "advisory not ignored" failure inside the cargo-audit or
+  # cargo-deny job — fail fast here with a clear signal instead.
+  render-scripts-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run render-ignores.sh / render-deny-toml.sh unit tests
+        run: |
+          chmod +x scripts/dep-audit/test_render_ignores.sh
+          chmod +x scripts/dep-audit/render-ignores.sh
+          chmod +x scripts/dep-audit/render-deny-toml.sh
+          bash scripts/dep-audit/test_render_ignores.sh
+
+      - name: Validate rustsec-ignores.jsonl parses
+        run: |
+          python3 -c 'import json, sys
+          with open("scripts/dep-audit/rustsec-ignores.jsonl") as f:
+              for i, line in enumerate(f, 1):
+                  e = json.loads(line)
+                  assert "id" in e, f"line {i}: missing id"
+                  assert e["id"].startswith("RUSTSEC-"), f"line {i}: bad id"
+                  assert "reason" in e, f"line {i}: missing reason"
+          print("rustsec-ignores.jsonl: ok")
+          '
+
+      - name: Validate rendered deny.toml parses
+        run: |
+          bash scripts/dep-audit/render-deny-toml.sh > /tmp/deny.toml
+          python3 -c 'import tomllib; d = tomllib.load(open("/tmp/deny.toml","rb")); assert d["advisories"]["ignore"], "empty ignore list"; print("rendered deny.toml: ok,", len(d["advisories"]["ignore"]), "ignores")'
+
   audit:
     runs-on: ubuntu-latest
+    needs: render-scripts-test
     strategy:
       fail-fast: false
       matrix:

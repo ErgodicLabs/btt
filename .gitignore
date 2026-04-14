@@ -39,3 +39,10 @@ target/
 *~
 .DS_Store
 *.env
+
+# Rendered cargo-deny config (issue #52). The committed source of
+# truth is scripts/dep-audit/deny.toml.in + rustsec-ignores.jsonl;
+# render-deny-toml.sh produces a temp deny.toml on every invocation.
+# Defensive: if a local run drops one into the tree it must not be
+# accidentally committed.
+/scripts/dep-audit/deny.toml
