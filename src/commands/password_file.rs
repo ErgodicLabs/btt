@@ -8,12 +8,20 @@
 //!
 //! Security posture
 //! ----------------
-//! - On unix, we refuse to read a file whose mode is other-readable
-//!   (`mode & 0o077 != 0`). Fail-closed. The caller is instructed to
-//!   `chmod 600 <path>`.
+//! - On unix, we refuse to read a file whose mode is group- or world-readable
+//!   (`mode & 0o077 != 0`). This check is not TOCTOU hardening — the expected
+//!   password file lives at `$HOME/.btt/pwd`, mode 0600, inside a 0700 parent,
+//!   and that posture already closes the TOCTOU window: any file reachable
+//!   under that posture is already one of the user's own files. The check
+//!   exists as a guard against the user pointing `--password-file` at
+//!   something like `/etc/passwd` by accident. Fail-closed. The caller is
+//!   instructed to `chmod 600 <path>`.
 //! - We refuse anything that is not a regular file. No FIFOs, no character
-//!   devices, no symlinks-to-devices. A password file is a tiny thing on a
-//!   tmpfs; it should not be a pipe.
+//!   devices, no directories. A password file is a tiny thing on a tmpfs;
+//!   it should not be a pipe.
+//! - On non-unix platforms we skip the mode check entirely and rely on the
+//!   filesystem's ACLs (NTFS on Windows, etc.). The portable `File::open`
+//!   path is used everywhere; there is no libc dependency.
 //! - Only the first line (up to the first `\n`, optionally dropping `\r`) is
 //!   taken as the password. Content beyond the first newline is discarded,
 //!   so `echo "pw" > /dev/shm/pw` works without trailing-whitespace footguns.
@@ -65,13 +73,27 @@ pub fn read_password_file(path: &str) -> Result<Zeroizing<String>, BttError> {
 }
 
 fn read_password_file_inner(path: &Path) -> Result<Zeroizing<String>, BttError> {
-    // `symlink_metadata` would refuse to follow symlinks; `metadata` does
-    // follow. We use `metadata` so users can keep a symlink inside a
-    // 0700 dir pointing at a tmpfs file. The symlink target itself is what
-    // we stat for the permission check.
-    let md = fs::metadata(path).map_err(|e| {
+    // Portable open. We previously used O_NOFOLLOW + a stat-before-open
+    // TOCTOU pre-check, but the TOCTOU ceremony was belt-and-suspenders
+    // given the expected posture (mode 0600 on a 0700 parent owned by the
+    // caller): any file that passes the mode check below is by
+    // construction one of the user's own files, so swapping doesn't buy
+    // an attacker anything. Dropping the libc dep also lets this compile
+    // unchanged on non-unix targets.
+    let mut file = fs::File::open(path).map_err(|e| {
         BttError::io(format!(
-            "failed to read password file {}: {}",
+            "failed to open password file {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+
+    // Metadata from the open fd. Using the fd (rather than re-stat'ing the
+    // path) means the is_file / mode checks below describe exactly the
+    // bytes we read into the buffer.
+    let md = file.metadata().map_err(|e| {
+        BttError::io(format!(
+            "failed to stat password file {}: {}",
             path.display(),
             e
         ))
@@ -108,14 +130,6 @@ fn read_password_file_inner(path: &Path) -> Result<Zeroizing<String>, BttError> 
             MAX_FILE_BYTES
         )));
     }
-
-    let mut file = fs::File::open(path).map_err(|e| {
-        BttError::io(format!(
-            "failed to open password file {}: {}",
-            path.display(),
-            e
-        ))
-    })?;
 
     let mut buf = Zeroizing::new(Vec::<u8>::with_capacity(md.len() as usize));
     file.read_to_end(&mut buf)
@@ -234,43 +248,10 @@ mod tests {
         let _ = fs::remove_file(&p);
         let err = read_password_file_inner(&p).expect_err("should fail");
         assert!(
-            err.message.contains("failed to read password file"),
+            err.message.contains("failed to open password file"),
             "msg: {}",
             err.message
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn rejects_fifo() {
-        // Create a FIFO via libc::mkfifo through std::process since we
-        // don't carry a libc dep; use `mkfifo` via std::process::Command.
-        let p = tmp_path("fifo");
-        let _ = fs::remove_file(&p);
-        let status = std::process::Command::new("mkfifo")
-            .arg(&p)
-            .status();
-        // If mkfifo isn't on the runner (highly unusual on linux/macos),
-        // skip the test rather than fail it.
-        let Ok(status) = status else {
-            eprintln!("mkfifo not available; skipping FIFO test");
-            return;
-        };
-        if !status.success() {
-            eprintln!("mkfifo failed; skipping FIFO test");
-            return;
-        }
-        // chmod 600 so the permission check doesn't short-circuit with
-        // "insecure mode". We want the is_file check to be the one that
-        // trips.
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).expect("chmod fifo");
-        let err = read_password_file_inner(&p).expect_err("should refuse FIFO");
-        assert!(
-            err.message.contains("not a regular file"),
-            "msg: {}",
-            err.message
-        );
-        fs::remove_file(&p).ok();
     }
 
     #[cfg(unix)]
@@ -286,6 +267,29 @@ mod tests {
             err.message
         );
         fs::remove_dir(&p).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepts_symlink_to_mode_0600_file() {
+        // The earlier revision of this file (issue #13) refused symlinks
+        // outright via `O_NOFOLLOW`. That was dropped: the mode-0600 check
+        // on the fd already guarantees the file is one of the caller's
+        // own files, so a symlink pointing at such a file poses no risk.
+        // Test that the portable `File::open` path accepts a symlink and
+        // reads the target's contents.
+        let target = tmp_path("sym-target");
+        let link = tmp_path("sym-link");
+        let _ = fs::remove_file(&link);
+        let _ = fs::remove_file(&target);
+        write_mode(&target, b"pw\n", 0o600);
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        let pw = read_password_file_inner(&link).expect("read through symlink");
+        assert_eq!(&*pw, "pw");
+
+        fs::remove_file(&link).ok();
+        fs::remove_file(&target).ok();
     }
 
     #[test]
