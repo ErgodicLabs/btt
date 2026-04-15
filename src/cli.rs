@@ -238,60 +238,6 @@ pub enum WalletAction {
         ss58: String,
     },
 
-    /// Acquire tTAO on the subtensor testnet via proof-of-work.
-    ///
-    /// Solves the faucet PoW challenge (keccak256(sha256(nonce ||
-    /// keccak256(block_hash || coldkey)))) against the fixed difficulty
-    /// of 1_000_000, then submits `SubtensorModule::faucet(block_number,
-    /// nonce, work)` signed by the wallet's coldkey. On success the
-    /// pallet credits 1 TAO to the coldkey's free balance.
-    ///
-    /// TESTNET ONLY. This command refuses to run against any endpoint
-    /// that looks like mainnet:
-    ///   1. URL blocklist — rejects hosts matching
-    ///      `entrypoint-finney.opentensor.ai`, `archive.chain.opentensor.ai`,
-    ///      or `dev.chain.opentensor.ai` (case-insensitive, substring).
-    ///   2. Genesis-hash blocklist — rejects the finney mainnet genesis
-    ///      `0x2f0555cc76fc2840a25a6ea3b9637146806f1f44b090c175ffde2a7e5ab36c03`.
-    ///
-    /// If either guard fires, no extrinsic is submitted and the command
-    /// exits with a structured error describing which signal triggered.
-    ///
-    /// PoW bounds: the solver caps at 1e9 total iterations OR 10 minutes
-    /// of wall-clock time, whichever comes first, so a misconfigured
-    /// testnet with an unexpectedly hard difficulty cannot peg your CPU
-    /// indefinitely. At the real difficulty (1_000_000) expected solve
-    /// time is under a second on any modern CPU.
-    Faucet {
-        /// Wallet name. The coldkey is decrypted and used to sign the
-        /// faucet extrinsic; the pallet credits the reward to this same
-        /// coldkey via `ensure_signed`.
-        #[arg(long)]
-        name: String,
-        /// Read coldkey password from file at <path>. For non-interactive
-        /// automation only. The file's first line (up to but not
-        /// including the trailing newline) is taken as the password. See
-        /// `wallet create --password-file` for the full security caveat;
-        /// the faucet is testnet-only so the leakage surface is narrower,
-        /// but the same hygiene rules apply.
-        #[arg(long, value_name = "PATH")]
-        password_file: Option<String>,
-        /// Number of parallel PoW workers. Default 1. Hard-capped at 32
-        /// to prevent a misread flag from spawning hundreds of threads.
-        /// The current solver is single-threaded and uses this value
-        /// only to stride the nonce space, so raising it has no
-        /// throughput effect today; the argument exists for btcli
-        /// compatibility and for a future parallel implementation.
-        #[arg(long, default_value_t = 1)]
-        num_processes: u32,
-        /// How often (in iterations) the solver checks the iteration and
-        /// wall-time caps and emits a progress event to stderr. Default
-        /// 50_000. Lower values reduce tail latency on the caps; higher
-        /// values reduce per-iteration overhead in the hot loop.
-        #[arg(long, default_value_t = 50_000)]
-        update_interval: u64,
-    },
-
     /// Reap stale `.tmp.*`, `.bak.*`, and `.lock.*` entries under the
     /// wallets directory. These are reserved prefixes left behind by
     /// `wallet create` on crashed or interrupted runs (see issue #42).
