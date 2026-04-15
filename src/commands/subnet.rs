@@ -123,18 +123,15 @@ pub async fn lock_cost(endpoint: &str) -> Result<LockCostInfo, BttError> {
 /// - `tempo`             — blocks between emission distribution events
 /// - `burn_rao`          — current registration burn, stringified rao
 /// - `burn_tao`          — the same value expressed as TAO with 9 frac digits
-/// - `emission_rao`      — per-block TAO emitted into this subnet.
-///                         **Currently always "0"**: the upstream
-///                         `get_subnet_info` implementation in subtensor
-///                         (`pallets/subtensor/src/rpc_info/subnet_info.rs`)
-///                         hardcodes `emission_values: 0.into()` for
-///                         both `SubnetInfo` v1 and v2 and does not read
-///                         from live chain state. btt decodes the field
-///                         faithfully and will produce real values the
-///                         moment the runtime starts populating it; the
-///                         column is kept in place so downstream
-///                         parsers don't have to add and remove it
-///                         across a runtime upgrade.
+/// - `emission_rao` — per-block TAO emitted into this subnet.
+///   **Currently always "0"**: the upstream `get_subnet_info`
+///   implementation in subtensor
+///   (`pallets/subtensor/src/rpc_info/subnet_info.rs`) hardcodes
+///   `emission_values: 0.into()` for both `SubnetInfo` v1 and v2 and
+///   does not read from live chain state. btt decodes the field
+///   faithfully and will produce real values the moment the runtime
+///   starts populating it; the column is kept in place so downstream
+///   parsers don't have to add and remove it across a runtime upgrade.
 /// - `difficulty`        — PoW difficulty
 /// - `immunity_period`   — blocks a new UID is immune from deregistration
 ///
