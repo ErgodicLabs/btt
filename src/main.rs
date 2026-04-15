@@ -9,7 +9,7 @@ mod rpc;
 use clap::Parser;
 use zeroize::Zeroizing;
 
-use cli::{ChainAction, Cli, Command, StakeAction, WalletAction};
+use cli::{ChainAction, Cli, Command, StakeAction, SubnetAction, WalletAction};
 use commands::password_file;
 use error::BttError;
 
@@ -244,6 +244,18 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                     )
                     .await?;
                     output::print_success(&result, pretty);
+                }
+            }
+        }
+        Command::Subnet { action } => {
+            let endpoint = rpc::resolve_endpoint(
+                cli.url.as_deref(),
+                cli.network.as_deref(),
+            )?;
+            match action {
+                SubnetAction::LockCost => {
+                    let info = commands::subnet::lock_cost(&endpoint).await?;
+                    output::print_success(&info, pretty);
                 }
             }
         }
