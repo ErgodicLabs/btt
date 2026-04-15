@@ -43,8 +43,27 @@ pub enum Command {
         action: StakeAction,
     },
 
+    /// Subnet read-only queries (registration cost, metagraph, hyperparameters, etc.)
+    Subnet {
+        #[command(subcommand)]
+        action: SubnetAction,
+    },
+
     /// Emit SKILL.md for AI agent integration
     Skill,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SubnetAction {
+    /// Query the current TAO cost to register a new subnet.
+    ///
+    /// Reads `SubnetRegistrationRuntimeApi::get_network_registration_cost`
+    /// on the head block. The value returned is the cost computed by the
+    /// runtime at query time; it decays between registrations per the
+    /// `NetworkLockReductionInterval` schedule, so repeated calls at
+    /// different blocks will return different values. This is a read-only
+    /// query — no wallet, no signing, no extrinsic.
+    LockCost,
 }
 
 #[derive(Subcommand, Debug)]
