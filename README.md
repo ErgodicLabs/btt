@@ -41,7 +41,7 @@ built-in default (finney).
 | `chain info`             | Display chain name, runtime version, and current block number.  |
 | `chain balance <ss58>`   | Query the free TAO balance for an SS58 address.                 |
 | `wallet list`            | List wallets in the btt config directory.                        |
-| `wallet create`          | Create a new wallet (coldkey + hotkey pair) and print mnemonic.  |
+| `wallet create`          | Create a new wallet and print both coldkey + hotkey mnemonics.   |
 | `wallet new-coldkey`     | Generate a new coldkey only.                                     |
 | `wallet new-hotkey`      | Generate a new hotkey under an existing wallet.                  |
 | `wallet regen-coldkey`   | Restore a coldkey from mnemonic or seed.                         |
@@ -70,7 +70,8 @@ btt chain balance <ss58_address>
 # List local wallets
 btt wallet list
 
-# Create a new wallet (coldkey + hotkey). Prints the coldkey mnemonic.
+# Create a new wallet (coldkey + hotkey). Prints BOTH mnemonics in the
+# JSON envelope: `coldkey_mnemonic` and `hotkey_mnemonic`.
 btt wallet create --name alice [--hotkey default] [--n-words 12|24] \
                   [--password-file <path>] [--force]
 
@@ -113,9 +114,10 @@ the generated mnemonic as part of the JSON response envelope. Treat the
 output as secret material: do not run these in a shared terminal, and do
 not redirect stdout to a file you will forget about. The mnemonic is the
 only way to recover the key if the encrypted wallet file is lost or the
-password is forgotten. (Note: as of this writing only the coldkey
-mnemonic is surfaced on `wallet create`; the hotkey mnemonic is written
-silently to disk. Issue #78 tracks promoting it into the response.)
+password is forgotten. `wallet create` emits BOTH mnemonics under the
+`coldkey_mnemonic` and `hotkey_mnemonic` fields of the JSON `data`
+object (issue #78). This is a breaking change from the pre-#78 shape
+that used a single `mnemonic` field for the coldkey phrase only.
 
 ### Stake
 
