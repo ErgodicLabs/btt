@@ -25,9 +25,52 @@
 use std::env::VarError;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Once;
 
 use crate::error::BttError;
+
+// ── `--quiet` global state ───────────────────────────────────────────
+//
+// The top-level `--quiet` flag from clap is threaded through to every
+// non-essential stderr status message via a process-wide atomic.
+// `main.rs` calls `set_quiet(cli.quiet)` once at startup before any
+// command dispatches; the individual warning sites read `is_quiet()`
+// and skip their writeln! when it returns true.
+//
+// Why a module-level atomic rather than threading a `&Cli` through
+// every layer: the warning sites are deep inside library-style
+// helpers (`guard_overwrite`, `warn_legacy`, etc.) that are called
+// from many paths. Threading a bool parameter through all of them
+// would touch ~20 functions and add a bool to every signature.
+// Setting the flag once at startup is cheaper and keeps the change
+// localized. The atomic reads are Relaxed — `--quiet` is a display
+// preference, not a safety gate, so strict ordering is unnecessary.
+//
+// `--quiet` does NOT suppress:
+//   - stdout JSON payloads (that is the actual result)
+//   - structured error envelopes (errors are the point)
+//   - the password prompt in `read_password` (the user needs to see it)
+//
+// `--quiet` DOES suppress:
+//   - the legacy wallet directory migration warning (non-essential)
+//   - `--force: destroying existing <label>` status warnings (non-
+//     essential; if you passed both `--force` and `--quiet` you have
+//     already opted into the destructive behavior)
+
+static QUIET: AtomicBool = AtomicBool::new(false);
+
+/// Set the process-wide `--quiet` state. Called once at startup by
+/// `main::run` from the top-level `Cli::quiet` value.
+pub fn set_quiet(q: bool) {
+    QUIET.store(q, Ordering::Relaxed);
+}
+
+/// Read the process-wide `--quiet` state. Called by stderr status
+/// writers that honor the flag.
+pub fn is_quiet() -> bool {
+    QUIET.load(Ordering::Relaxed)
+}
 
 /// Read an environment variable, distinguishing "not set" from "not UTF-8".
 ///
@@ -150,15 +193,25 @@ static LEGACY_WARNING: Once = Once::new();
 
 /// Emit the legacy-fallback migration warning at most once per `once`.
 ///
-/// Writer and `Once` are injected so tests can capture the output and
-/// supply a fresh `Once` per test (the static `LEGACY_WARNING` would
-/// otherwise "stick" across tests running in the same process).
+/// Writer, `Once`, and `quiet` flag are all injected so tests can
+/// capture the output, supply a fresh `Once` per test (the static
+/// `LEGACY_WARNING` would otherwise "stick" across tests running in
+/// the same process), and exercise both the quiet and non-quiet
+/// paths without touching the process-wide atomic.
+///
+/// When `quiet` is true this function returns early without touching
+/// `out` AND without burning the `once` — the flag is a display
+/// preference, not a "this warning fired for this run" marker.
 fn warn_legacy_to(
     out: &mut dyn Write,
     once: &Once,
     legacy: &Path,
     new: &Path,
+    quiet: bool,
 ) {
+    if quiet {
+        return;
+    }
     once.call_once(|| {
         let _ = writeln!(
             out,
@@ -179,10 +232,10 @@ fn warn_legacy_to(
 }
 
 /// Production-side wrapper: emit to stderr, gated by the process-wide
-/// `LEGACY_WARNING` `Once`.
+/// `LEGACY_WARNING` `Once` and the process-wide `--quiet` flag.
 fn warn_legacy(legacy: &Path, new: &Path) {
     let mut err = std::io::stderr().lock();
-    warn_legacy_to(&mut err, &LEGACY_WARNING, legacy, new);
+    warn_legacy_to(&mut err, &LEGACY_WARNING, legacy, new, is_quiet());
 }
 
 /// Resolve the per-user btt config directory.
@@ -562,7 +615,7 @@ mod tests {
         let native = PathBuf::from("/home/alice/.config/btt");
         let mut buf: Vec<u8> = Vec::new();
         let once = Once::new();
-        warn_legacy_to(&mut buf, &once, &legacy, &native);
+        warn_legacy_to(&mut buf, &once, &legacy, &native, false);
 
         let s = String::from_utf8(buf).expect("utf8");
         assert!(s.contains("legacy wallet directory at /home/alice/.bittensor"));
@@ -580,11 +633,11 @@ mod tests {
         let once = Once::new();
 
         let mut first: Vec<u8> = Vec::new();
-        warn_legacy_to(&mut first, &once, &legacy, &native);
+        warn_legacy_to(&mut first, &once, &legacy, &native, false);
         assert!(!first.is_empty(), "first call should emit");
 
         let mut second: Vec<u8> = Vec::new();
-        warn_legacy_to(&mut second, &once, &legacy, &native);
+        warn_legacy_to(&mut second, &once, &legacy, &native, false);
         assert!(
             second.is_empty(),
             "second call on same Once must emit nothing, got {:?}",
@@ -594,8 +647,64 @@ mod tests {
         // A fresh Once should emit again.
         let fresh = Once::new();
         let mut third: Vec<u8> = Vec::new();
-        warn_legacy_to(&mut third, &fresh, &legacy, &native);
+        warn_legacy_to(&mut third, &fresh, &legacy, &native, false);
         assert!(!third.is_empty(), "fresh Once should emit");
+    }
+
+    // ── Item 3b: quiet suppresses the banner AND leaves the Once unburned ──
+
+    #[test]
+    fn warn_legacy_quiet_suppresses_banner_and_preserves_once() {
+        // Issue #85: `--quiet` global flag must actually silence the
+        // legacy-wallet migration warning. The `quiet` bool injected
+        // into warn_legacy_to is the contract the production wrapper
+        // `warn_legacy` reads from `is_quiet()`.
+        let legacy = PathBuf::from("/home/carol/.bittensor");
+        let native = PathBuf::from("/home/carol/.config/btt");
+        let once = Once::new();
+
+        // First call with quiet=true: writer untouched, once NOT burned.
+        let mut quiet_buf: Vec<u8> = Vec::new();
+        warn_legacy_to(&mut quiet_buf, &once, &legacy, &native, true);
+        assert!(
+            quiet_buf.is_empty(),
+            "quiet=true must not emit anything, got {:?}",
+            String::from_utf8_lossy(&quiet_buf)
+        );
+
+        // Second call on the same Once with quiet=false should now
+        // emit — the earlier quiet call left the Once unburned.
+        let mut loud_buf: Vec<u8> = Vec::new();
+        warn_legacy_to(&mut loud_buf, &once, &legacy, &native, false);
+        assert!(
+            !loud_buf.is_empty(),
+            "quiet=false after a prior quiet=true call should still emit: the quiet call must not burn the Once"
+        );
+        let s = String::from_utf8(loud_buf).expect("utf8");
+        assert!(s.contains("legacy wallet directory at /home/carol/.bittensor"));
+    }
+
+    // ── Item 3c: the process-wide set_quiet/is_quiet atomic round-trips ──
+
+    #[test]
+    fn set_quiet_round_trips() {
+        // Guard the other tests: restore quiet=false on exit. Tests run
+        // in random order and no other test depends on this flag, but
+        // leaving the process-wide state modified would be a time bomb.
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                set_quiet(self.0);
+            }
+        }
+        let _restore = Restore(is_quiet());
+
+        set_quiet(false);
+        assert!(!is_quiet());
+        set_quiet(true);
+        assert!(is_quiet());
+        set_quiet(false);
+        assert!(!is_quiet());
     }
 
     // ── EnvGuard symmetric restore (item 1) ──────────────────────────

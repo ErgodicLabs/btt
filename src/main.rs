@@ -41,12 +41,15 @@ fn resolve_coldkey_password(
 
 async fn run(cli: Cli) -> Result<(), BttError> {
     let pretty = cli.pretty;
-    // `--quiet` is reserved for suppressing non-essential status output
-    // (progress indicators, banners, hints). None of those exist in the
-    // current scaffold, so it is intentionally unused for successful
-    // results. Success payloads are always emitted because they are the
-    // actual result of the command. Errors are never suppressed.
-    let _quiet = cli.quiet;
+    // `--quiet` suppresses non-essential stderr status output: the
+    // legacy wallet directory migration warning and the `--force`
+    // destruction warnings. Suppressed via a process-wide atomic in
+    // `commands::paths` that the warning sites read at print time.
+    // Structured errors (`{ok:false,error:...}`) and stdout JSON
+    // payloads are NEVER suppressed — `--quiet` is a display flag,
+    // not a "hide my mistakes" flag. See issue #85 for the full
+    // scoping decision.
+    commands::paths::set_quiet(cli.quiet);
 
     match cli.command {
         Command::Chain { action } => {
