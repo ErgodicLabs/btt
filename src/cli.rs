@@ -73,6 +73,21 @@ pub enum SubnetAction {
     /// period. Rows are sorted ascending by netuid. Read-only; no
     /// wallet, no signing, no extrinsic.
     List,
+
+    /// Dump the full metagraph of a given subnet.
+    ///
+    /// Reads `SubnetInfoRuntimeApi::get_metagraph(netuid)` on the head
+    /// block and returns a subnet-level header plus one row per UID
+    /// with the hotkey, coldkey, stake, rank, trust, consensus,
+    /// incentive, dividends, emission, active, validator permit, and
+    /// last-update columns. Read-only; no wallet, no signing, no
+    /// extrinsic. Exits with a structured error if the netuid does
+    /// not exist on chain.
+    Metagraph {
+        /// Subnet id to dump the metagraph for.
+        #[arg(long)]
+        netuid: u16,
+    },
 }
 
 #[derive(Subcommand, Debug)]
