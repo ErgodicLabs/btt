@@ -1,7 +1,7 @@
 // Subnet commands. Phase 1 (issue #77) is read-only.
 //
-// Ships so far: `lock-cost` (PR #91), `list` (this PR). Remaining
-// phase-1 commands: `metagraph --netuid <N>`, `hyperparameters --netuid
+// Ships so far: `lock-cost` (PR #91), `list` (PR #92), `metagraph`
+// (this PR). Remaining phase-1 command: `hyperparameters --netuid
 // <N>`. All four call into `SubnetInfoRuntimeApi` / `SubnetRegistration
 // RuntimeApi` — pure runtime state queries, no extrinsics, no wallet
 // material, no trust-sensitive surface. Phase 2 of issue #77 is
@@ -294,6 +294,396 @@ fn parse_subnet_info_list<C: Clone>(value: &Value<C>) -> Result<Vec<SubnetListEn
             difficulty,
             immunity_period,
         });
+    }
+    Ok(out)
+}
+
+// ── metagraph ─────────────────────────────────────────────────────────
+
+/// Subnet-level header fields returned by `btt subnet metagraph`.
+///
+/// The upstream `Metagraph<AccountId>` struct has ~50 fields split
+/// between subnet-scoped metadata and per-UID parallel arrays. This
+/// header surfaces the subnet-scoped fields a user needs to understand
+/// which subnet they are looking at. Per-UID data is in `uids`.
+#[derive(Serialize, Debug)]
+pub struct MetagraphHeader {
+    pub netuid: u16,
+    /// Subnet human name, decoded from the on-chain `Vec<u8>`. btcli
+    /// displays this so users can disambiguate subnets by name; we
+    /// pass it through as a UTF-8 string with lossy decoding, so any
+    /// non-UTF-8 bytes are replaced with U+FFFD. The authoritative
+    /// id is `netuid`, not `name`.
+    pub name: String,
+    /// Subnet token symbol (e.g. "α1"), same UTF-8 lossy decoding.
+    pub symbol: String,
+    pub owner_hotkey_ss58: String,
+    pub owner_coldkey_ss58: String,
+    pub tempo: u16,
+    pub num_uids: u16,
+    pub max_uids: u16,
+    /// Block number at which the metagraph was queried.
+    pub at_block: u64,
+}
+
+/// One row per UID in the metagraph. The curation is 14 fields: the
+/// keys (hotkey + coldkey), the stake (three denominations: total in
+/// rao + tao, alpha, tao), and the consensus-weighted metrics that
+/// validators use to pick targets (rank, trust, consensus, incentive,
+/// dividends, emission). Plus the two bools (active, validator_permit)
+/// and last_update for liveness.
+///
+/// Not included in this first PR: axon info (ip, port), pruning_score,
+/// block_at_registration, identity. Those can be folded into a
+/// `--detail` flag or a followup PR without breaking the row shape.
+///
+/// `rank`/`trust`/`consensus`/`incentive`/`dividends` are stored on
+/// chain as `u16` with the convention that `u16::MAX` corresponds to
+/// `1.0`. We emit the raw u16 here so callers can apply whatever
+/// normalization they want; a future `--pretty` renderer can convert
+/// to a 0.0-1.0 float for humans.
+#[derive(Serialize, Debug)]
+pub struct MetagraphUid {
+    pub uid: u16,
+    pub hotkey_ss58: String,
+    pub coldkey_ss58: String,
+    pub total_stake_rao: String,
+    pub total_stake_tao: String,
+    pub alpha_stake_rao: String,
+    pub tao_stake_rao: String,
+    pub rank: u16,
+    pub trust: u16,
+    pub consensus: u16,
+    pub incentive: u16,
+    pub dividends: u16,
+    /// Alpha-denominated per-block emission to this UID, stringified
+    /// rao.
+    pub emission_rao: String,
+    pub active: bool,
+    pub validator_permit: bool,
+    pub last_update: u64,
+}
+
+#[derive(Serialize)]
+pub struct SubnetMetagraphResult {
+    pub header: MetagraphHeader,
+    pub uids: Vec<MetagraphUid>,
+}
+
+/// Query the full metagraph of a subnet via
+/// `SubnetInfoRuntimeApi::get_metagraph(netuid)`. Returns `None` from
+/// the runtime if the netuid does not exist; btt translates that to a
+/// structured error.
+pub async fn metagraph(
+    endpoint: &str,
+    netuid: u16,
+) -> Result<SubnetMetagraphResult, BttError> {
+    let api = rpc::connect(endpoint).await?;
+
+    let at_block = tokio::time::timeout(RPC_TIMEOUT, api.at_current_block())
+        .await
+        .map_err(|_| BttError::query("at_current_block() timed out"))?
+        .map_err(|e| BttError::query(format!("failed to resolve client at head: {e}")))?;
+
+    let block_number: u64 = at_block.block_number();
+
+    let call = subxt::dynamic::runtime_api_call::<Vec<SValue>, SValue>(
+        "SubnetInfoRuntimeApi",
+        "get_metagraph",
+        vec![SValue::u128(netuid as u128)],
+    );
+
+    let value = tokio::time::timeout(RPC_TIMEOUT, at_block.runtime_apis().call(call))
+        .await
+        .map_err(|_| BttError::query("get_metagraph timed out"))?
+        .map_err(|e| BttError::query(format!("get_metagraph runtime call failed: {e}")))?;
+
+    // `Option<Metagraph>` — None means the netuid does not exist on
+    // chain. Peel the Option the same way parse_subnet_info_list does.
+    let mg = value.at(0).ok_or_else(|| {
+        BttError::query(format!("netuid {netuid} not found on chain"))
+    })?;
+
+    parse_metagraph(mg, netuid, block_number)
+}
+
+fn parse_metagraph<C: Clone>(
+    mg: &Value<C>,
+    expected_netuid: u16,
+    at_block: u64,
+) -> Result<SubnetMetagraphResult, BttError> {
+    // ── header ─────────────────────────────────────────────────────
+    let netuid = compact_u16(mg, "netuid").ok_or_else(|| {
+        BttError::parse("metagraph: missing netuid field")
+    })?;
+    if netuid != expected_netuid {
+        return Err(BttError::parse(format!(
+            "metagraph: returned netuid {netuid} does not match requested {expected_netuid}"
+        )));
+    }
+
+    let name = decode_compact_u8_vec(mg, "name").unwrap_or_default();
+    let symbol = decode_compact_u8_vec(mg, "symbol").unwrap_or_default();
+
+    let owner_hotkey = extract_account_id_field(mg, "owner_hotkey").ok_or_else(|| {
+        BttError::parse("metagraph: missing owner_hotkey")
+    })?;
+    let owner_coldkey = extract_account_id_field(mg, "owner_coldkey").ok_or_else(|| {
+        BttError::parse("metagraph: missing owner_coldkey")
+    })?;
+    let owner_hotkey_ss58 = AccountId32::from(owner_hotkey).to_ss58check();
+    let owner_coldkey_ss58 = AccountId32::from(owner_coldkey).to_ss58check();
+
+    let tempo = compact_u16(mg, "tempo").ok_or_else(|| {
+        BttError::parse("metagraph: missing tempo")
+    })?;
+    let num_uids = compact_u16(mg, "num_uids").ok_or_else(|| {
+        BttError::parse("metagraph: missing num_uids")
+    })?;
+    let max_uids = compact_u16(mg, "max_uids").ok_or_else(|| {
+        BttError::parse("metagraph: missing max_uids")
+    })?;
+
+    let header = MetagraphHeader {
+        netuid,
+        name,
+        symbol,
+        owner_hotkey_ss58,
+        owner_coldkey_ss58,
+        tempo,
+        num_uids,
+        max_uids,
+        at_block,
+    };
+
+    // ── per-UID parallel arrays ────────────────────────────────────
+    //
+    // Each of these fields is a Vec of length num_uids. We walk each
+    // one into a Vec<T> of the right element type, then zip them by
+    // index into the final Vec<MetagraphUid>. If any of the arrays is
+    // shorter than num_uids (runtime version drift) we return a
+    // structured error rather than silently truncating.
+
+    // Per-UID parallel arrays. Three of these fields (`rank`, `trust`,
+    // and the unused-but-adjacent `pruning_score`) are sometimes
+    // returned as empty Vecs by `get_metagraph` even when `num_uids`
+    // is nonzero — observed on testnet netuid 1 (2026-04-15), where
+    // upstream returns 256-element Vecs for most per-UID fields but
+    // 0-element Vecs for `rank`, `trust`, and `pruning_score`. That
+    // is legitimate "not yet computed / storage not populated" state
+    // at the runtime API level, not a decoder bug. For those fields
+    // we backfill with `T::default()` to num_uids so the output
+    // parallel indexing stays valid. Any OTHER length mismatch (non-
+    // zero but != num_uids) IS treated as an error, because that
+    // indicates actual runtime-version drift worth reporting.
+    let expected = num_uids as usize;
+
+    let hotkeys = pad_or_check(walk_account_vec(mg, "hotkeys")?, expected, "hotkeys")?;
+    let coldkeys = pad_or_check(walk_account_vec(mg, "coldkeys")?, expected, "coldkeys")?;
+    let total_stakes = pad_or_check(
+        walk_compact_u128_vec(mg, "total_stake")?,
+        expected,
+        "total_stake",
+    )?;
+    let alpha_stakes = pad_or_check(
+        walk_compact_u128_vec(mg, "alpha_stake")?,
+        expected,
+        "alpha_stake",
+    )?;
+    let tao_stakes = pad_or_check(
+        walk_compact_u128_vec(mg, "tao_stake")?,
+        expected,
+        "tao_stake",
+    )?;
+    let ranks = pad_or_check(walk_compact_u16_vec(mg, "rank")?, expected, "rank")?;
+    let trusts = pad_or_check(walk_compact_u16_vec(mg, "trust")?, expected, "trust")?;
+    let consensus =
+        pad_or_check(walk_compact_u16_vec(mg, "consensus")?, expected, "consensus")?;
+    let incentives = pad_or_check(
+        walk_compact_u16_vec(mg, "incentives")?,
+        expected,
+        "incentives",
+    )?;
+    let dividends =
+        pad_or_check(walk_compact_u16_vec(mg, "dividends")?, expected, "dividends")?;
+    let emissions = pad_or_check(
+        walk_compact_u128_vec(mg, "emission")?,
+        expected,
+        "emission",
+    )?;
+    let active = pad_or_check(walk_bool_vec(mg, "active")?, expected, "active")?;
+    let val_permits = pad_or_check(
+        walk_bool_vec(mg, "validator_permit")?,
+        expected,
+        "validator_permit",
+    )?;
+    let last_updates = pad_or_check(
+        walk_compact_u64_vec(mg, "last_update")?,
+        expected,
+        "last_update",
+    )?;
+
+    let mut uids = Vec::with_capacity(expected);
+    for i in 0..expected {
+        let total_rao = total_stakes[i];
+        uids.push(MetagraphUid {
+            uid: i as u16,
+            hotkey_ss58: AccountId32::from(hotkeys[i]).to_ss58check(),
+            coldkey_ss58: AccountId32::from(coldkeys[i]).to_ss58check(),
+            total_stake_rao: total_rao.to_string(),
+            total_stake_tao: format_rao_as_tao(total_rao),
+            alpha_stake_rao: alpha_stakes[i].to_string(),
+            tao_stake_rao: tao_stakes[i].to_string(),
+            rank: ranks[i],
+            trust: trusts[i],
+            consensus: consensus[i],
+            incentive: incentives[i],
+            dividends: dividends[i],
+            emission_rao: emissions[i].to_string(),
+            active: active[i],
+            validator_permit: val_permits[i],
+            last_update: last_updates[i],
+        });
+    }
+
+    Ok(SubnetMetagraphResult { header, uids })
+}
+
+/// Decode a `Vec<Compact<u8>>` value as a lossy UTF-8 String. Used
+/// for `name` and `symbol` fields. Returns `None` if the field is
+/// missing or any element is not a decodable u8.
+fn decode_compact_u8_vec<C: Clone>(composite: &Value<C>, field: &str) -> Option<String> {
+    let v = composite.at(field)?;
+    let mut bytes = Vec::new();
+    let mut idx = 0usize;
+    while let Some(entry) = v.at(idx) {
+        idx += 1;
+        let b = compact_value_to_u128(entry)?;
+        if b > 255 {
+            return None;
+        }
+        bytes.push(b as u8);
+    }
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+// ── per-UID vec walkers ───────────────────────────────────────────
+
+/// Normalize a per-UID Vec against the expected length. Three cases:
+/// - `got == expected`: pass through unchanged.
+/// - `got == 0` and `expected > 0`: backfill with `T::default()` to
+///   `expected` elements. This accommodates the runtime returning
+///   empty Vecs for fields whose storage has not yet been populated
+///   (e.g. `rank`, `trust`, `pruning_score` on a subnet whose epoch
+///   has not yet computed these values). The parallel-array indexing
+///   stays valid and the output contains zero placeholders which
+///   correctly represent the "not yet computed" state.
+/// - any other mismatch: hard error. A non-zero length that still
+///   doesn't match `num_uids` is runtime-version drift worth catching.
+fn pad_or_check<T: Default + Clone>(
+    got: Vec<T>,
+    expected: usize,
+    field: &str,
+) -> Result<Vec<T>, BttError> {
+    if got.len() == expected {
+        Ok(got)
+    } else if got.is_empty() {
+        Ok(vec![T::default(); expected])
+    } else {
+        Err(BttError::parse(format!(
+            "metagraph: per-UID array `{field}` has {got_len} elements, expected {expected} (num_uids) or 0",
+            got_len = got.len()
+        )))
+    }
+}
+
+fn walk_account_vec<C: Clone>(mg: &Value<C>, field: &str) -> Result<Vec<[u8; 32]>, BttError> {
+    let v = mg.at(field).ok_or_else(|| {
+        BttError::parse(format!("metagraph: missing vec field `{field}`"))
+    })?;
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    while let Some(entry) = v.at(idx) {
+        idx += 1;
+        let bytes = {
+            // Try the wrapped-tuple-struct shape first (AccountId32
+            // as a single-field composite wrapping [u8; 32]) and
+            // fall back to the raw byte array.
+            if let Some(inner) = entry.at(0) {
+                value_to_32_bytes(inner)
+            } else {
+                value_to_32_bytes(entry)
+            }
+        }
+        .ok_or_else(|| {
+            BttError::parse(format!(
+                "metagraph: `{field}`[{}] is not a decodable 32-byte account id",
+                idx - 1
+            ))
+        })?;
+        out.push(bytes);
+    }
+    Ok(out)
+}
+
+fn walk_compact_u16_vec<C: Clone>(mg: &Value<C>, field: &str) -> Result<Vec<u16>, BttError> {
+    walk_compact_numeric_vec(mg, field, |n| u16::try_from(n).ok())
+}
+
+fn walk_compact_u64_vec<C: Clone>(mg: &Value<C>, field: &str) -> Result<Vec<u64>, BttError> {
+    walk_compact_numeric_vec(mg, field, |n| u64::try_from(n).ok())
+}
+
+fn walk_compact_u128_vec<C: Clone>(mg: &Value<C>, field: &str) -> Result<Vec<u128>, BttError> {
+    walk_compact_numeric_vec(mg, field, Some)
+}
+
+fn walk_compact_numeric_vec<C: Clone, T>(
+    mg: &Value<C>,
+    field: &str,
+    coerce: impl Fn(u128) -> Option<T>,
+) -> Result<Vec<T>, BttError> {
+    let v = mg.at(field).ok_or_else(|| {
+        BttError::parse(format!("metagraph: missing vec field `{field}`"))
+    })?;
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    while let Some(entry) = v.at(idx) {
+        idx += 1;
+        let n = compact_value_to_u128(entry).ok_or_else(|| {
+            BttError::parse(format!(
+                "metagraph: `{field}`[{}] is not a decodable integer",
+                idx - 1
+            ))
+        })?;
+        let typed = coerce(n).ok_or_else(|| {
+            BttError::parse(format!(
+                "metagraph: `{field}`[{}] value {n} out of range for target type",
+                idx - 1
+            ))
+        })?;
+        out.push(typed);
+    }
+    Ok(out)
+}
+
+fn walk_bool_vec<C: Clone>(mg: &Value<C>, field: &str) -> Result<Vec<bool>, BttError> {
+    let v = mg.at(field).ok_or_else(|| {
+        BttError::parse(format!("metagraph: missing vec field `{field}`"))
+    })?;
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    while let Some(entry) = v.at(idx) {
+        idx += 1;
+        // scale-value represents booleans as Primitive::Bool under
+        // ValueDef::Primitive. Access via the primitive converter.
+        let b = entry.as_bool().ok_or_else(|| {
+            BttError::parse(format!(
+                "metagraph: `{field}`[{}] is not a bool",
+                idx - 1
+            ))
+        })?;
+        out.push(b);
     }
     Ok(out)
 }
