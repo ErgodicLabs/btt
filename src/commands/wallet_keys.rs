@@ -326,12 +326,28 @@ const ARGON2_PARALLELISM: u32 = 1;
 
 // ── Output types ──────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
+// `CreateResult` is the JSON payload `btt wallet create` emits on stdout.
+// It carries BOTH fresh mnemonics: one for the newly-minted coldkey and
+// one for the newly-minted hotkey. Per issue #78, an automation caller
+// that captures stdout must be able to recover both phrases from that
+// single buffer — the pre-#78 shape only exposed the coldkey phrase and
+// quietly wrote the hotkey phrase to disk, which strands any caller that
+// does not also re-read the on-disk hotkey file.
+//
+// The struct derives `ZeroizeOnDrop` so that the mnemonic `String`s (and
+// the less-sensitive ss58 fields along for the ride) have their heap
+// bytes overwritten the moment the result is dropped. `main.rs` drops
+// the result immediately after `print_success` returns, so the window
+// in which fresh phrases sit on the heap is bounded by a single JSON
+// serialization. `Serialize` is implemented by-reference and does not
+// conflict with `Drop`, so the two derives compose cleanly.
+#[derive(Serialize, Zeroize, ZeroizeOnDrop)]
 pub struct CreateResult {
     pub wallet_name: String,
     pub coldkey_ss58: String,
     pub hotkey_ss58: String,
-    pub mnemonic: String,
+    pub coldkey_mnemonic: String,
+    pub hotkey_mnemonic: String,
 }
 
 #[derive(Serialize)]
@@ -1009,9 +1025,18 @@ fn create_into_staging(
         }
     }
 
-    let mnemonic_out = cold_phrase.clone();
+    // Snapshot BOTH phrases into the result struct before zeroizing the
+    // originals. Per issue #78 the hotkey phrase must flow out through
+    // stdout alongside the coldkey phrase, not only through the on-disk
+    // hotkey file. The result struct is `ZeroizeOnDrop`, so these clones
+    // are scrubbed from the heap as soon as `main.rs` drops the value
+    // after `print_success`.
+    let coldkey_mnemonic_out = cold_phrase.clone();
+    let hotkey_mnemonic_out = hot_phrase.clone();
 
-    // Zeroize sensitive material that will not be returned to the caller.
+    // Zeroize the original secret buffers. The seeds are not returned to
+    // the caller at all; the phrases survive only via the clones above,
+    // which the result struct's `ZeroizeOnDrop` will scrub on drop.
     cold_phrase.zeroize();
     cold_seed.zeroize();
     hot_phrase.zeroize();
@@ -1021,7 +1046,8 @@ fn create_into_staging(
         wallet_name: wallet_name.to_string(),
         coldkey_ss58: cold_ss58,
         hotkey_ss58: hot_ss58,
-        mnemonic: mnemonic_out,
+        coldkey_mnemonic: coldkey_mnemonic_out,
+        hotkey_mnemonic: hotkey_mnemonic_out,
     })
 }
 
@@ -2430,8 +2456,43 @@ mod tests {
         assert_eq!(result.wallet_name, wallet_name);
         assert!(result.coldkey_ss58.starts_with('5'));
         assert!(result.hotkey_ss58.starts_with('5'));
-        let words: Vec<&str> = result.mnemonic.split_whitespace().collect();
-        assert_eq!(words.len(), 12);
+
+        // Both mnemonics must be present in the JSON envelope (issue #78).
+        let cold_words: Vec<&str> = result.coldkey_mnemonic.split_whitespace().collect();
+        assert_eq!(cold_words.len(), 12, "coldkey mnemonic should be 12 words");
+        let hot_words: Vec<&str> = result.hotkey_mnemonic.split_whitespace().collect();
+        assert_eq!(hot_words.len(), 12, "hotkey mnemonic should be 12 words");
+
+        // The two phrases come from independent `generate_keypair` calls
+        // and must be distinct. A regression where one field accidentally
+        // copies the other (e.g. a typo'd clone) would collapse them into
+        // equality and this assertion catches it.
+        assert_ne!(
+            result.coldkey_mnemonic, result.hotkey_mnemonic,
+            "coldkey and hotkey mnemonics must be distinct"
+        );
+
+        // Round-trip: re-derive both keypairs from the returned phrases
+        // and confirm the resulting ss58 addresses match the ones the
+        // command reported. This is the acceptance criterion from issue
+        // #78 — it proves the returned phrases are the phrases actually
+        // used to generate the on-disk keys, not unrelated filler.
+        let (cold_pair, _cold_phrase, _cold_seed) =
+            recover_keypair(Some(&result.coldkey_mnemonic), None)
+                .expect("coldkey mnemonic should re-derive");
+        assert_eq!(
+            cold_pair.public().to_ss58check(),
+            result.coldkey_ss58,
+            "coldkey mnemonic must re-derive to the reported coldkey ss58"
+        );
+        let (hot_pair, _hot_phrase, _hot_seed) =
+            recover_keypair(Some(&result.hotkey_mnemonic), None)
+                .expect("hotkey mnemonic should re-derive");
+        assert_eq!(
+            hot_pair.public().to_ss58check(),
+            result.hotkey_ss58,
+            "hotkey mnemonic must re-derive to the reported hotkey ss58"
+        );
     }
 
     // -- TAO/RAO conversion tests --
@@ -2979,8 +3040,12 @@ mod tests {
             "force must yield a fresh hotkey"
         );
         assert_ne!(
-            first.mnemonic, second.mnemonic,
-            "force must yield a fresh mnemonic"
+            first.coldkey_mnemonic, second.coldkey_mnemonic,
+            "force must yield a fresh coldkey mnemonic"
+        );
+        assert_ne!(
+            first.hotkey_mnemonic, second.hotkey_mnemonic,
+            "force must yield a fresh hotkey mnemonic"
         );
         assert!(second.coldkey_ss58.starts_with('5'));
         assert!(second.hotkey_ss58.starts_with('5'));
@@ -3033,7 +3098,7 @@ mod tests {
         // Regenerate the coldkey from the mnemonic. The wallet dir already
         // holds a `coldkey` file from `create` above, so we must pass
         // force=true or the guard would (correctly) refuse.
-        let regen = regen_coldkey(wallet_name, Some(&cr.mnemonic), None, password, true)
+        let regen = regen_coldkey(wallet_name, Some(&cr.coldkey_mnemonic), None, password, true)
             .expect("regen should work");
         assert_eq!(regen.ss58_address, cr.coldkey_ss58);
 
