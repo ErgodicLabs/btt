@@ -123,7 +123,18 @@ pub async fn lock_cost(endpoint: &str) -> Result<LockCostInfo, BttError> {
 /// - `tempo`             — blocks between emission distribution events
 /// - `burn_rao`          — current registration burn, stringified rao
 /// - `burn_tao`          — the same value expressed as TAO with 9 frac digits
-/// - `emission_rao`      — per-block TAO emitted into this subnet
+/// - `emission_rao`      — per-block TAO emitted into this subnet.
+///                         **Currently always "0"**: the upstream
+///                         `get_subnet_info` implementation in subtensor
+///                         (`pallets/subtensor/src/rpc_info/subnet_info.rs`)
+///                         hardcodes `emission_values: 0.into()` for
+///                         both `SubnetInfo` v1 and v2 and does not read
+///                         from live chain state. btt decodes the field
+///                         faithfully and will produce real values the
+///                         moment the runtime starts populating it; the
+///                         column is kept in place so downstream
+///                         parsers don't have to add and remove it
+///                         across a runtime upgrade.
 /// - `difficulty`        — PoW difficulty
 /// - `immunity_period`   — blocks a new UID is immune from deregistration
 ///
@@ -193,10 +204,10 @@ pub async fn list(endpoint: &str) -> Result<SubnetListResult, BttError> {
 }
 
 /// Walk a decoded `Vec<Option<SubnetInfo>>` value and produce one
-/// `SubnetListEntry` per `Some(info)`. `None` entries and malformed
-/// entries produce errors: we'd rather report a bad row than silently
-/// drop it, because a silent drop hides runtime-version drift where a
-/// new field got added or renamed.
+/// `SubnetListEntry` per `Some(info)`. Malformed entries produce errors:
+/// we'd rather report a bad row than silently drop it, because a silent
+/// drop hides runtime-version drift where a new field got added or
+/// renamed.
 fn parse_subnet_info_list<C: Clone>(value: &Value<C>) -> Result<Vec<SubnetListEntry>, BttError> {
     let mut out = Vec::new();
     let mut idx = 0usize;
@@ -204,12 +215,21 @@ fn parse_subnet_info_list<C: Clone>(value: &Value<C>) -> Result<Vec<SubnetListEn
         idx += 1;
 
         // `Option<SubnetInfo>` decodes as an enum variant. `None` is a
-        // variant named "None" with no fields; `Some` is a variant named
-        // "Some" with a single child that IS the `SubnetInfo` composite.
-        // scale-value exposes variant-or-composite uniformly through
-        // `.at(0)`: for a Some(...) we get the inner struct; for a None
-        // we get nothing. Both the hand-written unit tests below and the
-        // live runtime wire format match this shape.
+        // variant named "None" with no fields; `Some` is a variant
+        // named "Some" with a single child that IS the `SubnetInfo`
+        // composite. scale-value exposes the variant payload through
+        // `.at(0)`: for `Some(...)` we get the inner struct, for `None`
+        // we get nothing.
+        //
+        // Note: under the *current* upstream implementation
+        // (`pallets/subtensor/src/rpc_info/subnet_info.rs:172-192`)
+        // `get_subnets_info` pushes only `Some` entries — deregistered-
+        // netuid gaps are already filtered out at the producer. This
+        // `None` skip branch is therefore dead code against the live
+        // runtime today. It is kept as a defensive guard in case the
+        // producer contract changes to include gap placeholders; if
+        // the decoder ever begins reporting skipped rows, that is
+        // signal that upstream shape moved.
         let info = match entry.at(0) {
             Some(inner) => inner,
             None => continue,
@@ -285,8 +305,8 @@ fn parse_subnet_info_list<C: Clone>(value: &Value<C>) -> Result<Vec<SubnetListEn
 //
 // These helpers intentionally duplicate the shape of the helpers in
 // `stake.rs`. Consolidating them into a shared module under
-// `src/commands/` is a planned follow-up, but doing it in this PR
-// would creep scope across two commands; one PR does one thing.
+// `src/commands/` is tracked by issue #93 as a pure refactor PR;
+// doing it inline here would creep scope across two commands.
 
 /// Extract a `Compact<u*>` field from a composite, coerced to u16.
 /// Fails if the field is missing, not a primitive, or exceeds u16 range.
