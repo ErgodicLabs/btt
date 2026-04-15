@@ -1,5 +1,50 @@
 use clap::{Parser, Subcommand};
 
+/// Clap `value_parser` for the `--seed` flag on `wallet regen-coldkey`
+/// and `wallet regen-hotkey`.
+///
+/// The subtensor sr25519 seed is 32 bytes, conventionally encoded as a
+/// `0x`-prefixed 64-character lowercase hex string (66 characters
+/// total). This parser rejects anything else at clap parse time so the
+/// user gets a clear, actionable error before the key-decryption path
+/// runs.
+///
+/// Accepts: `0x` prefix + exactly 64 hex digits (case-insensitive).
+///
+/// Rejects:
+/// - missing `0x` prefix
+/// - wrong length (not exactly 66 chars including prefix, i.e. not
+///   exactly 64 hex digits after the prefix)
+/// - non-hex characters
+///
+/// Returns the input string unchanged on success. The downstream
+/// `recover_keypair` path still runs `hex::decode` and a
+/// `len == 32` check as a defense-in-depth backstop against any
+/// future caller that bypasses clap. This parser is the primary UX
+/// gate; the runtime check is the correctness gate.
+pub fn parse_seed_hex(s: &str) -> Result<String, String> {
+    let stripped = s.strip_prefix("0x").ok_or_else(|| {
+        format!(
+            "seed must start with `0x` and be followed by exactly 64 hex characters \
+             (32-byte sr25519 seed); got `{s}`"
+        )
+    })?;
+    if stripped.len() != 64 {
+        return Err(format!(
+            "seed must be exactly 64 hex characters after the `0x` prefix \
+             (32-byte sr25519 seed); got {} characters",
+            stripped.len()
+        ));
+    }
+    if !stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "seed must contain only hex characters [0-9a-fA-F] after the `0x` \
+             prefix; got `{s}`"
+        ));
+    }
+    Ok(s.to_string())
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "btt", version, about = "Minimal, secure Bittensor CLI")]
 pub struct Cli {
@@ -214,9 +259,11 @@ pub enum WalletAction {
         /// one of the two must be provided.
         #[arg(long, conflicts_with = "seed")]
         mnemonic: Option<String>,
-        /// Hex-encoded seed (0x...). Mutually exclusive with `--mnemonic`;
-        /// exactly one of the two must be provided.
-        #[arg(long)]
+        /// 32-byte sr25519 seed encoded as `0x` + 64 hex characters (66
+        /// characters total). Mutually exclusive with `--mnemonic`;
+        /// exactly one of the two must be provided. Clap rejects
+        /// non-conforming input at parse time.
+        #[arg(long, value_parser = parse_seed_hex)]
         seed: Option<String>,
         /// Read coldkey password from file at <path>. For non-interactive
         /// automation only. The file's first line (up to but not including
@@ -248,9 +295,11 @@ pub enum WalletAction {
         /// one of the two must be provided.
         #[arg(long, conflicts_with = "seed")]
         mnemonic: Option<String>,
-        /// Hex-encoded seed (0x...). Mutually exclusive with `--mnemonic`;
-        /// exactly one of the two must be provided.
-        #[arg(long)]
+        /// 32-byte sr25519 seed encoded as `0x` + 64 hex characters (66
+        /// characters total). Mutually exclusive with `--mnemonic`;
+        /// exactly one of the two must be provided. Clap rejects
+        /// non-conforming input at parse time.
+        #[arg(long, value_parser = parse_seed_hex)]
         seed: Option<String>,
         /// Overwrite an existing hotkey file if one is present. Without
         /// this flag, the command refuses to run when the target key file
@@ -402,4 +451,84 @@ pub enum StakeAction {
         #[arg(long, default_value_t = false)]
         all: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_seed_hex;
+
+    // Issue #87: clap-level `parse_seed_hex` rejects non-conforming input
+    // with clear messages. Accepts only `0x` + 64 hex chars.
+
+    #[test]
+    fn parse_seed_accepts_valid_64_hex_with_prefix() {
+        let seed = "0x0000000000000000000000000000000000000000000000000000000000000000";
+        let parsed = parse_seed_hex(seed).expect("32-byte zero seed should parse");
+        assert_eq!(parsed, seed);
+    }
+
+    #[test]
+    fn parse_seed_accepts_mixed_case_hex() {
+        let seed = "0xDeadBeefCafeBabe0123456789aBcDeF0123456789ABCDEF0123456789abcdef";
+        let parsed = parse_seed_hex(seed).expect("mixed-case hex should parse");
+        assert_eq!(parsed, seed);
+    }
+
+    #[test]
+    fn parse_seed_rejects_missing_0x_prefix() {
+        let err = parse_seed_hex(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .expect_err("missing prefix must be rejected");
+        assert!(err.contains("`0x`"), "error should name the 0x prefix: {err}");
+    }
+
+    #[test]
+    fn parse_seed_rejects_too_short() {
+        // 0x + 62 hex chars = 64 total, 2 short.
+        let err = parse_seed_hex(
+            "0x00000000000000000000000000000000000000000000000000000000000000",
+        )
+        .expect_err("too short must be rejected");
+        assert!(
+            err.contains("exactly 64 hex characters"),
+            "error should name the length: {err}"
+        );
+        assert!(err.contains("62"), "error should report the actual length: {err}");
+    }
+
+    #[test]
+    fn parse_seed_rejects_too_long() {
+        // 0x + 66 hex chars, 2 over.
+        let err = parse_seed_hex(
+            "0x000000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .expect_err("too long must be rejected");
+        assert!(err.contains("exactly 64 hex characters"), "got {err}");
+        assert!(err.contains("66"), "error should report the actual length: {err}");
+    }
+
+    #[test]
+    fn parse_seed_rejects_non_hex_characters() {
+        // 63 zeros + 1 'z' — right length, wrong charset.
+        let err = parse_seed_hex(
+            "0x000000000000000000000000000000000000000000000000000000000000000z",
+        )
+        .expect_err("non-hex must be rejected");
+        assert!(
+            err.contains("only hex characters"),
+            "error should name the charset: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_seed_rejects_empty_string() {
+        assert!(parse_seed_hex("").is_err());
+    }
+
+    #[test]
+    fn parse_seed_rejects_just_prefix() {
+        let err = parse_seed_hex("0x").expect_err("0x alone must be rejected");
+        assert!(err.contains("exactly 64"), "got {err}");
+    }
 }

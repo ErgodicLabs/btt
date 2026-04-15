@@ -83,18 +83,21 @@ btt wallet new-coldkey --name alice [--n-words 12|24] \
 btt wallet new-hotkey --name alice [--hotkey validator] \
                       [--n-words 12|24] [--force]
 
-# Restore a coldkey from mnemonic or seed (exactly one of --mnemonic / --seed).
+# Restore a coldkey from mnemonic or seed (exactly one of --mnemonic / --seed,
+# enforced at the clap parse layer). --seed is a 32-byte sr25519 seed
+# encoded as `0x` + 64 hex characters (66 characters total); anything else
+# is rejected at parse time with a clear error.
 btt wallet regen-coldkey --name alice \
     --mnemonic "word1 word2 ... word12" \
     [--password-file <path>] [--force]
-btt wallet regen-coldkey --name alice --seed 0x<hex> \
+btt wallet regen-coldkey --name alice --seed 0x<64 hex chars> \
     [--password-file <path>] [--force]
 
-# Restore a hotkey from mnemonic or seed (exactly one of --mnemonic / --seed).
+# Restore a hotkey from mnemonic or seed. Same --seed format: 0x + 64 hex.
 btt wallet regen-hotkey --name alice [--hotkey default] \
     --mnemonic "word1 word2 ... word12" [--force]
 btt wallet regen-hotkey --name alice [--hotkey default] \
-    --seed 0x<hex> [--force]
+    --seed 0x<64 hex chars> [--force]
 
 # Sign a message with the wallet's coldkey (default).
 btt wallet sign --name alice --message "hello" [--password-file <path>]
