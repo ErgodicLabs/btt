@@ -1,16 +1,18 @@
-// Subnet commands. Phase 1 (issue #77) is read-only: `lock-cost`
-// ships in this PR as the first command; `list`, `metagraph`, and
-// `hyperparameters` land in follow-ups.
+// Subnet commands. Phase 1 (issue #77) is read-only.
 //
-// All commands in this module are pure runtime state queries. They do
-// not submit extrinsics, require wallet material, or touch any
-// trust-sensitive surface. Phase 2 of issue #77 is reserved for write
-// commands (`subnet register`, `subnet create`, etc.) and will be its
-// own issue + PRs.
+// Ships so far: `lock-cost` (PR #91), `list` (this PR). Remaining
+// phase-1 commands: `metagraph --netuid <N>`, `hyperparameters --netuid
+// <N>`. All four call into `SubnetInfoRuntimeApi` / `SubnetRegistration
+// RuntimeApi` — pure runtime state queries, no extrinsics, no wallet
+// material, no trust-sensitive surface. Phase 2 of issue #77 is
+// reserved for write commands (`subnet register`, `subnet create`,
+// etc.) and will be its own issue + PRs.
 
 use std::time::Duration;
 
 use serde::Serialize;
+use sp_core::crypto::{AccountId32, Ss58Codec};
+use subxt::dynamic::{At, Value};
 use subxt::ext::scale_value::Value as SValue;
 
 use crate::error::BttError;
@@ -103,6 +105,259 @@ pub async fn lock_cost(endpoint: &str) -> Result<LockCostInfo, BttError> {
         lock_cost_tao: format_rao_as_tao(rao),
         at_block: block_number,
     })
+}
+
+// ── list ───────────────────────────────────────────────────────────────
+
+/// One row in the output of `btt subnet list`.
+///
+/// The wire format of `SubtensorModule::SubnetInfo` has 18 fields; we
+/// surface a curated nine here. The full dump is out of scope for a
+/// list view — a future `subnet info --netuid <N>` command can emit
+/// the full struct when that's actually useful. Field choice is:
+///
+/// - `netuid`            — the subnet id
+/// - `owner_ss58`        — the ss58-encoded owner coldkey (created the subnet)
+/// - `subnetwork_n`      — the current count of registered UIDs
+/// - `max_allowed_uids`  — the slot cap (how many UIDs can exist)
+/// - `tempo`             — blocks between emission distribution events
+/// - `burn_rao`          — current registration burn, stringified rao
+/// - `burn_tao`          — the same value expressed as TAO with 9 frac digits
+/// - `emission_rao`      — per-block TAO emitted into this subnet
+/// - `difficulty`        — PoW difficulty
+/// - `immunity_period`   — blocks a new UID is immune from deregistration
+///
+/// Balances are stringified to protect downstream JSON parsers from
+/// precision loss (Rao values routinely exceed JavaScript's
+/// `Number.MAX_SAFE_INTEGER`).
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct SubnetListEntry {
+    pub netuid: u16,
+    pub owner_ss58: String,
+    pub subnetwork_n: u16,
+    pub max_allowed_uids: u16,
+    pub tempo: u16,
+    pub burn_rao: String,
+    pub burn_tao: String,
+    pub emission_rao: String,
+    pub difficulty: u64,
+    pub immunity_period: u16,
+}
+
+/// Result envelope for `btt subnet list`. `at_block` correlates the
+/// snapshot to a specific chain state; `subnets` is sorted ascending by
+/// `netuid`.
+#[derive(Serialize)]
+pub struct SubnetListResult {
+    pub at_block: u64,
+    pub subnets: Vec<SubnetListEntry>,
+}
+
+/// Enumerate every subnet currently known to the runtime.
+///
+/// Calls `SubnetInfoRuntimeApi::get_subnets_info` which returns a
+/// `Vec<Option<SubnetInfo<AccountId32>>>` indexed by netuid. `None`
+/// entries are filtered out (they represent gaps in the netuid range
+/// from deregistered subnets). Each surviving `Some` is decoded into
+/// a `SubnetListEntry`.
+///
+/// Two round trips: one `at_current_block`, one runtime API call.
+pub async fn list(endpoint: &str) -> Result<SubnetListResult, BttError> {
+    let api = rpc::connect(endpoint).await?;
+
+    let at_block = tokio::time::timeout(RPC_TIMEOUT, api.at_current_block())
+        .await
+        .map_err(|_| BttError::query("at_current_block() timed out"))?
+        .map_err(|e| BttError::query(format!("failed to resolve client at head: {e}")))?;
+
+    let block_number: u64 = at_block.block_number();
+
+    let call = subxt::dynamic::runtime_api_call::<Vec<SValue>, SValue>(
+        "SubnetInfoRuntimeApi",
+        "get_subnets_info",
+        vec![],
+    );
+
+    let value = tokio::time::timeout(RPC_TIMEOUT, at_block.runtime_apis().call(call))
+        .await
+        .map_err(|_| BttError::query("get_subnets_info timed out"))?
+        .map_err(|e| BttError::query(format!("get_subnets_info runtime call failed: {e}")))?;
+
+    let mut subnets = parse_subnet_info_list(&value)?;
+    subnets.sort_by_key(|e| e.netuid);
+
+    Ok(SubnetListResult {
+        at_block: block_number,
+        subnets,
+    })
+}
+
+/// Walk a decoded `Vec<Option<SubnetInfo>>` value and produce one
+/// `SubnetListEntry` per `Some(info)`. `None` entries and malformed
+/// entries produce errors: we'd rather report a bad row than silently
+/// drop it, because a silent drop hides runtime-version drift where a
+/// new field got added or renamed.
+fn parse_subnet_info_list<C: Clone>(value: &Value<C>) -> Result<Vec<SubnetListEntry>, BttError> {
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    while let Some(entry) = value.at(idx) {
+        idx += 1;
+
+        // `Option<SubnetInfo>` decodes as an enum variant. `None` is a
+        // variant named "None" with no fields; `Some` is a variant named
+        // "Some" with a single child that IS the `SubnetInfo` composite.
+        // scale-value exposes variant-or-composite uniformly through
+        // `.at(0)`: for a Some(...) we get the inner struct; for a None
+        // we get nothing. Both the hand-written unit tests below and the
+        // live runtime wire format match this shape.
+        let info = match entry.at(0) {
+            Some(inner) => inner,
+            None => continue,
+        };
+
+        let netuid = compact_u16(info, "netuid").ok_or_else(|| {
+            BttError::parse(format!(
+                "SubnetInfo[{}]: missing or malformed netuid",
+                idx - 1
+            ))
+        })?;
+
+        let owner_bytes = extract_account_id_field(info, "owner").ok_or_else(|| {
+            BttError::parse(format!(
+                "SubnetInfo[netuid={netuid}]: missing or malformed owner account"
+            ))
+        })?;
+        let owner_ss58 = AccountId32::from(owner_bytes).to_ss58check();
+
+        let subnetwork_n = compact_u16(info, "subnetwork_n").ok_or_else(|| {
+            BttError::parse(format!(
+                "SubnetInfo[netuid={netuid}]: missing subnetwork_n"
+            ))
+        })?;
+        let max_allowed_uids = compact_u16(info, "max_allowed_uids").ok_or_else(|| {
+            BttError::parse(format!(
+                "SubnetInfo[netuid={netuid}]: missing max_allowed_uids"
+            ))
+        })?;
+        let tempo = compact_u16(info, "tempo").ok_or_else(|| {
+            BttError::parse(format!("SubnetInfo[netuid={netuid}]: missing tempo"))
+        })?;
+        let immunity_period = compact_u16(info, "immunity_period").ok_or_else(|| {
+            BttError::parse(format!(
+                "SubnetInfo[netuid={netuid}]: missing immunity_period"
+            ))
+        })?;
+        let difficulty = compact_u64(info, "difficulty").ok_or_else(|| {
+            BttError::parse(format!("SubnetInfo[netuid={netuid}]: missing difficulty"))
+        })?;
+
+        let burn_rao = compact_u128(info, "burn").ok_or_else(|| {
+            BttError::parse(format!("SubnetInfo[netuid={netuid}]: missing burn"))
+        })?;
+        // `SubnetInfo::emission_values` in the v1 struct (v2 has
+        // `emission_value`); accept either so a runtime version swap
+        // does not silently drop the column.
+        let emission_rao = compact_u128(info, "emission_values")
+            .or_else(|| compact_u128(info, "emission_value"))
+            .ok_or_else(|| {
+                BttError::parse(format!(
+                    "SubnetInfo[netuid={netuid}]: missing emission_values/emission_value"
+                ))
+            })?;
+
+        out.push(SubnetListEntry {
+            netuid,
+            owner_ss58,
+            subnetwork_n,
+            max_allowed_uids,
+            tempo,
+            burn_rao: burn_rao.to_string(),
+            burn_tao: format_rao_as_tao(burn_rao),
+            emission_rao: emission_rao.to_string(),
+            difficulty,
+            immunity_period,
+        });
+    }
+    Ok(out)
+}
+
+// ── decoder helpers ────────────────────────────────────────────────────
+//
+// These helpers intentionally duplicate the shape of the helpers in
+// `stake.rs`. Consolidating them into a shared module under
+// `src/commands/` is a planned follow-up, but doing it in this PR
+// would creep scope across two commands; one PR does one thing.
+
+/// Extract a `Compact<u*>` field from a composite, coerced to u16.
+/// Fails if the field is missing, not a primitive, or exceeds u16 range.
+fn compact_u16<C: Clone>(composite: &Value<C>, field: &str) -> Option<u16> {
+    let v = composite.at(field)?;
+    compact_value_to_u128(v).and_then(|n| u16::try_from(n).ok())
+}
+
+/// Same, coerced to u64.
+fn compact_u64<C: Clone>(composite: &Value<C>, field: &str) -> Option<u64> {
+    let v = composite.at(field)?;
+    compact_value_to_u128(v).and_then(|n| u64::try_from(n).ok())
+}
+
+/// Same, left as u128 (for balances).
+fn compact_u128<C: Clone>(composite: &Value<C>, field: &str) -> Option<u128> {
+    let v = composite.at(field)?;
+    compact_value_to_u128(v)
+}
+
+/// The SCALE-value representation of a `Compact<T>` is a single-field
+/// composite wrapping the inner primitive. Walk the wrapper if
+/// present, otherwise read the primitive directly — both shapes show
+/// up in the wild depending on how the codec flattens on that runtime
+/// version.
+fn compact_value_to_u128<C: Clone>(v: &Value<C>) -> Option<u128> {
+    if let Some(n) = v.as_u128() {
+        return Some(n);
+    }
+    if let subxt::ext::scale_value::ValueDef::Composite(c) = &v.value {
+        let values: Vec<&Value<C>> = c.values().collect();
+        if values.len() == 1 {
+            return compact_value_to_u128(values[0]);
+        }
+    }
+    None
+}
+
+/// Pull a 32-byte AccountId out of a named field. Mirrors the helper
+/// in `stake.rs`; see the note above about consolidation.
+fn extract_account_id_field<C: Clone>(entry: &Value<C>, field: &str) -> Option<[u8; 32]> {
+    let field_val = entry.at(field)?;
+    if let Some(inner) = field_val.at(0) {
+        if let Some(bytes) = value_to_32_bytes(inner) {
+            return Some(bytes);
+        }
+    }
+    value_to_32_bytes(field_val)
+}
+
+fn value_to_32_bytes<C: Clone>(value: &Value<C>) -> Option<[u8; 32]> {
+    let mut bytes = Vec::with_capacity(32);
+    let mut idx = 0usize;
+    while let Some(v) = value.at(idx) {
+        let b = v.as_u128()?;
+        if b > 255 {
+            return None;
+        }
+        bytes.push(b as u8);
+        idx += 1;
+        if bytes.len() > 32 {
+            return None;
+        }
+    }
+    if bytes.len() == 32 {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Some(arr)
+    } else {
+        None
+    }
 }
 
 /// Walk a decoded `scale_value::Value` looking for a u128-compatible

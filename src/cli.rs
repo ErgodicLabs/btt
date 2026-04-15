@@ -64,6 +64,15 @@ pub enum SubnetAction {
     /// different blocks will return different values. This is a read-only
     /// query — no wallet, no signing, no extrinsic.
     LockCost,
+
+    /// Enumerate every subnet currently registered on the chain.
+    ///
+    /// Reads `SubnetInfoRuntimeApi::get_subnets_info` on the head block
+    /// and returns one row per subnet with id, owner ss58, current UID
+    /// count, slot cap, tempo, burn, emission, difficulty, and immunity
+    /// period. Rows are sorted ascending by netuid. Read-only; no
+    /// wallet, no signing, no extrinsic.
+    List,
 }
 
 #[derive(Subcommand, Debug)]
