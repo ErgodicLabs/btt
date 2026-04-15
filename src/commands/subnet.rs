@@ -458,24 +458,27 @@ fn parse_metagraph<C: Clone>(
 
     // ── per-UID parallel arrays ────────────────────────────────────
     //
-    // Each of these fields is a Vec of length num_uids. We walk each
-    // one into a Vec<T> of the right element type, then zip them by
-    // index into the final Vec<MetagraphUid>. If any of the arrays is
-    // shorter than num_uids (runtime version drift) we return a
-    // structured error rather than silently truncating.
-
-    // Per-UID parallel arrays. Three of these fields (`rank`, `trust`,
-    // and the unused-but-adjacent `pruning_score`) are sometimes
-    // returned as empty Vecs by `get_metagraph` even when `num_uids`
-    // is nonzero — observed on testnet netuid 1 (2026-04-15), where
-    // upstream returns 256-element Vecs for most per-UID fields but
-    // 0-element Vecs for `rank`, `trust`, and `pruning_score`. That
-    // is legitimate "not yet computed / storage not populated" state
-    // at the runtime API level, not a decoder bug. For those fields
-    // we backfill with `T::default()` to num_uids so the output
-    // parallel indexing stays valid. Any OTHER length mismatch (non-
-    // zero but != num_uids) IS treated as an error, because that
-    // indicates actual runtime-version drift worth reporting.
+    // Each field is a Vec of length num_uids. We walk each one into a
+    // Vec<T>, then zip them by index into the final Vec<MetagraphUid>.
+    //
+    // Two of these fields (`rank` and `trust`) are returned as empty
+    // Vecs by `get_metagraph` regardless of num_uids. Upstream
+    // (`pallets/subtensor/src/rpc_info/metagraph.rs`) hardcodes them
+    // to `Vec::new()` with a comment marking them "Deprecated: no
+    // longer computed" — the fields are kept in the struct for wire
+    // compatibility but the runtime no longer populates them. The
+    // adjacent `pruning_score` field is in the same state (also empty
+    // per the runtime API observation against testnet netuid 1 on
+    // 2026-04-15); btt does not currently surface `pruning_score`
+    // but uses the same decode path.
+    //
+    // `pad_or_check` handles this by backfilling with `T::default()`
+    // to num_uids for empty arrays, so the parallel-array indexing
+    // stays valid and the output contains zero placeholders which
+    // correctly represent the "deprecated, not computed" state. Any
+    // OTHER length mismatch (non-zero but != num_uids) IS treated as
+    // a hard error — that indicates actual runtime-version drift
+    // worth catching, not a deprecated-field no-op.
     let expected = num_uids as usize;
 
     let hotkeys = pad_or_check(walk_account_vec(mg, "hotkeys")?, expected, "hotkeys")?;
