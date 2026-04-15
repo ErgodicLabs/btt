@@ -88,6 +88,21 @@ pub enum SubnetAction {
         #[arg(long)]
         netuid: u16,
     },
+
+    /// Dump the full hyperparameter set of a given subnet.
+    ///
+    /// Reads `SubnetInfoRuntimeApi::get_subnet_hyperparams(netuid)` on
+    /// the head block and returns all 27 runtime hyperparameter fields
+    /// (rho, kappa, tempo, immunity_period, min/max_allowed_weights,
+    /// min/max_burn, min/max_difficulty, adjustment_alpha, commit-
+    /// reveal settings, liquid alpha, etc.). Read-only; no wallet,
+    /// no signing, no extrinsic. Exits with a structured error if
+    /// the netuid does not exist on chain.
+    Hyperparameters {
+        /// Subnet id to dump the hyperparameters for.
+        #[arg(long)]
+        netuid: u16,
+    },
 }
 
 #[derive(Subcommand, Debug)]

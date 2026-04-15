@@ -266,6 +266,11 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                         commands::subnet::metagraph(&endpoint, netuid).await?;
                     output::print_success(&result, pretty);
                 }
+                SubnetAction::Hyperparameters { netuid } => {
+                    let result =
+                        commands::subnet::hyperparameters(&endpoint, netuid).await?;
+                    output::print_success(&result, pretty);
+                }
             }
         }
         Command::Skill => {

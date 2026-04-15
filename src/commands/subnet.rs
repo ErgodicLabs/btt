@@ -1,12 +1,11 @@
-// Subnet commands. Phase 1 (issue #77) is read-only.
-//
-// Ships so far: `lock-cost` (PR #91), `list` (PR #92), `metagraph`
-// (this PR). Remaining phase-1 command: `hyperparameters --netuid
-// <N>`. All four call into `SubnetInfoRuntimeApi` / `SubnetRegistration
-// RuntimeApi` — pure runtime state queries, no extrinsics, no wallet
-// material, no trust-sensitive surface. Phase 2 of issue #77 is
-// reserved for write commands (`subnet register`, `subnet create`,
-// etc.) and will be its own issue + PRs.
+// Subnet commands. Phase 1 (issue #77) is read-only. All four
+// commands land now: `lock-cost` (PR #91), `list` (PR #92),
+// `metagraph` (PR #94), `hyperparameters` (this PR). They call into
+// `SubnetInfoRuntimeApi` / `SubnetRegistrationRuntimeApi` — pure
+// runtime state queries, no extrinsics, no wallet material, no
+// trust-sensitive surface. Phase 2 of issue #77 is reserved for
+// write commands (`subnet register`, `subnet create`, etc.) and will
+// be its own issue + PRs.
 
 use std::time::Duration;
 
@@ -568,6 +567,158 @@ fn decode_compact_u8_vec<C: Clone>(composite: &Value<C>, field: &str) -> Option<
         bytes.push(b as u8);
     }
     Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+// ── hyperparameters ────────────────────────────────────────────────
+
+/// Full subnet hyperparameter dump returned by `btt subnet hyperparameters --netuid <N>`.
+///
+/// This is the 27-field upstream `SubnetHyperparams` struct
+/// (`pallets/subtensor/src/rpc_info/subnet_info.rs`), surfaced
+/// one-for-one. Unlike `subnet list`, where we curate down from 18
+/// upstream fields to 9 display fields, a hyperparameters dump is
+/// inherently a full dump — users running this command want to see
+/// the complete runtime configuration of a subnet, not a tasteful
+/// subset. The one transformation we apply is stringifying balances
+/// (`min_burn`, `max_burn`) for JSON parser safety.
+#[derive(Serialize, Debug)]
+pub struct SubnetHyperparamsInfo {
+    pub netuid: u16,
+    pub rho: u16,
+    pub kappa: u16,
+    pub immunity_period: u16,
+    pub min_allowed_weights: u16,
+    pub max_weights_limit: u16,
+    pub tempo: u16,
+    pub min_difficulty: u64,
+    pub max_difficulty: u64,
+    pub weights_version: u64,
+    pub weights_rate_limit: u64,
+    pub adjustment_interval: u16,
+    pub activity_cutoff: u16,
+    pub registration_allowed: bool,
+    pub target_regs_per_interval: u16,
+    pub min_burn_rao: String,
+    pub max_burn_rao: String,
+    pub bonds_moving_avg: u64,
+    pub max_regs_per_block: u16,
+    pub serving_rate_limit: u64,
+    pub max_validators: u16,
+    pub adjustment_alpha: u64,
+    pub difficulty: u64,
+    pub commit_reveal_period: u64,
+    pub commit_reveal_weights_enabled: bool,
+    pub alpha_high: u16,
+    pub alpha_low: u16,
+    pub liquid_alpha_enabled: bool,
+    /// Block number at which the hyperparameters were queried.
+    pub at_block: u64,
+}
+
+/// Query the hyperparameters of a subnet via
+/// `SubnetInfoRuntimeApi::get_subnet_hyperparams(netuid)`. Returns
+/// `None` from the runtime if the netuid does not exist; btt
+/// translates that to a structured `QUERY_FAILED` error.
+pub async fn hyperparameters(
+    endpoint: &str,
+    netuid: u16,
+) -> Result<SubnetHyperparamsInfo, BttError> {
+    let api = rpc::connect(endpoint).await?;
+
+    let at_block = tokio::time::timeout(RPC_TIMEOUT, api.at_current_block())
+        .await
+        .map_err(|_| BttError::query("at_current_block() timed out"))?
+        .map_err(|e| BttError::query(format!("failed to resolve client at head: {e}")))?;
+
+    let block_number: u64 = at_block.block_number();
+
+    let call = subxt::dynamic::runtime_api_call::<Vec<SValue>, SValue>(
+        "SubnetInfoRuntimeApi",
+        "get_subnet_hyperparams",
+        vec![SValue::u128(netuid as u128)],
+    );
+
+    let value = tokio::time::timeout(RPC_TIMEOUT, at_block.runtime_apis().call(call))
+        .await
+        .map_err(|_| BttError::query("get_subnet_hyperparams timed out"))?
+        .map_err(|e| {
+            BttError::query(format!("get_subnet_hyperparams runtime call failed: {e}"))
+        })?;
+
+    // `Option<SubnetHyperparams>` — None means the netuid does not
+    // exist on chain. Peel the Option via .at(0).
+    let hp = value.at(0).ok_or_else(|| {
+        BttError::query(format!("netuid {netuid} not found on chain"))
+    })?;
+
+    parse_hyperparams(hp, netuid, block_number)
+}
+
+fn parse_hyperparams<C: Clone>(
+    hp: &Value<C>,
+    netuid: u16,
+    at_block: u64,
+) -> Result<SubnetHyperparamsInfo, BttError> {
+    // Upstream `SubnetHyperparams` does NOT carry a `netuid` field —
+    // the netuid is an argument to `get_subnet_hyperparams`, not part
+    // of the return shape. We echo it back in the output envelope
+    // anyway so the JSON is self-describing.
+    let u16_field = |name: &'static str| -> Result<u16, BttError> {
+        compact_u16(hp, name).ok_or_else(|| {
+            BttError::parse(format!("hyperparameters[netuid={netuid}]: missing {name}"))
+        })
+    };
+    let u64_field = |name: &'static str| -> Result<u64, BttError> {
+        compact_u64(hp, name).ok_or_else(|| {
+            BttError::parse(format!("hyperparameters[netuid={netuid}]: missing {name}"))
+        })
+    };
+    let u128_field = |name: &'static str| -> Result<u128, BttError> {
+        compact_u128(hp, name).ok_or_else(|| {
+            BttError::parse(format!("hyperparameters[netuid={netuid}]: missing {name}"))
+        })
+    };
+    let bool_field = |name: &'static str| -> Result<bool, BttError> {
+        hp.at(name)
+            .and_then(|v| v.as_bool())
+            .ok_or_else(|| {
+                BttError::parse(format!(
+                    "hyperparameters[netuid={netuid}]: missing or non-bool {name}"
+                ))
+            })
+    };
+
+    Ok(SubnetHyperparamsInfo {
+        netuid,
+        rho: u16_field("rho")?,
+        kappa: u16_field("kappa")?,
+        immunity_period: u16_field("immunity_period")?,
+        min_allowed_weights: u16_field("min_allowed_weights")?,
+        max_weights_limit: u16_field("max_weights_limit")?,
+        tempo: u16_field("tempo")?,
+        min_difficulty: u64_field("min_difficulty")?,
+        max_difficulty: u64_field("max_difficulty")?,
+        weights_version: u64_field("weights_version")?,
+        weights_rate_limit: u64_field("weights_rate_limit")?,
+        adjustment_interval: u16_field("adjustment_interval")?,
+        activity_cutoff: u16_field("activity_cutoff")?,
+        registration_allowed: bool_field("registration_allowed")?,
+        target_regs_per_interval: u16_field("target_regs_per_interval")?,
+        min_burn_rao: u128_field("min_burn")?.to_string(),
+        max_burn_rao: u128_field("max_burn")?.to_string(),
+        bonds_moving_avg: u64_field("bonds_moving_avg")?,
+        max_regs_per_block: u16_field("max_regs_per_block")?,
+        serving_rate_limit: u64_field("serving_rate_limit")?,
+        max_validators: u16_field("max_validators")?,
+        adjustment_alpha: u64_field("adjustment_alpha")?,
+        difficulty: u64_field("difficulty")?,
+        commit_reveal_period: u64_field("commit_reveal_period")?,
+        commit_reveal_weights_enabled: bool_field("commit_reveal_weights_enabled")?,
+        alpha_high: u16_field("alpha_high")?,
+        alpha_low: u16_field("alpha_low")?,
+        liquid_alpha_enabled: bool_field("liquid_alpha_enabled")?,
+        at_block,
+    })
 }
 
 // ── per-UID vec walkers ───────────────────────────────────────────
