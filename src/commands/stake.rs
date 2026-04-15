@@ -78,6 +78,7 @@ impl subxt::tx::Signer<PolkadotConfig> for Sr25519Signer {
 }
 
 use crate::commands::chain::parse_ss58;
+use crate::commands::dynamic_decode::{extract_account_id_field, value_to_u64};
 use crate::commands::wallet_keys::{
     decrypt_coldkey_interactive, rao_to_tao_string, resolve_coldkey_address, tao_to_rao,
     RAO_PER_TAO,
@@ -663,57 +664,10 @@ fn resolve_address(wallet: Option<&str>, ss58: Option<&str>) -> Result<String, B
     }
 }
 
-/// Extract a 32-byte AccountId from a named field of a struct-shaped Value.
-///
-/// The on-wire shape of `T::AccountId` (sp_core::crypto::AccountId32) under
-/// the dynamic decoder is a single-element tuple struct wrapping a [u8; 32].
-/// In scale-value that typically surfaces as a `Composite::Unnamed` of one
-/// element (the [u8; 32]), though defensively we also accept the case where
-/// the field is directly a 32-byte composite.
-fn extract_account_id_field<C: Clone>(entry: &Value<C>, field: &str) -> Option<[u8; 32]> {
-    let field_val = entry.at(field)?;
-    // Try: AccountId -> inner tuple (.0) -> [u8; 32]
-    if let Some(inner) = field_val.at(0) {
-        if let Some(bytes) = value_to_32_bytes(inner) {
-            return Some(bytes);
-        }
-    }
-    // Fallback: field is directly the byte array
-    value_to_32_bytes(field_val)
-}
-
-/// Try to coerce a Value into 32 bytes. Accepts both a sequence-of-u8
-/// composite (the subxt dynamic representation of `[u8; 32]`) and a
-/// scale-value Primitive::U256 / byte-like form.
-fn value_to_32_bytes<C: Clone>(value: &Value<C>) -> Option<[u8; 32]> {
-    let mut bytes = Vec::with_capacity(32);
-    let mut idx = 0usize;
-    while let Some(v) = value.at(idx) {
-        let b = value_to_u64(v)?;
-        if b > 255 {
-            return None;
-        }
-        bytes.push(b as u8);
-        idx += 1;
-        if bytes.len() > 32 {
-            return None;
-        }
-    }
-    if bytes.len() == 32 {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        Some(arr)
-    } else {
-        None
-    }
-}
-
-/// Coerce a scale-value primitive into a u64. Handles the u128 path
-/// (Compact-unwrapped numeric primitives surface as u128).
-fn value_to_u64<C>(value: &Value<C>) -> Option<u64> {
-    let as_u128 = value.as_u128()?;
-    u64::try_from(as_u128).ok()
-}
+// Decoder helpers (`extract_account_id_field`, `value_to_32_bytes`,
+// `value_to_u64`) moved to `crate::commands::dynamic_decode` in issue
+// #93. Imported at the top of this file alongside the other
+// `dynamic_decode::*` helpers.
 
 // ── U64F64 decoding ───────────────────────────────────────────────────────
 //
