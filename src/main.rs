@@ -6,6 +6,8 @@ mod error;
 mod output;
 mod rpc;
 
+use std::io::Write;
+
 use clap::Parser;
 use zeroize::Zeroizing;
 
@@ -146,6 +148,19 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                 use_hotkey,
                 password_file,
             } => {
+                // Issue #86: hotkeys are stored unencrypted on disk, so
+                // `--password-file` is a silent no-op when paired with
+                // `--use-hotkey`. Surface the no-op as a clear stderr
+                // warning so a CI script that passes a generic
+                // `--password-file` regardless of key type does not
+                // think the file is being consulted when it isn't.
+                // Respects `--quiet` via the is_quiet() check.
+                if let Some(msg) = sign_password_file_warning(use_hotkey, password_file.is_some())
+                {
+                    if !commands::paths::is_quiet() {
+                        let _ = writeln!(std::io::stderr(), "{msg}");
+                    }
+                }
                 let password = if use_hotkey {
                     None
                 } else {
@@ -285,4 +300,57 @@ async fn run(cli: Cli) -> Result<(), BttError> {
     }
 
     Ok(())
+}
+
+/// Decide whether `wallet sign` should emit the
+/// "--password-file is ignored with --use-hotkey" warning, and if so,
+/// return the exact message text. Extracted as a pure function so the
+/// decision is unit-testable without touching stderr or the process-
+/// wide `--quiet` state.
+///
+/// The caller (`main::run`) applies the `!is_quiet()` gate around the
+/// actual stderr write; this function only answers "should a warning
+/// fire given the two relevant flags?".
+fn sign_password_file_warning(use_hotkey: bool, password_file_present: bool) -> Option<&'static str> {
+    if use_hotkey && password_file_present {
+        Some(
+            "btt: warning: --password-file is ignored with --use-hotkey \
+             (hotkeys are unencrypted)",
+        )
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Issue #86: assert the warning decision is correct for all four
+    // combinations of (use_hotkey, password_file_present). The pure
+    // function returns Some(msg) for exactly the (true, true) case.
+
+    #[test]
+    fn sign_warning_fires_for_hotkey_and_password_file() {
+        let msg = sign_password_file_warning(true, true)
+            .expect("warning must fire when both --use-hotkey and --password-file are set");
+        assert!(msg.contains("--password-file is ignored"));
+        assert!(msg.contains("--use-hotkey"));
+        assert!(msg.contains("unencrypted"));
+    }
+
+    #[test]
+    fn sign_warning_does_not_fire_for_use_hotkey_alone() {
+        assert!(sign_password_file_warning(true, false).is_none());
+    }
+
+    #[test]
+    fn sign_warning_does_not_fire_for_password_file_alone() {
+        assert!(sign_password_file_warning(false, true).is_none());
+    }
+
+    #[test]
+    fn sign_warning_does_not_fire_for_neither() {
+        assert!(sign_password_file_warning(false, false).is_none());
+    }
 }
