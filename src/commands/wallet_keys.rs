@@ -459,11 +459,13 @@ fn guard_overwrite(path: &Path, label: &str, force: bool) -> Result<(), BttError
             path.display()
         )));
     }
-    let _ = writeln!(
-        std::io::stderr(),
-        "btt: --force: destroying existing {label} at {}",
-        path.display()
-    );
+    if !crate::commands::paths::is_quiet() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "btt: --force: destroying existing {label} at {}",
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -509,19 +511,21 @@ fn guard_create_overwrite(
             path.display()
         )));
     }
-    if cold_exists {
-        let _ = writeln!(
-            std::io::stderr(),
-            "btt: --force: destroying existing coldkey at {}",
-            coldkey_path.display()
-        );
-    }
-    if hot_exists {
-        let _ = writeln!(
-            std::io::stderr(),
-            "btt: --force: destroying existing hotkey at {}",
-            hotkey_path.display()
-        );
+    if !crate::commands::paths::is_quiet() {
+        if cold_exists {
+            let _ = writeln!(
+                std::io::stderr(),
+                "btt: --force: destroying existing coldkey at {}",
+                coldkey_path.display()
+            );
+        }
+        if hot_exists {
+            let _ = writeln!(
+                std::io::stderr(),
+                "btt: --force: destroying existing hotkey at {}",
+                hotkey_path.display()
+            );
+        }
     }
     Ok(())
 }
