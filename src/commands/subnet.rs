@@ -1,4 +1,4 @@
-// Subnet commands. Phase 1 (issue #77) is read-only only: `lock_cost`
+// Subnet commands. Phase 1 (issue #77) is read-only: `lock-cost`
 // ships in this PR as the first command; `list`, `metagraph`, and
 // `hyperparameters` land in follow-ups.
 //
@@ -18,9 +18,9 @@ use crate::rpc;
 
 const RPC_TIMEOUT: Duration = rpc::RPC_TIMEOUT;
 
-// ── lock_cost ────────────────────────────────────────────────────────────
+// ── lock-cost ────────────────────────────────────────────────────────────
 
-/// Result shape for `btt subnet lock_cost`.
+/// Result shape for `btt subnet lock-cost`.
 ///
 /// The TAO cost of creating a new subnet is computed inside the
 /// subtensor runtime (see `SubtensorModule::get_network_lock_cost` in
