@@ -257,6 +257,10 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                     let info = commands::subnet::lock_cost(&endpoint).await?;
                     output::print_success(&info, pretty);
                 }
+                SubnetAction::List => {
+                    let result = commands::subnet::list(&endpoint).await?;
+                    output::print_success(&result, pretty);
+                }
             }
         }
         Command::Skill => {
