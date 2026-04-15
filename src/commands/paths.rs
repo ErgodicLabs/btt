@@ -240,22 +240,48 @@ fn warn_legacy(legacy: &Path, new: &Path) {
 
 /// Resolve the per-user btt config directory.
 ///
-/// Returns the OS-native location in the common case. If that location does
-/// not yet exist on disk but the legacy `$HOME/.bittensor` directory does,
-/// returns the legacy path and emits a one-time migration warning on stderr.
+/// Decision tree:
 ///
-/// The returned path is not guaranteed to exist — callers that need it to
-/// exist should create it themselves (with appropriate permissions).
+/// 1. **Native path exists on disk** → use it unconditionally. The user
+///    has either migrated or started fresh on the new layout.
+///
+/// 2. **Caller explicitly set `XDG_CONFIG_HOME`** (on linux / BSDs) →
+///    honor it and return the native path even if it does not yet
+///    exist on disk. Skip the legacy `$HOME/.bittensor` fallback in
+///    this branch. See issue #90: automation callers — CI scripts,
+///    test harnesses, tmpfs-scoped invocations from subagents —
+///    explicitly set `XDG_CONFIG_HOME` to isolate from the user's
+///    real wallet directory. A "sticky" legacy fallback that ignores
+///    that explicit intent defeats test isolation and can leak
+///    wallet material into `~/.bittensor/wallets/` on a fresh run.
+///
+/// 3. **Legacy `$HOME/.bittensor` exists** (and the caller did NOT
+///    override XDG) → use it, emit a one-time migration warning. This
+///    is the unchanged behavior for users upgrading from btcli-era
+///    wallets who have not touched XDG_CONFIG_HOME.
+///
+/// 4. **Neither native nor legacy path exists** → return the native
+///    path. The caller will create it on first write.
+///
+/// The returned path is not guaranteed to exist — callers that need
+/// it to exist should create it themselves with appropriate
+/// permissions.
 pub fn config_dir() -> Result<PathBuf, BttError> {
     let native = native_config_dir()?;
 
-    // If the native path already exists, use it unconditionally. The user
-    // has either migrated or started fresh on the new layout.
+    // Case 1: native path already exists — use it.
     if native.exists() {
         return Ok(native);
     }
 
-    // Native path does not exist. Check for the legacy location.
+    // Case 2: caller explicitly set XDG_CONFIG_HOME to a non-empty
+    // value. Trust the override even if the subdirectory does not
+    // yet exist. Skip the legacy fallback entirely.
+    if xdg_explicitly_set() {
+        return Ok(native);
+    }
+
+    // Case 3: check legacy location.
     if let Some(legacy) = legacy_dir()? {
         if legacy.exists() {
             warn_legacy(&legacy, &native);
@@ -263,9 +289,24 @@ pub fn config_dir() -> Result<PathBuf, BttError> {
         }
     }
 
-    // Neither exists. Return the native location — the caller will create
-    // it on first write.
+    // Case 4: neither exists. Return the native location — the caller
+    // will create it on first write.
     Ok(native)
+}
+
+/// Return `true` iff `XDG_CONFIG_HOME` is set in the process
+/// environment to a non-empty value. Used by `config_dir()` to
+/// decide whether to honor the caller's explicit override. On
+/// non-linux targets `native_config_dir()` does not consult XDG,
+/// so this predicate is checked anyway for symmetry and is a
+/// no-op in the common case (native_config_dir for macOS/Windows
+/// returns a path that does not end up being affected by the XDG
+/// override branch in practice).
+fn xdg_explicitly_set() -> bool {
+    read_env_var("XDG_CONFIG_HOME")
+        .ok()
+        .flatten()
+        .is_some_and(|s| !s.is_empty())
 }
 
 /// Root directory for wallet storage: `<config_dir>/wallets/`.
@@ -805,7 +846,11 @@ mod tests {
     #[test]
     fn legacy_fallback_when_only_old_dir_exists() {
         // Pin the ENV lock *and* build in a tempdir so we don't step on
-        // real wallets.
+        // real wallets. XDG must be UNSET here — see issue #90: an
+        // explicit XDG override now skips the legacy fallback. This
+        // test covers the "upgrading-from-btcli-era, no env overrides"
+        // path: legacy exists, user has not touched XDG_CONFIG_HOME,
+        // config_dir() must return the legacy path.
         let _guard = ENV_LOCK.lock().expect("env lock");
         let _restore = EnvGuard::capture();
         let tmp = std::env::temp_dir().join(format!("btt-legacy-{}", std::process::id()));
@@ -815,13 +860,89 @@ mod tests {
         std::fs::create_dir_all(&legacy).expect("mkdir legacy");
 
         std::env::set_var("HOME", tmp.to_str().expect("tmp str"));
-        std::env::set_var(
-            "XDG_CONFIG_HOME",
-            tmp.join(".config").to_str().expect("xdg str"),
-        );
+        std::env::remove_var("XDG_CONFIG_HOME");
 
         let resolved = config_dir().expect("resolve");
-        assert_eq!(resolved, legacy);
+        assert_eq!(
+            resolved, legacy,
+            "with no XDG override and legacy dir present, fall back to legacy"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn xdg_override_skips_legacy_fallback_when_legacy_exists() {
+        // Issue #90: an explicit `XDG_CONFIG_HOME` override must NOT
+        // be ignored when the legacy `$HOME/.bittensor` dir happens
+        // to exist. Automation callers (CI, test harnesses, tmpfs-
+        // scoped subagent invocations) set XDG explicitly to isolate
+        // from the user's real wallet directory. The pre-#90 logic
+        // silently redirected to legacy and leaked wallet material
+        // into `~/.bittensor/wallets/`.
+        //
+        // Repro mirror: set HOME so legacy dir resolves under tmp,
+        // create the legacy dir, set XDG to a fresh empty path where
+        // `btt/` does not yet exist, call config_dir() — must return
+        // the XDG-rooted native path, NOT the legacy path.
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _restore = EnvGuard::capture();
+        let tmp = std::env::temp_dir().join(format!("btt-xdg-override-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+        let legacy = tmp.join(".bittensor");
+        std::fs::create_dir_all(&legacy).expect("mkdir legacy");
+
+        // Fresh empty XDG root. NOTE: we do NOT create `xdg/btt`;
+        // the fix must honor the override even though the target
+        // subdirectory does not exist.
+        let xdg = tmp.join("xdg-fresh");
+        std::fs::create_dir_all(&xdg).expect("mkdir xdg");
+
+        std::env::set_var("HOME", tmp.to_str().expect("tmp str"));
+        std::env::set_var("XDG_CONFIG_HOME", xdg.to_str().expect("xdg str"));
+
+        let resolved = config_dir().expect("resolve");
+        let expected_native = xdg.join("btt");
+        assert_eq!(
+            resolved, expected_native,
+            "explicit XDG override must be honored even when legacy dir exists"
+        );
+        assert_ne!(
+            resolved, legacy,
+            "explicit XDG override must NOT silently redirect to legacy"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_xdg_treated_as_unset_allows_legacy_fallback() {
+        // Defensive edge case: `XDG_CONFIG_HOME=""` is treated as
+        // "not set" by `native_config_dir()` per POSIX convention,
+        // and the new `xdg_explicitly_set()` predicate mirrors that
+        // by requiring non-empty. So an empty XDG_CONFIG_HOME must
+        // STILL allow the legacy fallback to fire when legacy
+        // exists — otherwise a user accidentally exporting an
+        // empty XDG would lose access to their btcli-era wallets.
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _restore = EnvGuard::capture();
+        let tmp = std::env::temp_dir().join(format!("btt-xdg-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+        let legacy = tmp.join(".bittensor");
+        std::fs::create_dir_all(&legacy).expect("mkdir legacy");
+
+        std::env::set_var("HOME", tmp.to_str().expect("tmp str"));
+        std::env::set_var("XDG_CONFIG_HOME", "");
+
+        let resolved = config_dir().expect("resolve");
+        assert_eq!(
+            resolved, legacy,
+            "empty XDG must be treated as unset, legacy fallback still fires"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
