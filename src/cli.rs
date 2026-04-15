@@ -210,10 +210,12 @@ pub enum WalletAction {
         /// Wallet name
         #[arg(long)]
         name: String,
-        /// BIP39 mnemonic phrase
-        #[arg(long)]
+        /// BIP39 mnemonic phrase. Mutually exclusive with `--seed`; exactly
+        /// one of the two must be provided.
+        #[arg(long, conflicts_with = "seed")]
         mnemonic: Option<String>,
-        /// Hex-encoded seed (0x...)
+        /// Hex-encoded seed (0x...). Mutually exclusive with `--mnemonic`;
+        /// exactly one of the two must be provided.
         #[arg(long)]
         seed: Option<String>,
         /// Read coldkey password from file at <path>. For non-interactive
@@ -242,10 +244,12 @@ pub enum WalletAction {
         /// Hotkey name
         #[arg(long, default_value = "default")]
         hotkey: String,
-        /// BIP39 mnemonic phrase
-        #[arg(long)]
+        /// BIP39 mnemonic phrase. Mutually exclusive with `--seed`; exactly
+        /// one of the two must be provided.
+        #[arg(long, conflicts_with = "seed")]
         mnemonic: Option<String>,
-        /// Hex-encoded seed (0x...)
+        /// Hex-encoded seed (0x...). Mutually exclusive with `--mnemonic`;
+        /// exactly one of the two must be provided.
         #[arg(long)]
         seed: Option<String>,
         /// Overwrite an existing hotkey file if one is present. Without
