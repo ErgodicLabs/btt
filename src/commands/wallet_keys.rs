@@ -1347,6 +1347,15 @@ fn generate_keypair(_n_words: u32) -> Result<(Pair, String, [u8; 32]), BttError>
 }
 
 /// Recover a keypair from either a mnemonic phrase or a hex seed.
+///
+/// `--mnemonic` and `--seed` are mutually exclusive at the clap parse
+/// layer (see `src/cli.rs` — `mnemonic` carries `conflicts_with =
+/// "seed"` on both `RegenColdkey` and `RegenHotkey`), so the
+/// `(Some, Some)` case is unreachable from the public CLI and is
+/// asserted via `unreachable!` here for defense-in-depth against
+/// future direct callers. The `(None, None)` case is still reachable
+/// — clap does not require at least one of the two, so we still
+/// return a structured error naming both flags.
 fn recover_keypair(
     mnemonic: Option<&str>,
     seed_hex: Option<&str>,
@@ -1371,9 +1380,18 @@ fn recover_keypair(
             let pair = Pair::from_seed(&seed);
             Ok((pair, String::new(), seed))
         }
-        (Some(_), Some(_)) => Err(BttError::invalid_input(
-            "provide either --mnemonic or --seed, not both",
-        )),
+        (Some(_), Some(_)) => {
+            // Clap's `conflicts_with = "seed"` on the `--mnemonic`
+            // arg rejects this at parse time for both regen
+            // subcommands. If we ever land here it means either a
+            // direct test-only caller bypassed clap, or the
+            // conflicts_with attribute was removed — either way
+            // it's a bug worth panicking on, not a silent accept.
+            unreachable!(
+                "recover_keypair called with both mnemonic and seed — \
+                 clap conflicts_with should have rejected this at parse"
+            )
+        }
         (None, None) => Err(BttError::invalid_input(
             "provide either --mnemonic or --seed",
         )),
