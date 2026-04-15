@@ -166,32 +166,6 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                 let result = commands::wallet_keys::verify(&message, &signature, &ss58)?;
                 output::print_success(&result, pretty);
             }
-            WalletAction::Faucet {
-                name,
-                password_file,
-                num_processes,
-                update_interval,
-            } => {
-                // Faucet is network-bound: it signs and submits an
-                // extrinsic. Resolve the endpoint from the global flags
-                // the same way the stake and chain commands do.
-                let endpoint = rpc::resolve_endpoint(
-                    cli.url.as_deref(),
-                    cli.network.as_deref(),
-                )?;
-                let password = resolve_coldkey_password(password_file.as_deref())?;
-                let result = commands::wallet_faucet::run(
-                    commands::wallet_faucet::FaucetParams {
-                        endpoint: &endpoint,
-                        wallet: &name,
-                        password: password.as_str(),
-                        num_processes,
-                        update_interval,
-                    },
-                )
-                .await?;
-                output::print_success(&result, pretty);
-            }
             WalletAction::Cleanup {
                 dry_run,
                 wallet,
