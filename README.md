@@ -8,26 +8,152 @@ Minimal, secure Bittensor CLI. Static Rust binary, zero PyPI surface.
 cargo build --release
 ```
 
+## Output format
+
+btt emits structured JSON to stdout by default. Every successful response
+is shaped `{"ok": true, "data": {...}}` and every error is shaped
+`{"ok": false, "error": {"code": "...", "message": "..."}}`. Scripts can
+rely on `ok` as the first-line discriminator without parsing prose.
+
+Pass `--pretty` for indented, human-readable JSON. Pass `--quiet` to
+suppress non-essential stderr chatter (warnings, progress lines) while
+keeping the stdout JSON envelope intact.
+
+## Global options
+
+These flags apply to every subcommand and may be passed either before or
+after the command path:
+
+| Flag                  | Meaning                                                     |
+| --------------------- | ----------------------------------------------------------- |
+| `--url <URL>`         | Explicit RPC endpoint URL. Overrides `--network`.           |
+| `--network <NETWORK>` | Network shorthand: `finney` (mainnet), `test` (testnet), `local` (local dev node). |
+| `--pretty`            | Human-readable (indented) JSON instead of single-line JSON. |
+| `--quiet`             | Suppress non-essential stderr output.                       |
+
+If neither `--url` nor `--network` is given, btt falls back to its
+built-in default (finney).
+
 ## Usage
+
+| Command                  | What it does                                                     |
+| ------------------------ | ---------------------------------------------------------------- |
+| `chain info`             | Display chain name, runtime version, and current block number.  |
+| `chain balance <ss58>`   | Query the free TAO balance for an SS58 address.                 |
+| `wallet list`            | List wallets in the btt config directory.                        |
+| `wallet create`          | Create a new wallet (coldkey + hotkey pair) and print mnemonic.  |
+| `wallet new-coldkey`     | Generate a new coldkey only.                                     |
+| `wallet new-hotkey`      | Generate a new hotkey under an existing wallet.                  |
+| `wallet regen-coldkey`   | Restore a coldkey from mnemonic or seed.                         |
+| `wallet regen-hotkey`    | Restore a hotkey from mnemonic or seed.                          |
+| `wallet sign`            | Sign a message with the wallet's coldkey (or hotkey).            |
+| `wallet verify`          | Verify a signature against an SS58 address.                      |
+| `wallet cleanup`         | Reap stale staging/backup/lock artefacts from crashed runs.      |
+| `stake list`             | List all stakes held by a wallet or SS58 address.                |
+| `stake add`              | Stake TAO from a coldkey to a hotkey on a subnet.                |
+| `stake remove`           | Unstake alpha from a hotkey back to the coldkey on a subnet.     |
+| `skill`                  | Emit SKILL.md for AI agent integration.                          |
+
+### Chain
 
 ```bash
 # Chain info
 btt chain info
 
-# Query balance
+# Query free balance for an SS58 address
 btt chain balance <ss58_address>
+```
 
+### Wallet
+
+```bash
 # List local wallets
 btt wallet list
 
-# Reap stale staging/backup/lock artefacts from crashed wallet create runs
-btt wallet cleanup [--dry-run] [--wallet <name>] [--older-than 7d]
+# Create a new wallet (coldkey + hotkey). Prints the coldkey mnemonic.
+btt wallet create --name alice [--hotkey default] [--n-words 12|24] \
+                  [--password-file <path>] [--force]
 
+# Generate a new coldkey only.
+btt wallet new-coldkey --name alice [--n-words 12|24] \
+                       [--password-file <path>] [--force]
+
+# Generate a new hotkey under an existing wallet.
+btt wallet new-hotkey --name alice [--hotkey validator] \
+                      [--n-words 12|24] [--force]
+
+# Restore a coldkey from mnemonic or seed (exactly one of --mnemonic / --seed).
+btt wallet regen-coldkey --name alice \
+    --mnemonic "word1 word2 ... word12" \
+    [--password-file <path>] [--force]
+btt wallet regen-coldkey --name alice --seed 0x<hex> \
+    [--password-file <path>] [--force]
+
+# Restore a hotkey from mnemonic or seed (exactly one of --mnemonic / --seed).
+btt wallet regen-hotkey --name alice [--hotkey default] \
+    --mnemonic "word1 word2 ... word12" [--force]
+btt wallet regen-hotkey --name alice [--hotkey default] \
+    --seed 0x<hex> [--force]
+
+# Sign a message with the wallet's coldkey (default).
+btt wallet sign --name alice --message "hello" [--password-file <path>]
+
+# Sign a message with the hotkey instead of the coldkey.
+btt wallet sign --name alice --hotkey default --message "hello" --use-hotkey
+
+# Verify a signature against an SS58 address.
+btt wallet verify --ss58 <ss58_address> --message "hello" --signature 0x<hex>
+
+# Reap stale staging/backup/lock artefacts from crashed wallet create runs.
+btt wallet cleanup [--dry-run] [--wallet <name>] [--older-than 7d]
+```
+
+`wallet create`, `wallet new-coldkey`, and `wallet new-hotkey` all print
+the generated mnemonic as part of the JSON response envelope. Treat the
+output as secret material: do not run these in a shared terminal, and do
+not redirect stdout to a file you will forget about. The mnemonic is the
+only way to recover the key if the encrypted wallet file is lost or the
+password is forgotten. (Note: as of this writing only the coldkey
+mnemonic is surfaced on `wallet create`; the hotkey mnemonic is written
+silently to disk. Issue #78 tracks promoting it into the response.)
+
+### Stake
+
+```bash
+# List all stakes held by a wallet (reads coldkeypub.txt for the SS58).
+btt stake list --wallet alice
+
+# Same, but query by SS58 address directly.
+btt stake list --ss58 <ss58_address>
+
+# Stake TAO from a coldkey to a hotkey on a subnet.
+# --hotkey takes the hotkey's SS58 address, not a wallet hotkey name.
+btt stake add --wallet alice --hotkey <hotkey_ss58> \
+              --netuid <n> --amount <tao>
+
+# Unstake alpha back to the coldkey. Pick exactly one denomination:
+#   --amount-alpha <n>  submit n alpha directly
+#   --amount-tao   <n>  ask to unstake ~n TAO worth; btt converts via the
+#                       subnet pool spot price at the head block
+#   --all               unstake the full current alpha balance
+btt stake remove --wallet alice --hotkey <hotkey_ss58> \
+                 --netuid <n> --amount-alpha <n>
+btt stake remove --wallet alice --hotkey <hotkey_ss58> \
+                 --netuid <n> --amount-tao <n>
+btt stake remove --wallet alice --hotkey <hotkey_ss58> \
+                 --netuid <n> --all
+```
+
+Since dTAO, 1 alpha is not 1 TAO on any non-root subnet. `stake remove`
+is deliberately explicit about the denomination to avoid silent slippage
+on the submitted extrinsic.
+
+### Skill
+
+```bash
 # Emit SKILL.md for AI agent integration
 btt skill
 ```
-
-All commands output JSON to stdout. Use `--pretty` for human-readable formatting.
 
 ## Config and wallet directory
 
