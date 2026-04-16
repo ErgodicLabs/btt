@@ -439,6 +439,23 @@ pub enum WalletAction {
         ss58: String,
     },
 
+    /// Replace a hotkey associated with this wallet's coldkey.
+    ///
+    /// Submits a `SubtensorModule::swap_hotkey` extrinsic. Coldkey-
+    /// signing. The old hotkey's registrations, stakes, and weights
+    /// transfer to the new hotkey.
+    SwapHotkey {
+        /// Wallet name (coldkey used for signing)
+        #[arg(long)]
+        name: String,
+        /// SS58 address of the old hotkey to replace
+        #[arg(long)]
+        old_hotkey: String,
+        /// SS58 address of the new hotkey to install
+        #[arg(long)]
+        new_hotkey: String,
+    },
+
     /// Query on-chain identity for an SS58 address.
     ///
     /// Reads `SubtensorModule::Identities` storage map. Returns name,
