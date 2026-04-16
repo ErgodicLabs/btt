@@ -675,6 +675,64 @@ pub enum StakeAction {
         #[arg(long)]
         amount: f64,
     },
+
+    /// Set child hotkey delegation on a subnet. Hotkey-signing.
+    ChildSet {
+        /// Wallet name
+        #[arg(long)]
+        name: String,
+        /// Parent hotkey name
+        #[arg(long, default_value = "default")]
+        hotkey: String,
+        /// SS58 address of the child hotkey
+        #[arg(long)]
+        child: String,
+        /// Subnet ID
+        #[arg(long)]
+        netuid: u16,
+        /// Proportion of stake weight to delegate (0 to u64::MAX)
+        #[arg(long)]
+        proportion: u64,
+    },
+
+    /// Query child hotkeys for a parent. Read-only.
+    ChildGet {
+        /// SS58 address of the parent hotkey
+        #[arg(long)]
+        hotkey: String,
+        /// Subnet ID
+        #[arg(long)]
+        netuid: u16,
+    },
+
+    /// Revoke all child delegations on a subnet. Hotkey-signing.
+    ChildRevoke {
+        /// Wallet name
+        #[arg(long)]
+        name: String,
+        /// Parent hotkey name
+        #[arg(long, default_value = "default")]
+        hotkey: String,
+        /// Subnet ID
+        #[arg(long)]
+        netuid: u16,
+    },
+
+    /// Set the childkey take rate. Hotkey-signing.
+    ChildTake {
+        /// Wallet name
+        #[arg(long)]
+        name: String,
+        /// Hotkey name
+        #[arg(long, default_value = "default")]
+        hotkey: String,
+        /// Subnet ID
+        #[arg(long)]
+        netuid: u16,
+        /// Take rate (0 to 65535, representing 0% to 100%)
+        #[arg(long)]
+        take: u16,
+    },
 }
 
 #[cfg(test)]

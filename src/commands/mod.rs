@@ -1,5 +1,6 @@
 pub mod axon;
 pub mod chain;
+pub mod child_hotkey;
 pub mod dynamic_decode;
 pub mod identity;
 pub mod password_file;
