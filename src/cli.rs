@@ -94,6 +94,12 @@ pub enum Command {
         action: SubnetAction,
     },
 
+    /// Axon endpoint advertising for miners and validators
+    Axon {
+        #[command(subcommand)]
+        action: AxonAction,
+    },
+
     /// Utility commands (unit conversion, latency test)
     Utils {
         #[command(subcommand)]
@@ -125,6 +131,58 @@ pub enum UtilsAction {
     /// the round-trip time in milliseconds. Uses the same connection
     /// path as all other btt commands.
     Latency,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AxonAction {
+    /// Advertise the axon endpoint (IP, port) for a hotkey on a subnet.
+    ///
+    /// Submits a `SubtensorModule::serve_axon` extrinsic. Hotkey-signing
+    /// (lower risk than coldkey). Other nodes use this endpoint to
+    /// discover and connect to the miner or validator.
+    Set {
+        /// Wallet name
+        #[arg(long)]
+        name: String,
+        /// Hotkey name
+        #[arg(long, default_value = "default")]
+        hotkey: String,
+        /// Subnet id
+        #[arg(long)]
+        netuid: u16,
+        /// IP address (IPv4 or IPv6)
+        #[arg(long)]
+        ip: String,
+        /// Port number
+        #[arg(long)]
+        port: u16,
+        /// IP type (4 or 6). Auto-detected from the IP address if 0.
+        #[arg(long, default_value_t = 0)]
+        ip_type: u8,
+        /// Protocol identifier
+        #[arg(long, default_value_t = 4)]
+        protocol: u8,
+        /// Axon version
+        #[arg(long, default_value_t = 0)]
+        version: u32,
+    },
+
+    /// Clear the axon endpoint for a hotkey on a subnet. Hotkey-signing.
+    ///
+    /// Submits `SubtensorModule::serve_axon` with zeroed IP, port,
+    /// protocol, and version fields, effectively de-advertising the
+    /// endpoint.
+    Reset {
+        /// Wallet name
+        #[arg(long)]
+        name: String,
+        /// Hotkey name
+        #[arg(long, default_value = "default")]
+        hotkey: String,
+        /// Subnet id
+        #[arg(long)]
+        netuid: u16,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -174,6 +232,26 @@ pub enum SubnetAction {
     /// the netuid does not exist on chain.
     Hyperparameters {
         /// Subnet id to dump the hyperparameters for.
+        #[arg(long)]
+        netuid: u16,
+    },
+
+    /// Register a hotkey on a subnet by paying the burn cost.
+    ///
+    /// Submits a `SubtensorModule::burned_register` extrinsic. Coldkey-
+    /// signing. The burn cost varies per subnet and changes between
+    /// blocks — query it first with `btt subnet lock-cost` (note: that
+    /// command shows the subnet *creation* cost; the per-UID burn cost
+    /// is a different storage value that this command will display
+    /// before prompting for confirmation in a future iteration).
+    Register {
+        /// Wallet name (coldkey used for signing and paying the burn)
+        #[arg(long)]
+        name: String,
+        /// SS58 address of the hotkey to register
+        #[arg(long)]
+        hotkey: String,
+        /// Subnet id to register on
         #[arg(long)]
         netuid: u16,
     },
@@ -396,6 +474,60 @@ pub enum WalletAction {
         ss58: String,
     },
 
+    /// Replace a hotkey associated with this wallet's coldkey.
+    ///
+    /// Submits a `SubtensorModule::swap_hotkey` extrinsic. Coldkey-
+    /// signing. The old hotkey's registrations, stakes, and weights
+    /// transfer to the new hotkey.
+    SwapHotkey {
+        /// Wallet name (coldkey used for signing)
+        #[arg(long)]
+        name: String,
+        /// SS58 address of the old hotkey to replace
+        #[arg(long)]
+        old_hotkey: String,
+        /// SS58 address of the new hotkey to install
+        #[arg(long)]
+        new_hotkey: String,
+    },
+
+    /// Announce intent to swap this wallet's coldkey. Coldkey-signing.
+    /// Starts a 5-day (7200 block) waiting period before execution.
+    SwapColdkeyAnnounce {
+        /// Wallet name (current coldkey, used for signing)
+        #[arg(long)]
+        name: String,
+        /// SS58 address of the new coldkey to swap to
+        #[arg(long)]
+        new_coldkey: String,
+    },
+
+    /// Execute a previously announced coldkey swap. Coldkey-signing.
+    /// Only succeeds after the 5-day waiting period has elapsed.
+    SwapColdkeyExecute {
+        /// Wallet name (current coldkey, used for signing)
+        #[arg(long)]
+        name: String,
+    },
+
+    /// Cancel a pending coldkey swap announcement. Coldkey-signing.
+    SwapColdkeyClear {
+        /// Wallet name (current coldkey, used for signing)
+        #[arg(long)]
+        name: String,
+    },
+
+    /// Dispute another account's pending coldkey swap. Coldkey-signing.
+    /// Requires governance authority (senate membership).
+    SwapColdkeyDispute {
+        /// Wallet name (disputer's coldkey, used for signing)
+        #[arg(long)]
+        name: String,
+        /// SS58 address of the coldkey whose swap is being disputed
+        #[arg(long)]
+        target: String,
+    },
+
     /// Query on-chain identity for an SS58 address.
     ///
     /// Reads `SubtensorModule::Identities` storage map. Returns name,
@@ -541,6 +673,150 @@ pub enum StakeAction {
         /// Conflicts with --amount-alpha and --amount-tao.
         #[arg(long, default_value_t = false)]
         all: bool,
+    },
+
+    /// Move stake from one hotkey/subnet to another without unstake+restake.
+    ///
+    /// Submits a `SubtensorModule::move_stake` extrinsic. Coldkey-signing.
+    /// Avoids the slippage of separate unstake+restake on the dTAO AMM.
+    /// The amount is specified in TAO and converted to alpha-rao
+    /// internally.
+    Move {
+        /// Wallet name (coldkey will be decrypted for signing)
+        #[arg(long)]
+        wallet: String,
+        /// SS58 address of the origin hotkey
+        #[arg(long)]
+        origin_hotkey: String,
+        /// SS58 address of the destination hotkey
+        #[arg(long)]
+        destination_hotkey: String,
+        /// Origin subnet ID
+        #[arg(long)]
+        origin_netuid: u16,
+        /// Destination subnet ID
+        #[arg(long)]
+        destination_netuid: u16,
+        /// Amount in TAO to move
+        #[arg(long)]
+        amount: f64,
+    },
+
+    /// Transfer staked alpha to a different coldkey without unstaking.
+    ///
+    /// Submits `SubtensorModule::transfer_stake`. Coldkey-signing.
+    /// The recipient coldkey receives the alpha stake on the specified
+    /// hotkey and subnet.
+    Transfer {
+        /// Wallet name (coldkey used for signing)
+        #[arg(long)]
+        wallet: String,
+        /// SS58 address of the destination coldkey
+        #[arg(long)]
+        dest_coldkey: String,
+        /// Hotkey SS58 address
+        #[arg(long)]
+        hotkey: String,
+        /// Subnet ID
+        #[arg(long)]
+        netuid: u16,
+        /// Amount in TAO
+        #[arg(long)]
+        amount: f64,
+    },
+
+    /// Swap alpha between two subnets via the dTAO AMM.
+    ///
+    /// Submits `SubtensorModule::swap_stake`. Coldkey-signing. Sells
+    /// alpha on the origin subnet and buys alpha on the destination
+    /// subnet through the pool. Slippage applies.
+    Swap {
+        /// Wallet name (coldkey used for signing)
+        #[arg(long)]
+        wallet: String,
+        /// Hotkey SS58 address
+        #[arg(long)]
+        hotkey: String,
+        /// Origin subnet ID (selling alpha)
+        #[arg(long)]
+        origin_netuid: u16,
+        /// Destination subnet ID (buying alpha)
+        #[arg(long)]
+        destination_netuid: u16,
+        /// Amount in TAO
+        #[arg(long)]
+        amount: f64,
+    },
+
+    /// Set child hotkey delegation on a subnet. Hotkey-signing.
+    ChildSet {
+        /// Wallet name
+        #[arg(long)]
+        name: String,
+        /// Parent hotkey name
+        #[arg(long, default_value = "default")]
+        hotkey: String,
+        /// SS58 address of the child hotkey
+        #[arg(long)]
+        child: String,
+        /// Subnet ID
+        #[arg(long)]
+        netuid: u16,
+        /// Proportion of stake weight to delegate (0 to u64::MAX)
+        #[arg(long)]
+        proportion: u64,
+    },
+
+    /// Query child hotkeys for a parent. Read-only.
+    ChildGet {
+        /// SS58 address of the parent hotkey
+        #[arg(long)]
+        hotkey: String,
+        /// Subnet ID
+        #[arg(long)]
+        netuid: u16,
+    },
+
+    /// Revoke all child delegations on a subnet. Hotkey-signing.
+    ChildRevoke {
+        /// Wallet name
+        #[arg(long)]
+        name: String,
+        /// Parent hotkey name
+        #[arg(long, default_value = "default")]
+        hotkey: String,
+        /// Subnet ID
+        #[arg(long)]
+        netuid: u16,
+    },
+
+    /// Set the childkey take rate. Hotkey-signing.
+    ChildTake {
+        /// Wallet name
+        #[arg(long)]
+        name: String,
+        /// Hotkey name
+        #[arg(long, default_value = "default")]
+        hotkey: String,
+        /// Subnet ID
+        #[arg(long)]
+        netuid: u16,
+        /// Take rate (0 to 65535, representing 0% to 100%)
+        #[arg(long)]
+        take: u16,
+    },
+
+    /// Claim accumulated alpha dividends from subnets. Coldkey-signing.
+    ///
+    /// Submits `SubtensorModule::claim_root` with up to 5 subnet IDs.
+    /// Harvests any pending alpha emissions on the specified subnets.
+    Claim {
+        /// Wallet name (coldkey used for signing)
+        #[arg(long)]
+        wallet: String,
+        /// Subnet IDs to claim from (up to 5, comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        netuids: Vec<u16>,
     },
 }
 

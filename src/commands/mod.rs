@@ -1,11 +1,16 @@
+pub mod axon;
 pub mod chain;
+pub mod child_hotkey;
 pub mod dynamic_decode;
 pub mod identity;
 pub mod password_file;
 pub mod paths;
+pub mod register;
 pub mod skill;
 pub mod stake;
 pub mod subnet;
+pub mod swap_coldkey;
+pub mod swap_hotkey;
 pub mod transfer;
 pub mod utils;
 pub mod wallet;

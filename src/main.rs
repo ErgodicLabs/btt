@@ -11,7 +11,7 @@ use std::io::Write;
 use clap::Parser;
 use zeroize::Zeroizing;
 
-use cli::{ChainAction, Cli, Command, StakeAction, SubnetAction, UtilsAction, WalletAction};
+use cli::{AxonAction, ChainAction, Cli, Command, StakeAction, SubnetAction, UtilsAction, WalletAction};
 use commands::password_file;
 use error::BttError;
 
@@ -197,6 +197,55 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                 let result = commands::wallet_keys::verify(&message, &signature, &ss58)?;
                 output::print_success(&result, pretty);
             }
+            WalletAction::SwapColdkeyAnnounce { name, new_coldkey } => {
+                let endpoint = rpc::resolve_endpoint(
+                    cli.url.as_deref(),
+                    cli.network.as_deref(),
+                )?;
+                let result =
+                    commands::swap_coldkey::announce(&endpoint, &name, &new_coldkey).await?;
+                output::print_success(&result, pretty);
+            }
+            WalletAction::SwapColdkeyExecute { name } => {
+                let endpoint = rpc::resolve_endpoint(
+                    cli.url.as_deref(),
+                    cli.network.as_deref(),
+                )?;
+                let result = commands::swap_coldkey::execute(&endpoint, &name).await?;
+                output::print_success(&result, pretty);
+            }
+            WalletAction::SwapColdkeyClear { name } => {
+                let endpoint = rpc::resolve_endpoint(
+                    cli.url.as_deref(),
+                    cli.network.as_deref(),
+                )?;
+                let result = commands::swap_coldkey::clear(&endpoint, &name).await?;
+                output::print_success(&result, pretty);
+            }
+            WalletAction::SwapColdkeyDispute { name, target } => {
+                let endpoint = rpc::resolve_endpoint(
+                    cli.url.as_deref(),
+                    cli.network.as_deref(),
+                )?;
+                let result =
+                    commands::swap_coldkey::dispute(&endpoint, &name, &target).await?;
+                output::print_success(&result, pretty);
+            }
+            WalletAction::SwapHotkey {
+                name,
+                old_hotkey,
+                new_hotkey,
+            } => {
+                let endpoint = rpc::resolve_endpoint(
+                    cli.url.as_deref(),
+                    cli.network.as_deref(),
+                )?;
+                let result = commands::swap_hotkey::swap_hotkey(
+                    &endpoint, &name, &old_hotkey, &new_hotkey,
+                )
+                .await?;
+                output::print_success(&result, pretty);
+            }
             WalletAction::GetIdentity { ss58 } => {
                 let endpoint = rpc::resolve_endpoint(
                     cli.url.as_deref(),
@@ -315,6 +364,106 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                     .await?;
                     output::print_success(&result, pretty);
                 }
+                StakeAction::Move {
+                    wallet,
+                    origin_hotkey,
+                    destination_hotkey,
+                    origin_netuid,
+                    destination_netuid,
+                    amount,
+                } => {
+                    let result = commands::stake::move_stake(
+                        &endpoint,
+                        commands::stake::MoveStakeParams {
+                            wallet: &wallet,
+                            origin_hotkey: &origin_hotkey,
+                            destination_hotkey: &destination_hotkey,
+                            origin_netuid,
+                            destination_netuid,
+                            amount_tao: amount,
+                        },
+                    )
+                    .await?;
+                    output::print_success(&result, pretty);
+                }
+                StakeAction::Transfer {
+                    wallet,
+                    dest_coldkey,
+                    hotkey,
+                    netuid,
+                    amount,
+                } => {
+                    let result = commands::stake::transfer_stake(
+                        &endpoint, &wallet, &dest_coldkey, &hotkey, netuid, amount,
+                    )
+                    .await?;
+                    output::print_success(&result, pretty);
+                }
+                StakeAction::Swap {
+                    wallet,
+                    hotkey,
+                    origin_netuid,
+                    destination_netuid,
+                    amount,
+                } => {
+                    let result = commands::stake::swap_stake(
+                        &endpoint,
+                        &wallet,
+                        &hotkey,
+                        origin_netuid,
+                        destination_netuid,
+                        amount,
+                    )
+                    .await?;
+                    output::print_success(&result, pretty);
+                }
+                StakeAction::ChildSet {
+                    name,
+                    hotkey,
+                    child,
+                    netuid,
+                    proportion,
+                } => {
+                    let result = commands::child_hotkey::set_child(
+                        &endpoint, &name, &hotkey, &child, netuid, proportion,
+                    )
+                    .await?;
+                    output::print_success(&result, pretty);
+                }
+                StakeAction::ChildGet { hotkey, netuid } => {
+                    let result =
+                        commands::child_hotkey::get_children(&endpoint, &hotkey, netuid)
+                            .await?;
+                    output::print_success(&result, pretty);
+                }
+                StakeAction::ChildRevoke {
+                    name,
+                    hotkey,
+                    netuid,
+                } => {
+                    let result = commands::child_hotkey::revoke_child(
+                        &endpoint, &name, &hotkey, netuid,
+                    )
+                    .await?;
+                    output::print_success(&result, pretty);
+                }
+                StakeAction::ChildTake {
+                    name,
+                    hotkey,
+                    netuid,
+                    take,
+                } => {
+                    let result = commands::child_hotkey::set_childkey_take(
+                        &endpoint, &name, &hotkey, netuid, take,
+                    )
+                    .await?;
+                    output::print_success(&result, pretty);
+                }
+                StakeAction::Claim { wallet, netuids } => {
+                    let result =
+                        commands::stake::claim(&endpoint, &wallet, &netuids).await?;
+                    output::print_success(&result, pretty);
+                }
             }
         }
         Command::Subnet { action } => {
@@ -339,6 +488,59 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                 SubnetAction::Hyperparameters { netuid } => {
                     let result =
                         commands::subnet::hyperparameters(&endpoint, netuid).await?;
+                    output::print_success(&result, pretty);
+                }
+                SubnetAction::Register {
+                    name,
+                    hotkey,
+                    netuid,
+                } => {
+                    let result =
+                        commands::register::register(&endpoint, &name, &hotkey, netuid)
+                            .await?;
+                    output::print_success(&result, pretty);
+                }
+            }
+        }
+        Command::Axon { action } => {
+            let endpoint = rpc::resolve_endpoint(
+                cli.url.as_deref(),
+                cli.network.as_deref(),
+            )?;
+            match action {
+                AxonAction::Set {
+                    name,
+                    hotkey,
+                    netuid,
+                    ip,
+                    port,
+                    ip_type,
+                    protocol,
+                    version,
+                } => {
+                    let result = commands::axon::set(
+                        &endpoint,
+                        commands::axon::AxonParams {
+                            wallet: &name,
+                            hotkey: &hotkey,
+                            netuid,
+                            ip: &ip,
+                            port,
+                            ip_type,
+                            protocol,
+                            version,
+                        },
+                    )
+                    .await?;
+                    output::print_success(&result, pretty);
+                }
+                AxonAction::Reset {
+                    name,
+                    hotkey,
+                    netuid,
+                } => {
+                    let result =
+                        commands::axon::reset(&endpoint, &name, &hotkey, netuid).await?;
                     output::print_success(&result, pretty);
                 }
             }
