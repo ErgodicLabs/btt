@@ -89,13 +89,13 @@ mod tests {
 
     #[test]
     fn convert_tao_to_rao_basic() {
-        let r = convert_tao_to_rao(1.0).unwrap();
+        let r = convert_tao_to_rao(1.0).expect("1.0 TAO is valid");
         assert_eq!(r.rao, 1_000_000_000);
     }
 
     #[test]
     fn convert_tao_to_rao_fractional() {
-        let r = convert_tao_to_rao(0.5).unwrap();
+        let r = convert_tao_to_rao(0.5).expect("0.5 TAO is valid");
         assert_eq!(r.rao, 500_000_000);
     }
 
