@@ -370,6 +370,48 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                     .await?;
                     output::print_success(&result, pretty);
                 }
+                StakeAction::ChildSet {
+                    name,
+                    hotkey,
+                    child,
+                    netuid,
+                    proportion,
+                } => {
+                    let result = commands::child_hotkey::set_child(
+                        &endpoint, &name, &hotkey, &child, netuid, proportion,
+                    )
+                    .await?;
+                    output::print_success(&result, pretty);
+                }
+                StakeAction::ChildGet { hotkey, netuid } => {
+                    let result =
+                        commands::child_hotkey::get_children(&endpoint, &hotkey, netuid)
+                            .await?;
+                    output::print_success(&result, pretty);
+                }
+                StakeAction::ChildRevoke {
+                    name,
+                    hotkey,
+                    netuid,
+                } => {
+                    let result = commands::child_hotkey::revoke_child(
+                        &endpoint, &name, &hotkey, netuid,
+                    )
+                    .await?;
+                    output::print_success(&result, pretty);
+                }
+                StakeAction::ChildTake {
+                    name,
+                    hotkey,
+                    netuid,
+                    take,
+                } => {
+                    let result = commands::child_hotkey::set_childkey_take(
+                        &endpoint, &name, &hotkey, netuid, take,
+                    )
+                    .await?;
+                    output::print_success(&result, pretty);
+                }
             }
         }
         Command::Subnet { action } => {
