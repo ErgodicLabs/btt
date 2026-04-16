@@ -184,6 +184,45 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                 let result = commands::wallet_keys::verify(&message, &signature, &ss58)?;
                 output::print_success(&result, pretty);
             }
+            WalletAction::GetIdentity { ss58 } => {
+                let endpoint = rpc::resolve_endpoint(
+                    cli.url.as_deref(),
+                    cli.network.as_deref(),
+                )?;
+                let result =
+                    commands::identity::get_identity(&endpoint, &ss58).await?;
+                output::print_success(&result, pretty);
+            }
+            WalletAction::SetIdentity {
+                name,
+                display_name,
+                url,
+                description,
+                image,
+                discord,
+                github_repo,
+                github_username,
+            } => {
+                let endpoint = rpc::resolve_endpoint(
+                    cli.url.as_deref(),
+                    cli.network.as_deref(),
+                )?;
+                let result = commands::identity::set_identity(
+                    &endpoint,
+                    &name,
+                    commands::identity::SetIdentityFields {
+                        display_name: &display_name,
+                        url: &url,
+                        description: &description,
+                        image: &image,
+                        discord: &discord,
+                        github_repo: &github_repo,
+                        github_username: &github_username,
+                    },
+                )
+                .await?;
+                output::print_success(&result, pretty);
+            }
             WalletAction::Cleanup {
                 dry_run,
                 wallet,

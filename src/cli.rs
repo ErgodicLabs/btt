@@ -378,6 +378,50 @@ pub enum WalletAction {
         ss58: String,
     },
 
+    /// Query on-chain identity for an SS58 address.
+    ///
+    /// Reads `SubtensorModule::Identities` storage map. Returns name,
+    /// URL, description, image, discord, github repo, and github
+    /// username. Empty strings for unset fields. Read-only; no wallet,
+    /// no signing, no extrinsic.
+    GetIdentity {
+        /// SS58 address to query
+        #[arg(long)]
+        ss58: String,
+    },
+
+    /// Set on-chain identity for this wallet's coldkey.
+    ///
+    /// Submits a `SubtensorModule::set_identity` extrinsic. Coldkey-
+    /// signing. All fields are optional strings; unset fields are sent
+    /// as empty strings.
+    SetIdentity {
+        /// Wallet name (coldkey used for signing)
+        #[arg(long)]
+        name: String,
+        /// Display name
+        #[arg(long, default_value = "")]
+        display_name: String,
+        /// URL
+        #[arg(long, default_value = "")]
+        url: String,
+        /// Description
+        #[arg(long, default_value = "")]
+        description: String,
+        /// Image URL
+        #[arg(long, default_value = "")]
+        image: String,
+        /// Discord handle
+        #[arg(long, default_value = "")]
+        discord: String,
+        /// GitHub repository
+        #[arg(long, default_value = "")]
+        github_repo: String,
+        /// GitHub username
+        #[arg(long, default_value = "")]
+        github_username: String,
+    },
+
     /// Reap stale `.tmp.*`, `.bak.*`, and `.lock.*` entries under the
     /// wallets directory. These are reserved prefixes left behind by
     /// `wallet create` on crashed or interrupted runs (see issue #42).
