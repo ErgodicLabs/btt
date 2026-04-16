@@ -645,6 +645,99 @@ async fn submit_stake_tx(
     })
 }
 
+// ── move ──────────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct MoveStakeResult {
+    pub tx_hash: String,
+    pub block: String,
+    pub origin_hotkey: String,
+    pub destination_hotkey: String,
+    pub origin_netuid: u16,
+    pub destination_netuid: u16,
+    pub amount_alpha_rao: u64,
+}
+
+pub struct MoveStakeParams<'a> {
+    pub wallet: &'a str,
+    pub origin_hotkey: &'a str,
+    pub destination_hotkey: &'a str,
+    pub origin_netuid: u16,
+    pub destination_netuid: u16,
+    pub amount_tao: f64,
+}
+
+pub async fn move_stake(
+    endpoint: &str,
+    params: MoveStakeParams<'_>,
+) -> Result<MoveStakeResult, BttError> {
+    let amount_rao = tao_to_rao(params.amount_tao)?;
+    if amount_rao == 0 {
+        return Err(BttError::invalid_amount(
+            "move amount must be greater than zero",
+        ));
+    }
+
+    let origin_hotkey_bytes = parse_ss58(params.origin_hotkey)?;
+    let dest_hotkey_bytes = parse_ss58(params.destination_hotkey)?;
+
+    let pair = decrypt_coldkey_interactive(params.wallet)?;
+    let signer = Sr25519Signer::new(pair);
+
+    let api = rpc::connect(endpoint).await?;
+
+    let tx = subxt::dynamic::tx(
+        "SubtensorModule",
+        "move_stake",
+        vec![
+            SValue::from_bytes(origin_hotkey_bytes),
+            SValue::from_bytes(dest_hotkey_bytes),
+            SValue::u128(params.origin_netuid as u128),
+            SValue::u128(params.destination_netuid as u128),
+            SValue::u128(amount_rao as u128),
+        ],
+    );
+
+    let mut tx_client = tokio::time::timeout(Duration::from_secs(120), api.tx())
+        .await
+        .map_err(|_| BttError::submission_failed("resolving transaction client timed out"))?
+        .map_err(|e| {
+            BttError::submission_failed(format!("failed to resolve transaction client: {e}"))
+        })?;
+
+    let progress = tokio::time::timeout(
+        Duration::from_secs(120),
+        tx_client.sign_and_submit_then_watch_default(&tx, &signer),
+    )
+    .await
+    .map_err(|_| BttError::submission_failed("transaction submission timed out"))?
+    .map_err(|e| BttError::submission_failed(format!("failed to submit transaction: {e}")))?;
+
+    let tx_hash = format!("{:?}", progress.extrinsic_hash());
+
+    let in_block = tokio::time::timeout(Duration::from_secs(120), progress.wait_for_finalized())
+        .await
+        .map_err(|_| BttError::submission_failed("waiting for finalization timed out"))?
+        .map_err(|e| BttError::submission_failed(format!("transaction failed: {e}")))?;
+
+    let block_hash = format!("{:?}", in_block.block_hash());
+
+    in_block
+        .wait_for_success()
+        .await
+        .map_err(|e| BttError::submission_failed(format!("extrinsic failed: {e}")))?;
+
+    Ok(MoveStakeResult {
+        tx_hash,
+        block: block_hash,
+        origin_hotkey: params.origin_hotkey.to_string(),
+        destination_hotkey: params.destination_hotkey.to_string(),
+        origin_netuid: params.origin_netuid,
+        destination_netuid: params.destination_netuid,
+        amount_alpha_rao: amount_rao,
+    })
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────
 
 /// Resolve an address from either a wallet name or a direct SS58 string.

@@ -602,6 +602,33 @@ pub enum StakeAction {
         #[arg(long, default_value_t = false)]
         all: bool,
     },
+
+    /// Move stake from one hotkey/subnet to another without unstake+restake.
+    ///
+    /// Submits a `SubtensorModule::move_stake` extrinsic. Coldkey-signing.
+    /// Avoids the slippage of separate unstake+restake on the dTAO AMM.
+    /// The amount is specified in TAO and converted to alpha-rao
+    /// internally.
+    Move {
+        /// Wallet name (coldkey will be decrypted for signing)
+        #[arg(long)]
+        wallet: String,
+        /// SS58 address of the origin hotkey
+        #[arg(long)]
+        origin_hotkey: String,
+        /// SS58 address of the destination hotkey
+        #[arg(long)]
+        destination_hotkey: String,
+        /// Origin subnet ID
+        #[arg(long)]
+        origin_netuid: u16,
+        /// Destination subnet ID
+        #[arg(long)]
+        destination_netuid: u16,
+        /// Amount in TAO to move
+        #[arg(long)]
+        amount: f64,
+    },
 }
 
 #[cfg(test)]
