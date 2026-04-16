@@ -907,6 +907,80 @@ pub async fn swap_stake(
     })
 }
 
+// ── claim ─────────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct ClaimResult {
+    pub tx_hash: String,
+    pub block: String,
+    pub netuids: Vec<u16>,
+}
+
+pub async fn claim(
+    endpoint: &str,
+    wallet: &str,
+    netuids: &[u16],
+) -> Result<ClaimResult, BttError> {
+    if netuids.is_empty() {
+        return Err(BttError::invalid_input(
+            "provide at least one netuid to claim from",
+        ));
+    }
+    if netuids.len() > 5 {
+        return Err(BttError::invalid_input(
+            "claim_root supports at most 5 subnet IDs per call",
+        ));
+    }
+
+    let pair = decrypt_coldkey_interactive(wallet)?;
+    let signer = Sr25519Signer::new(pair);
+
+    let api = rpc::connect(endpoint).await?;
+
+    let netuid_values: Vec<SValue> = netuids.iter().map(|n| SValue::u128(*n as u128)).collect();
+
+    let tx = subxt::dynamic::tx(
+        "SubtensorModule",
+        "claim_root",
+        vec![SValue::unnamed_composite(netuid_values)],
+    );
+
+    let mut tx_client = tokio::time::timeout(Duration::from_secs(120), api.tx())
+        .await
+        .map_err(|_| BttError::submission_failed("resolving transaction client timed out"))?
+        .map_err(|e| {
+            BttError::submission_failed(format!("failed to resolve transaction client: {e}"))
+        })?;
+
+    let progress = tokio::time::timeout(
+        Duration::from_secs(120),
+        tx_client.sign_and_submit_then_watch_default(&tx, &signer),
+    )
+    .await
+    .map_err(|_| BttError::submission_failed("transaction submission timed out"))?
+    .map_err(|e| BttError::submission_failed(format!("failed to submit transaction: {e}")))?;
+
+    let tx_hash = format!("{:?}", progress.extrinsic_hash());
+
+    let in_block = tokio::time::timeout(Duration::from_secs(120), progress.wait_for_finalized())
+        .await
+        .map_err(|_| BttError::submission_failed("waiting for finalization timed out"))?
+        .map_err(|e| BttError::submission_failed(format!("transaction failed: {e}")))?;
+
+    let block_hash = format!("{:?}", in_block.block_hash());
+
+    in_block
+        .wait_for_success()
+        .await
+        .map_err(|e| BttError::submission_failed(format!("extrinsic failed: {e}")))?;
+
+    Ok(ClaimResult {
+        tx_hash,
+        block: block_hash,
+        netuids: netuids.to_vec(),
+    })
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────
 
 /// Resolve an address from either a wallet name or a direct SS58 string.
