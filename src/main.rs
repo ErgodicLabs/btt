@@ -317,6 +317,28 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                     .await?;
                     output::print_success(&result, pretty);
                 }
+                StakeAction::Move {
+                    wallet,
+                    origin_hotkey,
+                    destination_hotkey,
+                    origin_netuid,
+                    destination_netuid,
+                    amount,
+                } => {
+                    let result = commands::stake::move_stake(
+                        &endpoint,
+                        commands::stake::MoveStakeParams {
+                            wallet: &wallet,
+                            origin_hotkey: &origin_hotkey,
+                            destination_hotkey: &destination_hotkey,
+                            origin_netuid,
+                            destination_netuid,
+                            amount_tao: amount,
+                        },
+                    )
+                    .await?;
+                    output::print_success(&result, pretty);
+                }
             }
         }
         Command::Subnet { action } => {
