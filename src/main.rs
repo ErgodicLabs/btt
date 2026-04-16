@@ -184,6 +184,21 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                 let result = commands::wallet_keys::verify(&message, &signature, &ss58)?;
                 output::print_success(&result, pretty);
             }
+            WalletAction::SwapHotkey {
+                name,
+                old_hotkey,
+                new_hotkey,
+            } => {
+                let endpoint = rpc::resolve_endpoint(
+                    cli.url.as_deref(),
+                    cli.network.as_deref(),
+                )?;
+                let result = commands::swap_hotkey::swap_hotkey(
+                    &endpoint, &name, &old_hotkey, &new_hotkey,
+                )
+                .await?;
+                output::print_success(&result, pretty);
+            }
             WalletAction::GetIdentity { ss58 } => {
                 let endpoint = rpc::resolve_endpoint(
                     cli.url.as_deref(),
