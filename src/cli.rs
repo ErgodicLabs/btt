@@ -416,6 +416,24 @@ pub enum WalletAction {
         force: bool,
     },
 
+    /// Send TAO from this wallet's coldkey to a destination address.
+    ///
+    /// Decrypts the coldkey, constructs a `Balances::transfer_keep_alive`
+    /// extrinsic, signs, submits, and waits for finalization. The
+    /// sender's account must retain at least the existential deposit
+    /// after the transfer.
+    Transfer {
+        /// Wallet name (coldkey used for signing)
+        #[arg(long)]
+        name: String,
+        /// Destination SS58 address
+        #[arg(long)]
+        dest: String,
+        /// Amount of TAO to transfer (decimal, e.g. 1.5)
+        #[arg(long)]
+        amount: f64,
+    },
+
     /// Sign a message with a wallet key
     Sign {
         /// Wallet name
