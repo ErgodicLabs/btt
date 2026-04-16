@@ -15,3 +15,4 @@ pub mod transfer;
 pub mod utils;
 pub mod wallet;
 pub mod wallet_keys;
+pub mod weights;

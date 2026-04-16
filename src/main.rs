@@ -11,7 +11,7 @@ use std::io::Write;
 use clap::Parser;
 use zeroize::Zeroizing;
 
-use cli::{AxonAction, ChainAction, Cli, Command, StakeAction, SubnetAction, UtilsAction, WalletAction};
+use cli::{AxonAction, ChainAction, Cli, Command, StakeAction, SubnetAction, UtilsAction, WalletAction, WeightsAction};
 use commands::password_file;
 use error::BttError;
 
@@ -498,6 +498,41 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                     let result =
                         commands::register::register(&endpoint, &name, &hotkey, netuid)
                             .await?;
+                    output::print_success(&result, pretty);
+                }
+            }
+        }
+        Command::Weights { action } => {
+            let endpoint = rpc::resolve_endpoint(
+                cli.url.as_deref(),
+                cli.network.as_deref(),
+            )?;
+            match action {
+                WeightsAction::Commit {
+                    name,
+                    hotkey,
+                    netuid,
+                    hash,
+                } => {
+                    let result = commands::weights::commit(
+                        &endpoint, &name, &hotkey, netuid, &hash,
+                    )
+                    .await?;
+                    output::print_success(&result, pretty);
+                }
+                WeightsAction::Reveal {
+                    name,
+                    hotkey,
+                    netuid,
+                    uids,
+                    values,
+                    salt,
+                    version_key,
+                } => {
+                    let result = commands::weights::reveal(
+                        &endpoint, &name, &hotkey, netuid, &uids, &values, &salt, version_key,
+                    )
+                    .await?;
                     output::print_success(&result, pretty);
                 }
             }
