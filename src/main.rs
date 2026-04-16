@@ -11,7 +11,7 @@ use std::io::Write;
 use clap::Parser;
 use zeroize::Zeroizing;
 
-use cli::{ChainAction, Cli, Command, StakeAction, SubnetAction, WalletAction};
+use cli::{ChainAction, Cli, Command, StakeAction, SubnetAction, UtilsAction, WalletAction};
 use commands::password_file;
 use error::BttError;
 
@@ -197,6 +197,45 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                 let result = commands::wallet_keys::verify(&message, &signature, &ss58)?;
                 output::print_success(&result, pretty);
             }
+            WalletAction::GetIdentity { ss58 } => {
+                let endpoint = rpc::resolve_endpoint(
+                    cli.url.as_deref(),
+                    cli.network.as_deref(),
+                )?;
+                let result =
+                    commands::identity::get_identity(&endpoint, &ss58).await?;
+                output::print_success(&result, pretty);
+            }
+            WalletAction::SetIdentity {
+                name,
+                display_name,
+                url,
+                description,
+                image,
+                discord,
+                github_repo,
+                github_username,
+            } => {
+                let endpoint = rpc::resolve_endpoint(
+                    cli.url.as_deref(),
+                    cli.network.as_deref(),
+                )?;
+                let result = commands::identity::set_identity(
+                    &endpoint,
+                    &name,
+                    commands::identity::SetIdentityFields {
+                        display_name: &display_name,
+                        url: &url,
+                        description: &description,
+                        image: &image,
+                        discord: &discord,
+                        github_repo: &github_repo,
+                        github_username: &github_username,
+                    },
+                )
+                .await?;
+                output::print_success(&result, pretty);
+            }
             WalletAction::Cleanup {
                 dry_run,
                 wallet,
@@ -304,6 +343,28 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                 }
             }
         }
+        Command::Utils { action } => match action {
+            UtilsAction::Convert { rao, tao } => {
+                let result = match (rao, tao) {
+                    (Some(r), None) => commands::utils::convert_rao_to_tao(r),
+                    (None, Some(t)) => commands::utils::convert_tao_to_rao(t)?,
+                    _ => {
+                        return Err(BttError::invalid_input(
+                            "provide exactly one of --rao or --tao",
+                        ));
+                    }
+                };
+                output::print_success(&result, pretty);
+            }
+            UtilsAction::Latency => {
+                let endpoint = rpc::resolve_endpoint(
+                    cli.url.as_deref(),
+                    cli.network.as_deref(),
+                )?;
+                let result = commands::utils::latency(&endpoint).await?;
+                output::print_success(&result, pretty);
+            }
+        },
         Command::Skill => {
             // `btt skill` emits the SKILL.md document. This is the
             // command's primary output, not a status line, so `--quiet`

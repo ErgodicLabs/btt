@@ -94,8 +94,37 @@ pub enum Command {
         action: SubnetAction,
     },
 
+    /// Utility commands (unit conversion, latency test)
+    Utils {
+        #[command(subcommand)]
+        action: UtilsAction,
+    },
+
     /// Emit SKILL.md for AI agent integration
     Skill,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum UtilsAction {
+    /// Convert between TAO and RAO denominations.
+    ///
+    /// 1 TAO = 1,000,000,000 RAO (10^9). Provide either `--rao` or
+    /// `--tao`; the command outputs both representations.
+    Convert {
+        /// Amount in RAO (smallest unit). Mutually exclusive with `--tao`.
+        #[arg(long, conflicts_with = "tao")]
+        rao: Option<u64>,
+        /// Amount in TAO (decimal). Mutually exclusive with `--rao`.
+        #[arg(long)]
+        tao: Option<f64>,
+    },
+
+    /// Measure RPC endpoint latency.
+    ///
+    /// Connects to the endpoint, fetches the latest block, and reports
+    /// the round-trip time in milliseconds. Uses the same connection
+    /// path as all other btt commands.
+    Latency,
 }
 
 #[derive(Subcommand, Debug)]
@@ -365,6 +394,50 @@ pub enum WalletAction {
         /// SS58 address of the signer
         #[arg(long)]
         ss58: String,
+    },
+
+    /// Query on-chain identity for an SS58 address.
+    ///
+    /// Reads `SubtensorModule::Identities` storage map. Returns name,
+    /// URL, description, image, discord, github repo, and github
+    /// username. Empty strings for unset fields. Read-only; no wallet,
+    /// no signing, no extrinsic.
+    GetIdentity {
+        /// SS58 address to query
+        #[arg(long)]
+        ss58: String,
+    },
+
+    /// Set on-chain identity for this wallet's coldkey.
+    ///
+    /// Submits a `SubtensorModule::set_identity` extrinsic. Coldkey-
+    /// signing. All fields are optional strings; unset fields are sent
+    /// as empty strings.
+    SetIdentity {
+        /// Wallet name (coldkey used for signing)
+        #[arg(long)]
+        name: String,
+        /// Display name
+        #[arg(long, default_value = "")]
+        display_name: String,
+        /// URL
+        #[arg(long, default_value = "")]
+        url: String,
+        /// Description
+        #[arg(long, default_value = "")]
+        description: String,
+        /// Image URL
+        #[arg(long, default_value = "")]
+        image: String,
+        /// Discord handle
+        #[arg(long, default_value = "")]
+        discord: String,
+        /// GitHub repository
+        #[arg(long, default_value = "")]
+        github_repo: String,
+        /// GitHub username
+        #[arg(long, default_value = "")]
+        github_username: String,
     },
 
     /// Reap stale `.tmp.*`, `.bak.*`, and `.lock.*` entries under the
