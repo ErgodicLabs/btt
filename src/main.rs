@@ -149,7 +149,7 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                 let endpoint = rpc::resolve_endpoint(
                     cli.url.as_deref(),
                     cli.network.as_deref(),
-                );
+                )?;
                 let result =
                     commands::transfer::transfer(&endpoint, &name, &dest, amount).await?;
                 output::print_success(&result, pretty);
