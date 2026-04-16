@@ -108,16 +108,20 @@ pub struct SetIdentityResult {
     pub name: String,
 }
 
+pub struct SetIdentityFields<'a> {
+    pub display_name: &'a str,
+    pub url: &'a str,
+    pub description: &'a str,
+    pub image: &'a str,
+    pub discord: &'a str,
+    pub github_repo: &'a str,
+    pub github_username: &'a str,
+}
+
 pub async fn set_identity(
     endpoint: &str,
     wallet: &str,
-    name: &str,
-    url: &str,
-    description: &str,
-    image: &str,
-    discord: &str,
-    github_repo: &str,
-    github_username: &str,
+    fields: SetIdentityFields<'_>,
 ) -> Result<SetIdentityResult, BttError> {
     let pair = decrypt_coldkey_interactive(wallet)?;
     let from_ss58 = sp_core::crypto::AccountId32::from(PairTrait::public(&pair)).to_string();
@@ -129,14 +133,14 @@ pub async fn set_identity(
         "SubtensorModule",
         "set_identity",
         vec![
-            SValue::string(name),
-            SValue::string(url),
-            SValue::string(image),
-            SValue::string(discord),
-            SValue::string(description),
+            SValue::string(fields.display_name),
+            SValue::string(fields.url),
+            SValue::string(fields.image),
+            SValue::string(fields.discord),
+            SValue::string(fields.description),
             SValue::string(""),
-            SValue::string(github_repo),
-            SValue::string(github_username),
+            SValue::string(fields.github_repo),
+            SValue::string(fields.github_username),
         ],
     );
 
@@ -173,6 +177,6 @@ pub async fn set_identity(
         tx_hash,
         block: block_hash,
         address: from_ss58,
-        name: name.to_string(),
+        name: fields.display_name.to_string(),
     })
 }

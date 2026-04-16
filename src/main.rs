@@ -210,13 +210,15 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                 let result = commands::identity::set_identity(
                     &endpoint,
                     &name,
-                    &display_name,
-                    &url,
-                    &description,
-                    &image,
-                    &discord,
-                    &github_repo,
-                    &github_username,
+                    commands::identity::SetIdentityFields {
+                        display_name: &display_name,
+                        url: &url,
+                        description: &description,
+                        image: &image,
+                        discord: &discord,
+                        github_repo: &github_repo,
+                        github_username: &github_username,
+                    },
                 )
                 .await?;
                 output::print_success(&result, pretty);
