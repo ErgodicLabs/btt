@@ -2,9 +2,11 @@ use std::time::Duration;
 
 use serde::Serialize;
 use sp_core::Pair as PairTrait;
+use subxt::dynamic::{At, Value};
 use subxt::ext::scale_value::Value as SValue;
 
 use crate::commands::chain::parse_ss58;
+use crate::commands::dynamic_decode::value_to_u64;
 use crate::commands::stake::Sr25519Signer;
 use crate::commands::wallet_keys::decrypt_coldkey_interactive;
 use crate::error::BttError;
@@ -24,35 +26,25 @@ pub struct IdentityInfo {
     pub github_username: String,
 }
 
-fn extract_string_field(val: &SValue, field: &str) -> String {
-    val.at(field)
-        .and_then(|v| {
-            if let SValue::Primitive(subxt::ext::scale_value::Primitive::String(s)) = v {
-                Some(s.clone())
-            } else {
-                v.as_u128().map(|_| String::new())
+fn value_to_string<C: Clone>(val: &Value<C>) -> String {
+    let mut bytes = Vec::new();
+    let mut idx = 0usize;
+    while let Some(v) = val.at(idx) {
+        if let Some(b) = value_to_u64(v) {
+            if b <= 255 {
+                bytes.push(b as u8);
             }
-        })
-        .unwrap_or_default()
+        }
+        idx += 1;
+    }
+    String::from_utf8(bytes).unwrap_or_default()
 }
 
-fn extract_bytes_as_string(val: &SValue, field: &str) -> String {
-    val.at(field)
-        .map(|v| match v {
-            SValue::Primitive(subxt::ext::scale_value::Primitive::String(s)) => s.clone(),
-            _ => {
-                let mut bytes = Vec::new();
-                let mut i = 0u32;
-                while let Some(b) = v.at(i) {
-                    if let Some(n) = b.as_u128() {
-                        bytes.push(n as u8);
-                    }
-                    i += 1;
-                }
-                String::from_utf8(bytes).unwrap_or_default()
-            }
-        })
-        .unwrap_or_default()
+fn extract_identity_field<C: Clone>(val: &Value<C>, field: &str) -> String {
+    match val.at(field) {
+        Some(v) => value_to_string(v),
+        None => String::new(),
+    }
 }
 
 pub async fn get_identity(endpoint: &str, address: &str) -> Result<IdentityInfo, BttError> {
@@ -86,13 +78,13 @@ pub async fn get_identity(endpoint: &str, address: &str) -> Result<IdentityInfo,
 
             Ok(IdentityInfo {
                 address: address.to_string(),
-                name: extract_bytes_as_string(&decoded, "name"),
-                url: extract_bytes_as_string(&decoded, "url"),
-                description: extract_bytes_as_string(&decoded, "description"),
-                image: extract_bytes_as_string(&decoded, "image"),
-                discord: extract_bytes_as_string(&decoded, "discord"),
-                github_repo: extract_bytes_as_string(&decoded, "github_repo"),
-                github_username: extract_bytes_as_string(&decoded, "github_username"),
+                name: extract_identity_field(&decoded, "name"),
+                url: extract_identity_field(&decoded, "url"),
+                description: extract_identity_field(&decoded, "description"),
+                image: extract_identity_field(&decoded, "image"),
+                discord: extract_identity_field(&decoded, "discord"),
+                github_repo: extract_identity_field(&decoded, "github_repo"),
+                github_username: extract_identity_field(&decoded, "github_username"),
             })
         }
         None => Ok(IdentityInfo {
