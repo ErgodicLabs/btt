@@ -5,5 +5,6 @@ pub mod paths;
 pub mod skill;
 pub mod stake;
 pub mod subnet;
+pub mod utils;
 pub mod wallet;
 pub mod wallet_keys;

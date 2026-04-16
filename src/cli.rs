@@ -94,8 +94,37 @@ pub enum Command {
         action: SubnetAction,
     },
 
+    /// Utility commands (unit conversion, latency test)
+    Utils {
+        #[command(subcommand)]
+        action: UtilsAction,
+    },
+
     /// Emit SKILL.md for AI agent integration
     Skill,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum UtilsAction {
+    /// Convert between TAO and RAO denominations.
+    ///
+    /// 1 TAO = 1,000,000,000 RAO (10^9). Provide either `--rao` or
+    /// `--tao`; the command outputs both representations.
+    Convert {
+        /// Amount in RAO (smallest unit). Mutually exclusive with `--tao`.
+        #[arg(long, conflicts_with = "tao")]
+        rao: Option<u64>,
+        /// Amount in TAO (decimal). Mutually exclusive with `--rao`.
+        #[arg(long)]
+        tao: Option<f64>,
+    },
+
+    /// Measure RPC endpoint latency.
+    ///
+    /// Connects to the endpoint, fetches the latest block, and reports
+    /// the round-trip time in milliseconds. Uses the same connection
+    /// path as all other btt commands.
+    Latency,
 }
 
 #[derive(Subcommand, Debug)]
