@@ -166,6 +166,23 @@ pub enum AxonAction {
         #[arg(long, default_value_t = 0)]
         version: u32,
     },
+
+    /// Clear the axon endpoint for a hotkey on a subnet. Hotkey-signing.
+    ///
+    /// Submits `SubtensorModule::serve_axon` with zeroed IP, port,
+    /// protocol, and version fields, effectively de-advertising the
+    /// endpoint.
+    Reset {
+        /// Wallet name
+        #[arg(long)]
+        name: String,
+        /// Hotkey name
+        #[arg(long, default_value = "default")]
+        hotkey: String,
+        /// Subnet id
+        #[arg(long)]
+        netuid: u16,
+    },
 }
 
 #[derive(Subcommand, Debug)]
