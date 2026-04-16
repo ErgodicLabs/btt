@@ -1,5 +1,6 @@
 pub mod chain;
 pub mod dynamic_decode;
+pub mod identity;
 pub mod password_file;
 pub mod paths;
 pub mod skill;
