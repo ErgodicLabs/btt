@@ -49,14 +49,13 @@ pub async fn latency(endpoint: &str) -> Result<LatencyResult, BttError> {
     let start = Instant::now();
     let api = rpc::connect(endpoint).await?;
 
-    let block = api
-        .blocks()
-        .at_latest()
+    let at_block = api
+        .at_current_block()
         .await
         .map_err(|e| BttError::connection(format!("failed to fetch latest block: {e}")))?;
 
     let elapsed = start.elapsed();
-    let block_number = block.number().into();
+    let block_number: u64 = at_block.block_number();
 
     Ok(LatencyResult {
         endpoint: endpoint.to_string(),
