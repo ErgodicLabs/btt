@@ -473,6 +473,43 @@ pub enum WalletAction {
         new_hotkey: String,
     },
 
+    /// Announce intent to swap this wallet's coldkey. Coldkey-signing.
+    /// Starts a 5-day (7200 block) waiting period before execution.
+    SwapColdkeyAnnounce {
+        /// Wallet name (current coldkey, used for signing)
+        #[arg(long)]
+        name: String,
+        /// SS58 address of the new coldkey to swap to
+        #[arg(long)]
+        new_coldkey: String,
+    },
+
+    /// Execute a previously announced coldkey swap. Coldkey-signing.
+    /// Only succeeds after the 5-day waiting period has elapsed.
+    SwapColdkeyExecute {
+        /// Wallet name (current coldkey, used for signing)
+        #[arg(long)]
+        name: String,
+    },
+
+    /// Cancel a pending coldkey swap announcement. Coldkey-signing.
+    SwapColdkeyClear {
+        /// Wallet name (current coldkey, used for signing)
+        #[arg(long)]
+        name: String,
+    },
+
+    /// Dispute another account's pending coldkey swap. Coldkey-signing.
+    /// Requires governance authority (senate membership).
+    SwapColdkeyDispute {
+        /// Wallet name (disputer's coldkey, used for signing)
+        #[arg(long)]
+        name: String,
+        /// SS58 address of the coldkey whose swap is being disputed
+        #[arg(long)]
+        target: String,
+    },
+
     /// Query on-chain identity for an SS58 address.
     ///
     /// Reads `SubtensorModule::Identities` storage map. Returns name,
