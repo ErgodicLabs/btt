@@ -487,6 +487,15 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                     .await?;
                     output::print_success(&result, pretty);
                 }
+                AxonAction::Reset {
+                    name,
+                    hotkey,
+                    netuid,
+                } => {
+                    let result =
+                        commands::axon::reset(&endpoint, &name, &hotkey, netuid).await?;
+                    output::print_success(&result, pretty);
+                }
             }
         }
         Command::Utils { action } => match action {
