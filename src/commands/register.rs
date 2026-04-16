@@ -6,9 +6,7 @@ use subxt::ext::scale_value::Value as SValue;
 
 use crate::commands::chain::parse_ss58;
 use crate::commands::stake::Sr25519Signer;
-use crate::commands::wallet_keys::{
-    decrypt_coldkey_interactive, rao_to_tao_string, resolve_coldkey_address,
-};
+use crate::commands::wallet_keys::decrypt_coldkey_interactive;
 use crate::error::BttError;
 use crate::rpc;
 
