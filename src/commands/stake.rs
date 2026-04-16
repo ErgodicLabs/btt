@@ -738,6 +738,175 @@ pub async fn move_stake(
     })
 }
 
+// ── transfer stake ────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct TransferStakeResult {
+    pub tx_hash: String,
+    pub block: String,
+    pub destination_coldkey: String,
+    pub hotkey: String,
+    pub netuid: u16,
+    pub amount_alpha_rao: u64,
+}
+
+pub async fn transfer_stake(
+    endpoint: &str,
+    wallet: &str,
+    dest_coldkey: &str,
+    hotkey: &str,
+    netuid: u16,
+    amount_tao: f64,
+) -> Result<TransferStakeResult, BttError> {
+    let amount_rao = tao_to_rao(amount_tao)?;
+    if amount_rao == 0 {
+        return Err(BttError::invalid_amount(
+            "transfer amount must be greater than zero",
+        ));
+    }
+
+    let dest_bytes = parse_ss58(dest_coldkey)?;
+    let hotkey_bytes = parse_ss58(hotkey)?;
+
+    let pair = decrypt_coldkey_interactive(wallet)?;
+    let signer = Sr25519Signer::new(pair);
+
+    let api = rpc::connect(endpoint).await?;
+
+    let tx = subxt::dynamic::tx(
+        "SubtensorModule",
+        "transfer_stake",
+        vec![
+            SValue::from_bytes(dest_bytes),
+            SValue::from_bytes(hotkey_bytes),
+            SValue::u128(netuid as u128),
+            SValue::u128(amount_rao as u128),
+        ],
+    );
+
+    let mut tx_client = tokio::time::timeout(Duration::from_secs(120), api.tx())
+        .await
+        .map_err(|_| BttError::submission_failed("resolving transaction client timed out"))?
+        .map_err(|e| {
+            BttError::submission_failed(format!("failed to resolve transaction client: {e}"))
+        })?;
+
+    let progress = tokio::time::timeout(
+        Duration::from_secs(120),
+        tx_client.sign_and_submit_then_watch_default(&tx, &signer),
+    )
+    .await
+    .map_err(|_| BttError::submission_failed("transaction submission timed out"))?
+    .map_err(|e| BttError::submission_failed(format!("failed to submit transaction: {e}")))?;
+
+    let tx_hash = format!("{:?}", progress.extrinsic_hash());
+
+    let in_block = tokio::time::timeout(Duration::from_secs(120), progress.wait_for_finalized())
+        .await
+        .map_err(|_| BttError::submission_failed("waiting for finalization timed out"))?
+        .map_err(|e| BttError::submission_failed(format!("transaction failed: {e}")))?;
+
+    let block_hash = format!("{:?}", in_block.block_hash());
+
+    in_block
+        .wait_for_success()
+        .await
+        .map_err(|e| BttError::submission_failed(format!("extrinsic failed: {e}")))?;
+
+    Ok(TransferStakeResult {
+        tx_hash,
+        block: block_hash,
+        destination_coldkey: dest_coldkey.to_string(),
+        hotkey: hotkey.to_string(),
+        netuid,
+        amount_alpha_rao: amount_rao,
+    })
+}
+
+// ── swap stake ────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct SwapStakeResult {
+    pub tx_hash: String,
+    pub block: String,
+    pub hotkey: String,
+    pub origin_netuid: u16,
+    pub destination_netuid: u16,
+    pub amount_alpha_rao: u64,
+}
+
+pub async fn swap_stake(
+    endpoint: &str,
+    wallet: &str,
+    hotkey: &str,
+    origin_netuid: u16,
+    destination_netuid: u16,
+    amount_tao: f64,
+) -> Result<SwapStakeResult, BttError> {
+    let amount_rao = tao_to_rao(amount_tao)?;
+    if amount_rao == 0 {
+        return Err(BttError::invalid_amount(
+            "swap amount must be greater than zero",
+        ));
+    }
+
+    let hotkey_bytes = parse_ss58(hotkey)?;
+
+    let pair = decrypt_coldkey_interactive(wallet)?;
+    let signer = Sr25519Signer::new(pair);
+
+    let api = rpc::connect(endpoint).await?;
+
+    let tx = subxt::dynamic::tx(
+        "SubtensorModule",
+        "swap_stake",
+        vec![
+            SValue::from_bytes(hotkey_bytes),
+            SValue::u128(origin_netuid as u128),
+            SValue::u128(destination_netuid as u128),
+            SValue::u128(amount_rao as u128),
+        ],
+    );
+
+    let mut tx_client = tokio::time::timeout(Duration::from_secs(120), api.tx())
+        .await
+        .map_err(|_| BttError::submission_failed("resolving transaction client timed out"))?
+        .map_err(|e| {
+            BttError::submission_failed(format!("failed to resolve transaction client: {e}"))
+        })?;
+
+    let progress = tokio::time::timeout(
+        Duration::from_secs(120),
+        tx_client.sign_and_submit_then_watch_default(&tx, &signer),
+    )
+    .await
+    .map_err(|_| BttError::submission_failed("transaction submission timed out"))?
+    .map_err(|e| BttError::submission_failed(format!("failed to submit transaction: {e}")))?;
+
+    let tx_hash = format!("{:?}", progress.extrinsic_hash());
+
+    let in_block = tokio::time::timeout(Duration::from_secs(120), progress.wait_for_finalized())
+        .await
+        .map_err(|_| BttError::submission_failed("waiting for finalization timed out"))?
+        .map_err(|e| BttError::submission_failed(format!("transaction failed: {e}")))?;
+
+    let block_hash = format!("{:?}", in_block.block_hash());
+
+    in_block
+        .wait_for_success()
+        .await
+        .map_err(|e| BttError::submission_failed(format!("extrinsic failed: {e}")))?;
+
+    Ok(SwapStakeResult {
+        tx_hash,
+        block: block_hash,
+        hotkey: hotkey.to_string(),
+        origin_netuid,
+        destination_netuid,
+        amount_alpha_rao: amount_rao,
+    })
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────
 
 /// Resolve an address from either a wallet name or a direct SS58 string.

@@ -629,6 +629,52 @@ pub enum StakeAction {
         #[arg(long)]
         amount: f64,
     },
+
+    /// Transfer staked alpha to a different coldkey without unstaking.
+    ///
+    /// Submits `SubtensorModule::transfer_stake`. Coldkey-signing.
+    /// The recipient coldkey receives the alpha stake on the specified
+    /// hotkey and subnet.
+    Transfer {
+        /// Wallet name (coldkey used for signing)
+        #[arg(long)]
+        wallet: String,
+        /// SS58 address of the destination coldkey
+        #[arg(long)]
+        dest_coldkey: String,
+        /// Hotkey SS58 address
+        #[arg(long)]
+        hotkey: String,
+        /// Subnet ID
+        #[arg(long)]
+        netuid: u16,
+        /// Amount in TAO
+        #[arg(long)]
+        amount: f64,
+    },
+
+    /// Swap alpha between two subnets via the dTAO AMM.
+    ///
+    /// Submits `SubtensorModule::swap_stake`. Coldkey-signing. Sells
+    /// alpha on the origin subnet and buys alpha on the destination
+    /// subnet through the pool. Slippage applies.
+    Swap {
+        /// Wallet name (coldkey used for signing)
+        #[arg(long)]
+        wallet: String,
+        /// Hotkey SS58 address
+        #[arg(long)]
+        hotkey: String,
+        /// Origin subnet ID (selling alpha)
+        #[arg(long)]
+        origin_netuid: u16,
+        /// Destination subnet ID (buying alpha)
+        #[arg(long)]
+        destination_netuid: u16,
+        /// Amount in TAO
+        #[arg(long)]
+        amount: f64,
+    },
 }
 
 #[cfg(test)]
