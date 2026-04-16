@@ -184,6 +184,40 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                 let result = commands::wallet_keys::verify(&message, &signature, &ss58)?;
                 output::print_success(&result, pretty);
             }
+            WalletAction::SwapColdkeyAnnounce { name, new_coldkey } => {
+                let endpoint = rpc::resolve_endpoint(
+                    cli.url.as_deref(),
+                    cli.network.as_deref(),
+                )?;
+                let result =
+                    commands::swap_coldkey::announce(&endpoint, &name, &new_coldkey).await?;
+                output::print_success(&result, pretty);
+            }
+            WalletAction::SwapColdkeyExecute { name } => {
+                let endpoint = rpc::resolve_endpoint(
+                    cli.url.as_deref(),
+                    cli.network.as_deref(),
+                )?;
+                let result = commands::swap_coldkey::execute(&endpoint, &name).await?;
+                output::print_success(&result, pretty);
+            }
+            WalletAction::SwapColdkeyClear { name } => {
+                let endpoint = rpc::resolve_endpoint(
+                    cli.url.as_deref(),
+                    cli.network.as_deref(),
+                )?;
+                let result = commands::swap_coldkey::clear(&endpoint, &name).await?;
+                output::print_success(&result, pretty);
+            }
+            WalletAction::SwapColdkeyDispute { name, target } => {
+                let endpoint = rpc::resolve_endpoint(
+                    cli.url.as_deref(),
+                    cli.network.as_deref(),
+                )?;
+                let result =
+                    commands::swap_coldkey::dispute(&endpoint, &name, &target).await?;
+                output::print_success(&result, pretty);
+            }
             WalletAction::SwapHotkey {
                 name,
                 old_hotkey,

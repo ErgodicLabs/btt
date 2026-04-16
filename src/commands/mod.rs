@@ -9,6 +9,7 @@ pub mod register;
 pub mod skill;
 pub mod stake;
 pub mod subnet;
+pub mod swap_coldkey;
 pub mod swap_hotkey;
 pub mod utils;
 pub mod wallet;
