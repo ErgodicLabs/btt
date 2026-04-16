@@ -530,7 +530,16 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                     version_key,
                 } => {
                     let result = commands::weights::reveal(
-                        &endpoint, &name, &hotkey, netuid, &uids, &values, &salt, version_key,
+                        &endpoint,
+                        commands::weights::RevealParams {
+                            wallet: &name,
+                            hotkey: &hotkey,
+                            netuid,
+                            uids: &uids,
+                            values: &values,
+                            salt: &salt,
+                            version_key,
+                        },
                     )
                     .await?;
                     output::print_success(&result, pretty);

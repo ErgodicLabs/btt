@@ -38,7 +38,7 @@ pub async fn commit(
         "commit_weights",
         vec![
             SValue::u128(netuid as u128),
-            SValue::from_bytes(hash_bytes.to_vec()),
+            SValue::from_bytes(hash_bytes),
         ],
     );
 
@@ -53,23 +53,30 @@ pub async fn commit(
     })
 }
 
+pub struct RevealParams<'a> {
+    pub wallet: &'a str,
+    pub hotkey: &'a str,
+    pub netuid: u16,
+    pub uids: &'a [u16],
+    pub values: &'a [u16],
+    pub salt: &'a [u16],
+    pub version_key: u64,
+}
+
 pub async fn reveal(
     endpoint: &str,
-    wallet: &str,
-    hotkey_name: &str,
-    netuid: u16,
-    uids: &[u16],
-    values: &[u16],
-    salt: &[u16],
-    version_key: u64,
+    params: RevealParams<'_>,
 ) -> Result<WeightsTxResult, BttError> {
+    let uids = params.uids;
+    let values = params.values;
+    let salt = params.salt;
     if uids.len() != values.len() {
         return Err(BttError::invalid_input(
             "uids and values must have the same length",
         ));
     }
 
-    let pair = load_hotkey_pair(wallet, hotkey_name)?;
+    let pair = load_hotkey_pair(params.wallet, params.hotkey)?;
     let hotkey_ss58 = sp_core::crypto::AccountId32::from(PairTrait::public(&pair)).to_string();
     let signer = Sr25519Signer::new(pair);
 
@@ -83,11 +90,11 @@ pub async fn reveal(
         "SubtensorModule",
         "reveal_weights",
         vec![
-            SValue::u128(netuid as u128),
+            SValue::u128(params.netuid as u128),
             SValue::unnamed_composite(uid_values),
             SValue::unnamed_composite(weight_values),
             SValue::unnamed_composite(salt_values),
-            SValue::u128(version_key as u128),
+            SValue::u128(params.version_key as u128),
         ],
     );
 
@@ -98,7 +105,7 @@ pub async fn reveal(
         block: block_hash,
         action: "reveal_weights".to_string(),
         hotkey: hotkey_ss58,
-        netuid,
+        netuid: params.netuid,
     })
 }
 
