@@ -4,6 +4,7 @@ pub mod dynamic_decode;
 pub mod identity;
 pub mod password_file;
 pub mod paths;
+pub mod register;
 pub mod skill;
 pub mod stake;
 pub mod subnet;

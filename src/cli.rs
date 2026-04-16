@@ -218,6 +218,26 @@ pub enum SubnetAction {
         #[arg(long)]
         netuid: u16,
     },
+
+    /// Register a hotkey on a subnet by paying the burn cost.
+    ///
+    /// Submits a `SubtensorModule::burned_register` extrinsic. Coldkey-
+    /// signing. The burn cost varies per subnet and changes between
+    /// blocks — query it first with `btt subnet lock-cost` (note: that
+    /// command shows the subnet *creation* cost; the per-UID burn cost
+    /// is a different storage value that this command will display
+    /// before prompting for confirmation in a future iteration).
+    Register {
+        /// Wallet name (coldkey used for signing and paying the burn)
+        #[arg(long)]
+        name: String,
+        /// SS58 address of the hotkey to register
+        #[arg(long)]
+        hotkey: String,
+        /// Subnet id to register on
+        #[arg(long)]
+        netuid: u16,
+    },
 }
 
 #[derive(Subcommand, Debug)]
