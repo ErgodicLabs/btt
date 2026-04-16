@@ -100,6 +100,12 @@ pub enum Command {
         action: AxonAction,
     },
 
+    /// Weight commit/reveal for validators
+    Weights {
+        #[command(subcommand)]
+        action: WeightsAction,
+    },
+
     /// Utility commands (unit conversion, latency test)
     Utils {
         #[command(subcommand)]
@@ -131,6 +137,57 @@ pub enum UtilsAction {
     /// the round-trip time in milliseconds. Uses the same connection
     /// path as all other btt commands.
     Latency,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum WeightsAction {
+    /// Commit a hash of the weight vector. Hotkey-signing.
+    ///
+    /// Submits `SubtensorModule::commit_weights`. The hash is a 32-byte
+    /// hex string (0x-prefixed or raw). The validator reveals the actual
+    /// weights later with `weights reveal`.
+    Commit {
+        /// Wallet name
+        #[arg(long)]
+        name: String,
+        /// Hotkey name
+        #[arg(long, default_value = "default")]
+        hotkey: String,
+        /// Subnet ID
+        #[arg(long)]
+        netuid: u16,
+        /// 32-byte commit hash (hex, 0x-prefixed or raw)
+        #[arg(long)]
+        hash: String,
+    },
+
+    /// Reveal the actual weights after a commit. Hotkey-signing.
+    ///
+    /// Submits `SubtensorModule::reveal_weights`. The UIDs, values, and
+    /// salt must match what was used to compute the commit hash.
+    Reveal {
+        /// Wallet name
+        #[arg(long)]
+        name: String,
+        /// Hotkey name
+        #[arg(long, default_value = "default")]
+        hotkey: String,
+        /// Subnet ID
+        #[arg(long)]
+        netuid: u16,
+        /// Comma-separated UIDs
+        #[arg(long, value_delimiter = ',')]
+        uids: Vec<u16>,
+        /// Comma-separated weight values
+        #[arg(long, value_delimiter = ',')]
+        values: Vec<u16>,
+        /// Comma-separated salt values
+        #[arg(long, value_delimiter = ',')]
+        salt: Vec<u16>,
+        /// Version key
+        #[arg(long, default_value_t = 0)]
+        version_key: u64,
+    },
 }
 
 #[derive(Subcommand, Debug)]
