@@ -246,6 +246,17 @@ pub fn decrypt_coldkey_interactive(wallet_name: &str) -> Result<Pair, BttError> 
     Ok(pair)
 }
 
+pub(crate) fn load_hotkey_pair(wallet_name: &str, hotkey_name: &str) -> Result<Pair, BttError> {
+    let wdir = wallet_path(wallet_name)?;
+    if !wdir.exists() {
+        return Err(BttError::wallet_not_found(format!(
+            "wallet '{wallet_name}' not found at {}",
+            wdir.display()
+        )));
+    }
+    load_hotkey(&wdir, hotkey_name)
+}
+
 /// Extract an SS58 address from key file content.
 fn extract_ss58_from_content(content: &str) -> Option<String> {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {

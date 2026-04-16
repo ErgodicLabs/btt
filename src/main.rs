@@ -11,7 +11,7 @@ use std::io::Write;
 use clap::Parser;
 use zeroize::Zeroizing;
 
-use cli::{ChainAction, Cli, Command, StakeAction, SubnetAction, UtilsAction, WalletAction};
+use cli::{AxonAction, ChainAction, Cli, Command, StakeAction, SubnetAction, UtilsAction, WalletAction};
 use commands::password_file;
 use error::BttError;
 
@@ -326,6 +326,40 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                 SubnetAction::Hyperparameters { netuid } => {
                     let result =
                         commands::subnet::hyperparameters(&endpoint, netuid).await?;
+                    output::print_success(&result, pretty);
+                }
+            }
+        }
+        Command::Axon { action } => {
+            let endpoint = rpc::resolve_endpoint(
+                cli.url.as_deref(),
+                cli.network.as_deref(),
+            )?;
+            match action {
+                AxonAction::Set {
+                    name,
+                    hotkey,
+                    netuid,
+                    ip,
+                    port,
+                    ip_type,
+                    protocol,
+                    version,
+                } => {
+                    let result = commands::axon::set(
+                        &endpoint,
+                        commands::axon::AxonParams {
+                            wallet: &name,
+                            hotkey: &hotkey,
+                            netuid,
+                            ip: &ip,
+                            port,
+                            ip_type,
+                            protocol,
+                            version,
+                        },
+                    )
+                    .await?;
                     output::print_success(&result, pretty);
                 }
             }

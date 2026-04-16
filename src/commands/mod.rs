@@ -1,3 +1,4 @@
+pub mod axon;
 pub mod chain;
 pub mod dynamic_decode;
 pub mod identity;
