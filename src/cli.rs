@@ -94,6 +94,12 @@ pub enum Command {
         action: SubnetAction,
     },
 
+    /// Axon endpoint advertising for miners and validators
+    Axon {
+        #[command(subcommand)]
+        action: AxonAction,
+    },
+
     /// Utility commands (unit conversion, latency test)
     Utils {
         #[command(subcommand)]
@@ -125,6 +131,41 @@ pub enum UtilsAction {
     /// the round-trip time in milliseconds. Uses the same connection
     /// path as all other btt commands.
     Latency,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AxonAction {
+    /// Advertise the axon endpoint (IP, port) for a hotkey on a subnet.
+    ///
+    /// Submits a `SubtensorModule::serve_axon` extrinsic. Hotkey-signing
+    /// (lower risk than coldkey). Other nodes use this endpoint to
+    /// discover and connect to the miner or validator.
+    Set {
+        /// Wallet name
+        #[arg(long)]
+        name: String,
+        /// Hotkey name
+        #[arg(long, default_value = "default")]
+        hotkey: String,
+        /// Subnet id
+        #[arg(long)]
+        netuid: u16,
+        /// IP address (IPv4 or IPv6)
+        #[arg(long)]
+        ip: String,
+        /// Port number
+        #[arg(long)]
+        port: u16,
+        /// IP type (4 or 6). Auto-detected from the IP address if 0.
+        #[arg(long, default_value_t = 0)]
+        ip_type: u8,
+        /// Protocol identifier
+        #[arg(long, default_value_t = 4)]
+        protocol: u8,
+        /// Axon version
+        #[arg(long, default_value_t = 0)]
+        version: u32,
+    },
 }
 
 #[derive(Subcommand, Debug)]
