@@ -412,6 +412,11 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                     .await?;
                     output::print_success(&result, pretty);
                 }
+                StakeAction::Claim { wallet, netuids } => {
+                    let result =
+                        commands::stake::claim(&endpoint, &wallet, &netuids).await?;
+                    output::print_success(&result, pretty);
+                }
             }
         }
         Command::Subnet { action } => {

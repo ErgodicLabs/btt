@@ -733,6 +733,19 @@ pub enum StakeAction {
         #[arg(long)]
         take: u16,
     },
+
+    /// Claim accumulated alpha dividends from subnets. Coldkey-signing.
+    ///
+    /// Submits `SubtensorModule::claim_root` with up to 5 subnet IDs.
+    /// Harvests any pending alpha emissions on the specified subnets.
+    Claim {
+        /// Wallet name (coldkey used for signing)
+        #[arg(long)]
+        wallet: String,
+        /// Subnet IDs to claim from (up to 5, comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        netuids: Vec<u16>,
+    },
 }
 
 #[cfg(test)]
