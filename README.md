@@ -2,6 +2,9 @@
 
 Minimal, secure Bittensor CLI. Static Rust binary, zero PyPI surface.
 
+- [Developer guide](docs/developer-guide.md) — codebase walkthrough, how to add commands
+- [Contributing](CONTRIBUTING.md) — CI pipeline, dependency policy, security measures
+
 ## Build
 
 ```bash
