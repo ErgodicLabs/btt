@@ -24,7 +24,6 @@ src/
     child_hotkey.rs — set_children, get_children, set_childkey_take
     swap_hotkey.rs — swap_hotkey extrinsic
     swap_coldkey.rs — schedule/execute/cancel/dispute coldkey swap
-    liquidity.rs   — concentrated liquidity (Swap pallet)
     dynamic_decode.rs — shared helpers for decoding scale_value trees
     password_file.rs  — read password from file (automation)
     paths.rs       — wallet directory resolution, quiet flag
