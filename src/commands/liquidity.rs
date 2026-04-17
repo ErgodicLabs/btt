@@ -286,7 +286,7 @@ pub async fn list_positions(
                 &positions_query,
                 vec![
                     SValue::u128(netuid as u128),
-                    SValue::from_bytes(coldkey_bytes),
+                    SValue::from_bytes(coldkey_bytes.clone()),
                     SValue::u128(pos_id),
                 ],
             ),
