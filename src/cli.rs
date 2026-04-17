@@ -106,6 +106,12 @@ pub enum Command {
         action: WeightsAction,
     },
 
+    /// Concentrated liquidity management (dTAO AMM)
+    Liquidity {
+        #[command(subcommand)]
+        action: LiquidityAction,
+    },
+
     /// Utility commands (unit conversion, latency test)
     Utils {
         #[command(subcommand)]
@@ -187,6 +193,100 @@ pub enum WeightsAction {
         /// Version key
         #[arg(long, default_value_t = 0)]
         version_key: u64,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum LiquidityAction {
+    /// Add a concentrated liquidity position on a subnet's dTAO AMM.
+    ///
+    /// Submits `Swap::add_liquidity`. Coldkey-signing. Specifies a tick
+    /// range and liquidity amount in RAO. The position earns fees from
+    /// swaps that cross the range. Note: this extrinsic may be disabled
+    /// on mainnet until the subnet owner enables user liquidity.
+    Add {
+        /// Wallet name (coldkey used for signing)
+        #[arg(long)]
+        wallet: String,
+        /// Hotkey SS58 address
+        #[arg(long)]
+        hotkey: String,
+        /// Subnet ID
+        #[arg(long)]
+        netuid: u16,
+        /// Lower tick bound (i32, price = 1.0001^tick)
+        #[arg(long)]
+        tick_low: i32,
+        /// Upper tick bound (i32, price = 1.0001^tick)
+        #[arg(long)]
+        tick_high: i32,
+        /// Liquidity amount in TAO (decimal)
+        #[arg(long)]
+        amount: f64,
+    },
+
+    /// Remove a liquidity position entirely. Coldkey-signing.
+    ///
+    /// Submits `Swap::remove_liquidity`. Returns TAO to coldkey balance
+    /// and Alpha to coldkey->hotkey stake, including accrued fees.
+    Remove {
+        /// Wallet name (coldkey used for signing)
+        #[arg(long)]
+        wallet: String,
+        /// Hotkey SS58 address
+        #[arg(long)]
+        hotkey: String,
+        /// Subnet ID
+        #[arg(long)]
+        netuid: u16,
+        /// Position ID to remove
+        #[arg(long)]
+        position_id: u128,
+    },
+
+    /// Modify liquidity on an existing position. Coldkey-signing.
+    ///
+    /// Submits `Swap::modify_position`. Positive delta adds liquidity;
+    /// negative delta removes it.
+    Modify {
+        /// Wallet name (coldkey used for signing)
+        #[arg(long)]
+        wallet: String,
+        /// Hotkey SS58 address
+        #[arg(long)]
+        hotkey: String,
+        /// Subnet ID
+        #[arg(long)]
+        netuid: u16,
+        /// Position ID to modify
+        #[arg(long)]
+        position_id: u128,
+        /// Liquidity change in RAO (positive to add, negative to remove)
+        #[arg(long, allow_hyphen_values = true)]
+        delta: i64,
+    },
+
+    /// List liquidity positions for a coldkey on a subnet. Read-only.
+    ///
+    /// Queries `Swap::Positions` storage. Returns position IDs, tick
+    /// ranges, and liquidity amounts.
+    List {
+        /// Coldkey SS58 address to query
+        #[arg(long)]
+        ss58: String,
+        /// Subnet ID
+        #[arg(long)]
+        netuid: u16,
+    },
+
+    /// Query pool state for a subnet. Read-only.
+    ///
+    /// Returns the current tick, liquidity depth, and whether user
+    /// liquidity and V3 initialization are enabled.
+    Pool {
+        /// Subnet ID
+        #[arg(long)]
+        netuid: u16,
     },
 }
 
