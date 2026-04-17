@@ -261,7 +261,10 @@ pub enum LiquidityAction {
         /// Position ID to modify
         #[arg(long)]
         position_id: u128,
-        /// Liquidity change in RAO (positive to add, negative to remove)
+        /// Liquidity delta (abstract L-units from Uniswap-V3
+        /// concentrated-liquidity math, NOT a RAO amount). Positive
+        /// adds, negative removes. See the upstream pallet_subtensor_swap
+        /// docs for the math.
         #[arg(long, allow_hyphen_values = true)]
         delta: i64,
     },
