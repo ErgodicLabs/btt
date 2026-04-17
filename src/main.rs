@@ -11,7 +11,7 @@ use std::io::Write;
 use clap::Parser;
 use zeroize::Zeroizing;
 
-use cli::{AxonAction, ChainAction, Cli, Command, StakeAction, SubnetAction, UtilsAction, WalletAction, WeightsAction};
+use cli::{AxonAction, ChainAction, Cli, Command, LiquidityAction, StakeAction, SubnetAction, UtilsAction, WalletAction, WeightsAction};
 use commands::password_file;
 use error::BttError;
 
@@ -542,6 +542,72 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                         },
                     )
                     .await?;
+                    output::print_success(&result, pretty);
+                }
+            }
+        }
+        Command::Liquidity { action } => {
+            let endpoint = rpc::resolve_endpoint(
+                cli.url.as_deref(),
+                cli.network.as_deref(),
+            )?;
+            match action {
+                LiquidityAction::Add {
+                    wallet,
+                    hotkey,
+                    netuid,
+                    tick_low,
+                    tick_high,
+                    amount,
+                } => {
+                    let result = commands::liquidity::add_liquidity(
+                        &endpoint,
+                        commands::liquidity::AddLiquidityParams {
+                            wallet: &wallet,
+                            hotkey: &hotkey,
+                            netuid,
+                            tick_low,
+                            tick_high,
+                            amount_tao: amount,
+                        },
+                    )
+                    .await?;
+                    output::print_success(&result, pretty);
+                }
+                LiquidityAction::Remove {
+                    wallet,
+                    hotkey,
+                    netuid,
+                    position_id,
+                } => {
+                    let result = commands::liquidity::remove_liquidity(
+                        &endpoint, &wallet, &hotkey, netuid, position_id,
+                    )
+                    .await?;
+                    output::print_success(&result, pretty);
+                }
+                LiquidityAction::Modify {
+                    wallet,
+                    hotkey,
+                    netuid,
+                    position_id,
+                    delta,
+                } => {
+                    let result = commands::liquidity::modify_position(
+                        &endpoint, &wallet, &hotkey, netuid, position_id, delta,
+                    )
+                    .await?;
+                    output::print_success(&result, pretty);
+                }
+                LiquidityAction::List { ss58, netuid } => {
+                    let result =
+                        commands::liquidity::list_positions(&endpoint, &ss58, netuid)
+                            .await?;
+                    output::print_success(&result, pretty);
+                }
+                LiquidityAction::Pool { netuid } => {
+                    let result =
+                        commands::liquidity::pool_info(&endpoint, netuid).await?;
                     output::print_success(&result, pretty);
                 }
             }

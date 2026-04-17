@@ -3,6 +3,7 @@ pub mod chain;
 pub mod child_hotkey;
 pub mod dynamic_decode;
 pub mod identity;
+pub mod liquidity;
 pub mod password_file;
 pub mod paths;
 pub mod register;
