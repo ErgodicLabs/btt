@@ -40,13 +40,18 @@ CI will catch failures, but catching them locally saves a round-trip.
 
 Every PR runs the following checks. All must pass before merge.
 
-| Check | What it does |
+Four workflows, one with a three-tool matrix and one internal tripwire job.
+
+| Workflow / check | What it does |
 |---|---|
 | **lint** | `cargo clippy --all-targets --all-features -- -D warnings` + `cargo fmt --check` |
 | **tests** | `cargo test --workspace` |
-| **btcli-compat** | Builds release binary, verifies coldkey format compatibility with btcli |
-| **dep-audit** | `cargo audit` (known vulnerabilities), `cargo deny` (license + advisory), `cargo outdated` |
-| **checksum** | SHA256 of the release binary |
+| **btcli-compat** | Builds the release binary, generates signing vectors, and runs `scripts/btcli-compat/check.py` to verify `wallet sign` output against a PyNaCl reference (no `bittensor.*` imports — only the verification surface) |
+| **dep-audit → audit (cargo-audit)** | Known-vulnerability scan via `cargo audit`, with ignores pinned in `scripts/dep-audit/rustsec-ignores.jsonl` |
+| **dep-audit → audit (cargo-deny)** | License + advisory gate via `cargo deny` against a rendered `deny.toml` |
+| **dep-audit → audit (cargo-outdated)** | Informational only; never blocks merge |
+| **dep-audit → checksum** | Supply-chain tripwire: `scripts/dep-audit/checksum.py` compares every resolved dep's crate checksum to the committed DB at `.cryptid/dep-audit/checksums.db`. New / stale / mismatched entries fail the job and block merge until the DB is refreshed by intent |
+| **dep-audit → combine** | Fails the overall `dep-audit` result if any of the above matrix jobs failed |
 
 ## Dependency discipline
 
