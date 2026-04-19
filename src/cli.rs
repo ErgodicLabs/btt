@@ -592,6 +592,16 @@ pub enum WalletAction {
         /// Amount of TAO to transfer (decimal, e.g. 1.5)
         #[arg(long)]
         amount: f64,
+        /// Read coldkey password from file at <path>. For non-interactive
+        /// automation only. The file's first line (up to but not including
+        /// the trailing newline) is taken as the password. Security note:
+        /// anyone who can read the file can recover your password. Ensure
+        /// the file is mode 0600, on a tmpfs (/dev/shm) if possible, and
+        /// shredded immediately after use. Do not use this with mainnet
+        /// wallets unless your filesystem, process listing, and shell
+        /// history are all under your control.
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<String>,
     },
 
     /// Sign a message with a wallet key
@@ -792,6 +802,16 @@ pub enum StakeAction {
         /// Amount in TAO (e.g. 10.5)
         #[arg(long)]
         amount: f64,
+        /// Read coldkey password from file at <path>. For non-interactive
+        /// automation only. The file's first line (up to but not including
+        /// the trailing newline) is taken as the password. Security note:
+        /// anyone who can read the file can recover your password. Ensure
+        /// the file is mode 0600, on a tmpfs (/dev/shm) if possible, and
+        /// shredded immediately after use. Do not use this with mainnet
+        /// wallets unless your filesystem, process listing, and shell
+        /// history are all under your control.
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<String>,
     },
 
     /// Unstake alpha from a hotkey back to the coldkey on a subnet.
@@ -833,6 +853,16 @@ pub enum StakeAction {
         /// Conflicts with --amount-alpha and --amount-tao.
         #[arg(long, default_value_t = false)]
         all: bool,
+        /// Read coldkey password from file at <path>. For non-interactive
+        /// automation only. The file's first line (up to but not including
+        /// the trailing newline) is taken as the password. Security note:
+        /// anyone who can read the file can recover your password. Ensure
+        /// the file is mode 0600, on a tmpfs (/dev/shm) if possible, and
+        /// shredded immediately after use. Do not use this with mainnet
+        /// wallets unless your filesystem, process listing, and shell
+        /// history are all under your control.
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<String>,
     },
 
     /// Move stake from one hotkey/subnet to another without unstake+restake.
@@ -883,6 +913,16 @@ pub enum StakeAction {
         /// Amount in TAO
         #[arg(long)]
         amount: f64,
+        /// Read coldkey password from file at <path>. For non-interactive
+        /// automation only. The file's first line (up to but not including
+        /// the trailing newline) is taken as the password. Security note:
+        /// anyone who can read the file can recover your password. Ensure
+        /// the file is mode 0600, on a tmpfs (/dev/shm) if possible, and
+        /// shredded immediately after use. Do not use this with mainnet
+        /// wallets unless your filesystem, process listing, and shell
+        /// history are all under your control.
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<String>,
     },
 
     /// Swap alpha between two subnets via the dTAO AMM.

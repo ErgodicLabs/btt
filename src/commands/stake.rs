@@ -80,8 +80,8 @@ impl subxt::tx::Signer<PolkadotConfig> for Sr25519Signer {
 use crate::commands::chain::parse_ss58;
 use crate::commands::dynamic_decode::{extract_account_id_field, value_to_u64};
 use crate::commands::wallet_keys::{
-    decrypt_coldkey_interactive, rao_to_tao_string, resolve_coldkey_address, tao_to_rao,
-    RAO_PER_TAO,
+    decrypt_coldkey, decrypt_coldkey_interactive, rao_to_tao_string, resolve_coldkey_address,
+    tao_to_rao, RAO_PER_TAO,
 };
 use crate::error::BttError;
 use crate::rpc;
@@ -372,6 +372,7 @@ pub async fn add(
     hotkey: &str,
     netuid: u16,
     amount_tao: f64,
+    password: Option<&str>,
 ) -> Result<StakeTxResult, BttError> {
     let amount_rao = tao_to_rao(amount_tao)?;
     if amount_rao == 0 {
@@ -382,7 +383,7 @@ pub async fn add(
 
     let hotkey_bytes = parse_ss58(hotkey)?;
 
-    let pair = decrypt_coldkey_interactive(wallet)?;
+    let pair = decrypt_coldkey(wallet, password)?;
     let signer = Sr25519Signer::new(pair);
 
     let api = rpc::connect(endpoint).await?;
@@ -437,11 +438,12 @@ pub async fn remove(
     hotkey: &str,
     netuid: u16,
     source: RemoveAmount,
+    password: Option<&str>,
 ) -> Result<StakeTxResult, BttError> {
     let hotkey_bytes = parse_ss58(hotkey)?;
 
     // Decrypt first so a wrong password fails fast, before any RPC work.
-    let pair = decrypt_coldkey_interactive(wallet)?;
+    let pair = decrypt_coldkey(wallet, password)?;
 
     // Cross-check the decrypted pair against coldkeypub.txt (M-3). The
     // public key baked into the cold wallet directory is the canonical
@@ -757,6 +759,7 @@ pub async fn transfer_stake(
     hotkey: &str,
     netuid: u16,
     amount_tao: f64,
+    password: Option<&str>,
 ) -> Result<TransferStakeResult, BttError> {
     let amount_rao = tao_to_rao(amount_tao)?;
     if amount_rao == 0 {
@@ -768,7 +771,7 @@ pub async fn transfer_stake(
     let dest_bytes = parse_ss58(dest_coldkey)?;
     let hotkey_bytes = parse_ss58(hotkey)?;
 
-    let pair = decrypt_coldkey_interactive(wallet)?;
+    let pair = decrypt_coldkey(wallet, password)?;
     let signer = Sr25519Signer::new(pair);
 
     let api = rpc::connect(endpoint).await?;

@@ -8,7 +8,7 @@ use subxt::ext::scale_value::Value as SValue;
 
 use crate::commands::chain::parse_ss58;
 use crate::commands::stake::Sr25519Signer;
-use crate::commands::wallet_keys::{decrypt_coldkey_interactive, rao_to_tao_string, tao_to_rao};
+use crate::commands::wallet_keys::{decrypt_coldkey, rao_to_tao_string, tao_to_rao};
 use crate::error::BttError;
 use crate::rpc;
 
@@ -27,6 +27,7 @@ pub async fn transfer(
     wallet: &str,
     dest: &str,
     amount_tao: f64,
+    password: Option<&str>,
 ) -> Result<TransferResult, BttError> {
     let amount_rao = tao_to_rao(amount_tao)?;
     if amount_rao == 0 {
@@ -37,7 +38,7 @@ pub async fn transfer(
 
     let dest_bytes = parse_ss58(dest)?;
 
-    let pair = decrypt_coldkey_interactive(wallet)?;
+    let pair = decrypt_coldkey(wallet, password)?;
     let from_ss58 = AccountId32::from(PairTrait::public(&pair)).to_ss58check();
     let signer = Sr25519Signer::new(pair);
 

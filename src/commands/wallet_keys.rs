@@ -246,6 +246,41 @@ pub fn decrypt_coldkey_interactive(wallet_name: &str) -> Result<Pair, BttError> 
     Ok(pair)
 }
 
+/// Decrypt the coldkey for a wallet, using a caller-supplied password if
+/// given and falling back to an interactive prompt otherwise. This is the
+/// non-interactive-capable counterpart to `decrypt_coldkey_interactive`.
+///
+/// Callers reading the password from a `--password-file` flag resolve the
+/// file contents upstream (in the CLI dispatch layer) and pass the resolved
+/// string into `Some(...)` here; the file-reading, permission-checking, and
+/// BOM-stripping logic lives in `commands::password_file`, not here.
+///
+/// When `password` is `None` the behavior is exactly
+/// `decrypt_coldkey_interactive`: sniff the envelope, prompt via rpassword,
+/// load the coldkey.
+pub fn decrypt_coldkey(wallet_name: &str, password: Option<&str>) -> Result<Pair, BttError> {
+    match password {
+        None => decrypt_coldkey_interactive(wallet_name),
+        Some(pw) => {
+            let wdir = wallet_path(wallet_name)?;
+            if !wdir.exists() {
+                return Err(BttError::wallet_not_found(format!(
+                    "wallet '{wallet_name}' not found at {}",
+                    wdir.display()
+                )));
+            }
+            let coldkey_path = wdir.join("coldkey");
+            if !coldkey_path.exists() {
+                return Err(BttError::wallet_not_found(format!(
+                    "coldkey file not found for wallet '{wallet_name}'"
+                )));
+            }
+            sniff_nacl_envelope(&coldkey_path)?;
+            load_coldkey(&wdir, pw)
+        }
+    }
+}
+
 pub(crate) fn load_hotkey_pair(wallet_name: &str, hotkey_name: &str) -> Result<Pair, BttError> {
     let wdir = wallet_path(wallet_name)?;
     if !wdir.exists() {
