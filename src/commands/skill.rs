@@ -90,6 +90,11 @@ btt wallet sign --name <name> --message "<msg>" [--use-hotkey] \
 # Verify a signature against an SS58 address
 btt wallet verify --message "<msg>" --signature 0x... --ss58 <address>
 
+# Transfer free-balance TAO from this wallet's coldkey to a destination
+# SS58 address. `Balances::transfer_keep_alive`. Coldkey-signing.
+btt wallet transfer --name <name> --dest <ss58> --amount <TAO> \
+  [--password-file <path>]
+
 # Reap stale `.tmp.*`, `.bak.*`, and `.lock.*` entries left under the
 # wallets directory by crashed or interrupted `wallet create` runs.
 # Uses a strict reserved-prefix grammar match, never follows symlinks,
@@ -159,16 +164,26 @@ btt stake list --wallet <name>
 btt stake list --ss58 <address>
 
 # Add stake. add_stake.amount_staked is TaoBalance, so --amount is in TAO.
-btt stake add --wallet <name> --hotkey <ss58> --netuid <u16> --amount <TAO>
+btt stake add --wallet <name> --hotkey <ss58> --netuid <u16> --amount <TAO> \
+  [--password-file <path>]
 
 # Remove stake. remove_stake.amount_unstaked is AlphaBalance, so the
 # amount is in alpha. Pick one of:
 #   --amount-alpha <N>   Submit N alpha directly.
 #   --amount-tao   <N>   Convert ~N TAO -> alpha via head-block price.
 #   --all                Unstake the full current alpha balance.
-btt stake remove --wallet <name> --hotkey <ss58> --netuid <u16> --amount-alpha <ALPHA>
-btt stake remove --wallet <name> --hotkey <ss58> --netuid <u16> --amount-tao <TAO>
-btt stake remove --wallet <name> --hotkey <ss58> --netuid <u16> --all
+btt stake remove --wallet <name> --hotkey <ss58> --netuid <u16> --amount-alpha <ALPHA> \
+  [--password-file <path>]
+btt stake remove --wallet <name> --hotkey <ss58> --netuid <u16> --amount-tao <TAO> \
+  [--password-file <path>]
+btt stake remove --wallet <name> --hotkey <ss58> --netuid <u16> --all \
+  [--password-file <path>]
+
+# Transfer staked alpha to a different coldkey without unstaking.
+# `SubtensorModule::transfer_stake`. Coldkey-signing.
+btt stake transfer --wallet <name> --dest-coldkey <ss58> \
+  --hotkey <ss58> --netuid <u16> --amount <TAO> \
+  [--password-file <path>]
 ```
 
 Before signing a `remove --all`, btt cross-checks the decrypted keypair's

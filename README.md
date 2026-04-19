@@ -102,6 +102,11 @@ btt wallet regen-hotkey --name alice [--hotkey default] \
 btt wallet regen-hotkey --name alice [--hotkey default] \
     --seed 0x<64 hex chars> [--force]
 
+# Transfer free-balance TAO from this wallet's coldkey to a destination
+# SS58 address. Constructs a `Balances::transfer_keep_alive` extrinsic.
+btt wallet transfer --name alice --dest <ss58> --amount <tao> \
+                    [--password-file <path>]
+
 # Sign a message with the wallet's coldkey (default).
 btt wallet sign --name alice --message "hello" [--password-file <path>]
 
@@ -137,7 +142,7 @@ btt stake list --ss58 <ss58_address>
 # Stake TAO from a coldkey to a hotkey on a subnet.
 # --hotkey takes the hotkey's SS58 address, not a wallet hotkey name.
 btt stake add --wallet alice --hotkey <hotkey_ss58> \
-              --netuid <n> --amount <tao>
+              --netuid <n> --amount <tao> [--password-file <path>]
 
 # Unstake alpha back to the coldkey. Pick exactly one denomination:
 #   --amount-alpha <n>  submit n alpha directly
@@ -145,11 +150,18 @@ btt stake add --wallet alice --hotkey <hotkey_ss58> \
 #                       subnet pool spot price at the head block
 #   --all               unstake the full current alpha balance
 btt stake remove --wallet alice --hotkey <hotkey_ss58> \
-                 --netuid <n> --amount-alpha <n>
+                 --netuid <n> --amount-alpha <n> [--password-file <path>]
 btt stake remove --wallet alice --hotkey <hotkey_ss58> \
-                 --netuid <n> --amount-tao <n>
+                 --netuid <n> --amount-tao <n> [--password-file <path>]
 btt stake remove --wallet alice --hotkey <hotkey_ss58> \
-                 --netuid <n> --all
+                 --netuid <n> --all [--password-file <path>]
+
+# Transfer staked alpha to a different coldkey without unstaking. Signs
+# with the current coldkey; the alpha lands on the destination coldkey
+# paired to the same hotkey and netuid.
+btt stake transfer --wallet alice --dest-coldkey <ss58> \
+                   --hotkey <hotkey_ss58> --netuid <n> --amount <tao> \
+                   [--password-file <path>]
 ```
 
 Since dTAO, 1 alpha is not 1 TAO on any non-root subnet. `stake remove`
@@ -200,7 +212,8 @@ to leave the legacy location in place and let both tools share it.
 ## Non-interactive automation
 
 Commands that prompt for the coldkey password (`wallet create`, `wallet
-new-coldkey`, `wallet regen-coldkey`, `wallet sign`) accept a `--password-file
+new-coldkey`, `wallet regen-coldkey`, `wallet sign`, `wallet transfer`,
+`stake add`, `stake remove`, `stake transfer`) accept a `--password-file
 <path>` flag for CI and scripted use. The file's first line (minus the
 trailing newline) is taken as the password.
 

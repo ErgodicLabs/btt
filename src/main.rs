@@ -145,13 +145,30 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                 name,
                 dest,
                 amount,
+                password_file,
             } => {
                 let endpoint = rpc::resolve_endpoint(
                     cli.url.as_deref(),
                     cli.network.as_deref(),
                 )?;
-                let result =
-                    commands::transfer::transfer(&endpoint, &name, &dest, amount).await?;
+                // When `--password-file` is omitted, pass `None` so the
+                // command prompts interactively — mirroring the pre-#147
+                // behavior byte-for-byte. Only when the flag is set do we
+                // resolve the file via `password_file::read_password_file`
+                // and pass the resolved password down.
+                let password = match password_file.as_deref() {
+                    Some(path) => Some(password_file::read_password_file(path)?),
+                    None => None,
+                };
+                let password_ref = password.as_ref().map(|p| p.as_str());
+                let result = commands::transfer::transfer(
+                    &endpoint,
+                    &name,
+                    &dest,
+                    amount,
+                    password_ref,
+                )
+                .await?;
                 output::print_success(&result, pretty);
             }
             WalletAction::Sign {
@@ -318,13 +335,20 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                     hotkey,
                     netuid,
                     amount,
+                    password_file,
                 } => {
+                    let password = match password_file.as_deref() {
+                        Some(path) => Some(password_file::read_password_file(path)?),
+                        None => None,
+                    };
+                    let password_ref = password.as_ref().map(|p| p.as_str());
                     let result = commands::stake::add(
                         &endpoint,
                         &wallet,
                         &hotkey,
                         netuid,
                         amount,
+                        password_ref,
                     )
                     .await?;
                     output::print_success(&result, pretty);
@@ -336,6 +360,7 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                     amount_alpha,
                     amount_tao,
                     all,
+                    password_file,
                 } => {
                     let source = match (amount_alpha, amount_tao, all) {
                         (Some(a), None, false) => commands::stake::RemoveAmount::Alpha(a),
@@ -354,12 +379,18 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                             ));
                         }
                     };
+                    let password = match password_file.as_deref() {
+                        Some(path) => Some(password_file::read_password_file(path)?),
+                        None => None,
+                    };
+                    let password_ref = password.as_ref().map(|p| p.as_str());
                     let result = commands::stake::remove(
                         &endpoint,
                         &wallet,
                         &hotkey,
                         netuid,
                         source,
+                        password_ref,
                     )
                     .await?;
                     output::print_success(&result, pretty);
@@ -392,9 +423,21 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                     hotkey,
                     netuid,
                     amount,
+                    password_file,
                 } => {
+                    let password = match password_file.as_deref() {
+                        Some(path) => Some(password_file::read_password_file(path)?),
+                        None => None,
+                    };
+                    let password_ref = password.as_ref().map(|p| p.as_str());
                     let result = commands::stake::transfer_stake(
-                        &endpoint, &wallet, &dest_coldkey, &hotkey, netuid, amount,
+                        &endpoint,
+                        &wallet,
+                        &dest_coldkey,
+                        &hotkey,
+                        netuid,
+                        amount,
+                        password_ref,
                     )
                     .await?;
                     output::print_success(&result, pretty);
