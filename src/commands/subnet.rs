@@ -810,7 +810,7 @@ pub async fn info(
     parse_dynamic_info(info_value, netuid, block_number)
 }
 
-fn parse_dynamic_info<C: Clone>(
+fn parse_dynamic_info<C: Clone + std::fmt::Debug>(
     info: &Value<C>,
     expected_netuid: u16,
     at_block: u64,
