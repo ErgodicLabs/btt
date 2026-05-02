@@ -1,0 +1,122 @@
+name: release
+
+# Release-binary build. Triggered manually via workflow_dispatch (no
+# tag ceremony required) or automatically on a `v*` tag push. Produces
+# a single x86_64-unknown-linux-gnu release binary, packaged with the
+# README + LICENSE, uploaded as a workflow artifact for download via
+# `gh run download` and (when triggered by a tag) attached to a
+# GitHub Release.
+#
+# Why this workflow exists (issue tracking the verification gap): the
+# existing CI workflows (lint, tests, btcli-compat, dep-audit) build
+# btt for verification but do not publish the resulting binary in a
+# form that's usable from a developer's machine. That left the
+# real-target gate from `feedback_done_means_works_on_testnet`
+# unsatisfiable on memory-tight hosts that cannot themselves run
+# `cargo build --release` for btt's full dep tree (subxt + jsonrpsee +
+# polkadot-sdk + ring + ...). This workflow closes that gap: any
+# author can dispatch it, download the artifact, and run the binary
+# against the real target network without needing a beefy local box.
+#
+# Compared to a tag-based release-only workflow, this trades the
+# permanence of a versioned release for the speed of artifact-only
+# verification builds — appropriate because verification builds get
+# requested far more often than versioned releases, and the artifact
+# retention period (90 days default) is plenty.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to build (branch, tag, or SHA). Defaults to the workflow run target.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write  # needed for `gh release upload` on tag pushes
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: Build x86_64-linux release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Install Rust toolchain
+        # Use the project's pinned toolchain (rust-toolchain.toml).
+        run: |
+          rustup show
+          rustc --version
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-release-${{ runner.os }}-
+
+      - name: Build release binary
+        run: cargo build --release --bin btt
+
+      - name: Stage artifact
+        # Bundle the binary with the README and LICENSE so a
+        # downloader gets context with the executable.
+        run: |
+          mkdir -p dist
+          cp target/release/btt dist/btt
+          cp README.md dist/
+          cp LICENSE dist/
+          chmod +x dist/btt
+          (cd dist && sha256sum btt > btt.sha256)
+          ls -la dist/
+
+      - name: Resolve build identifier
+        id: ident
+        run: |
+          # short sha for artifact naming
+          short_sha=$(git rev-parse --short HEAD)
+          echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "ref_name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: btt-x86_64-unknown-linux-gnu-${{ steps.ident.outputs.ref_name }}-${{ steps.ident.outputs.short_sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Attach to GitHub Release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Create the release if it does not exist; upload the binary
+          # and its sha256 as assets either way. `gh release upload --clobber`
+          # is idempotent on re-runs.
+          tag="${GITHUB_REF_NAME}"
+          if ! gh release view "${tag}" >/dev/null 2>&1; then
+            gh release create "${tag}" \
+              --title "${tag}" \
+              --notes "Automated release build of btt for ${tag}." \
+              --verify-tag
+          fi
+          gh release upload "${tag}" \
+            dist/btt \
+            dist/btt.sha256 \
+            dist/README.md \
+            dist/LICENSE \
+            --clobber
