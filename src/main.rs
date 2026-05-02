@@ -533,6 +533,11 @@ async fn run(cli: Cli) -> Result<(), BttError> {
                         commands::subnet::hyperparameters(&endpoint, netuid).await?;
                     output::print_success(&result, pretty);
                 }
+                SubnetAction::Info { netuid } => {
+                    let result =
+                        commands::subnet::info(&endpoint, netuid).await?;
+                    output::print_success(&result, pretty);
+                }
                 SubnetAction::Register {
                     name,
                     hotkey,
