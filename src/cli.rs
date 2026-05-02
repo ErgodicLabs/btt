@@ -396,6 +396,22 @@ pub enum SubnetAction {
         netuid: u16,
     },
 
+    /// Dump the dynamic-pricing info (dTAO market state + identity) for a given subnet.
+    ///
+    /// Reads `SubnetInfoRuntimeApi::get_dynamic_info(netuid)` on the
+    /// head block and returns the dTAO market state (alpha supply,
+    /// alpha-vs-TAO reserves, recent emission rate) along with the
+    /// subnet-owner identity (hotkey, coldkey) and the on-chain
+    /// identity record the owner has registered (name, description,
+    /// github URL, website, discord, logo URL). Read-only; no wallet,
+    /// no signing, no extrinsic. Exits with a structured error if the
+    /// netuid does not exist on chain.
+    Info {
+        /// Subnet id to query.
+        #[arg(long)]
+        netuid: u16,
+    },
+
     /// Register a hotkey on a subnet by paying the burn cost.
     ///
     /// Submits a `SubtensorModule::burned_register` extrinsic. Coldkey-

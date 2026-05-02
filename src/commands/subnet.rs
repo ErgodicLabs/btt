@@ -727,6 +727,152 @@ fn format_rao_as_tao(rao: u128) -> String {
     format!("{whole}.{frac:09}")
 }
 
+// ── info ───────────────────────────────────────────────────────────────
+
+/// Result shape for `btt subnet info --netuid <N>`.
+///
+/// Surfaces the dTAO market state and on-chain identity record for a
+/// single subnet via `SubnetInfoRuntimeApi::get_dynamic_info(netuid)`.
+/// Unlike `subnet metagraph` (which also returns per-UID arrays and is
+/// the heaviest read in the subnet command tree), this is a small,
+/// fixed-size struct suitable for routine recon.
+///
+/// Field shape decisions:
+/// - Owner hotkey/coldkey are emitted as ss58 strings, matching `list`
+///   and `metagraph`.
+/// - Identity strings (name, github_repo, subnet_url, discord,
+///   description, additional, logo_url) are surfaced as `Option<String>`
+///   because the runtime emits empty strings for unset identity fields
+///   and an `Option` makes the "owner has not registered identity"
+///   case explicit downstream.
+/// - The `raw` field carries the full SCALE-decoded `Value` as a
+///   debug-formatted string. v1 of this command extracts the
+///   conservative subset of fields above; the raw blob covers
+///   everything else (alpha-pool reserves, emission rate, registration
+///   cost, etc.) until subsequent commits add typed accessors per
+///   field.
+#[derive(Serialize, Debug)]
+pub struct SubnetInfoResult {
+    pub netuid: u16,
+    pub owner_hotkey_ss58: Option<String>,
+    pub owner_coldkey_ss58: Option<String>,
+    pub name: Option<String>,
+    pub symbol: Option<String>,
+    pub github_repo: Option<String>,
+    pub subnet_url: Option<String>,
+    pub discord: Option<String>,
+    pub description: Option<String>,
+    pub additional: Option<String>,
+    pub logo_url: Option<String>,
+    /// Full debug-formatted SCALE Value of the runtime API response.
+    /// Carries every field including ones not yet promoted to typed
+    /// accessors above. Stable across calls modulo on-chain state
+    /// changes; not stable across runtime upgrades that reshape the
+    /// struct.
+    pub raw: String,
+    pub at_block: u64,
+}
+
+/// Query the dynamic-pricing info for a subnet via
+/// `SubnetInfoRuntimeApi::get_dynamic_info(netuid)`. Returns `None`
+/// from the runtime if the netuid does not exist; btt translates that
+/// to a structured error.
+pub async fn info(
+    endpoint: &str,
+    netuid: u16,
+) -> Result<SubnetInfoResult, BttError> {
+    let api = rpc::connect(endpoint).await?;
+
+    let at_block = tokio::time::timeout(RPC_TIMEOUT, api.at_current_block())
+        .await
+        .map_err(|_| BttError::query("at_current_block() timed out"))?
+        .map_err(|e| BttError::query(format!("failed to resolve client at head: {e}")))?;
+
+    let block_number: u64 = at_block.block_number();
+
+    let call = subxt::dynamic::runtime_api_call::<Vec<SValue>, SValue>(
+        "SubnetInfoRuntimeApi",
+        "get_dynamic_info",
+        vec![SValue::u128(netuid as u128)],
+    );
+
+    let value = tokio::time::timeout(RPC_TIMEOUT, at_block.runtime_apis().call(call))
+        .await
+        .map_err(|_| BttError::query("get_dynamic_info timed out"))?
+        .map_err(|e| BttError::query(format!("get_dynamic_info runtime call failed: {e}")))?;
+
+    // `Option<DynamicInfo>` — None means the netuid does not exist on
+    // chain. Same Option-peel as parse_subnet_info_list.
+    let info_value = value.at(0).ok_or_else(|| {
+        BttError::query(format!("netuid {netuid} not found on chain"))
+    })?;
+
+    parse_dynamic_info(info_value, netuid, block_number)
+}
+
+fn parse_dynamic_info<C: Clone>(
+    info: &Value<C>,
+    expected_netuid: u16,
+    at_block: u64,
+) -> Result<SubnetInfoResult, BttError> {
+    // The netuid round-trip is the only field we treat as a hard error
+    // if absent / wrong — it tells us the runtime API actually
+    // returned the subnet we asked for, not some accidentally-
+    // unwrapped enum tail.
+    let returned_netuid = compact_u16(info, "netuid").ok_or_else(|| {
+        BttError::parse("dynamic_info: missing netuid field")
+    })?;
+    if returned_netuid != expected_netuid {
+        return Err(BttError::parse(format!(
+            "dynamic_info: returned netuid {returned_netuid} does not match requested {expected_netuid}"
+        )));
+    }
+
+    // Owner accounts. Best-effort: if upstream renames the field in a
+    // future runtime, we surface None rather than fail the whole call.
+    let owner_hotkey_ss58 = extract_account_id_field(info, "owner_hotkey")
+        .map(|raw| AccountId32::from(raw).to_ss58check());
+    let owner_coldkey_ss58 = extract_account_id_field(info, "owner_coldkey")
+        .map(|raw| AccountId32::from(raw).to_ss58check());
+
+    // String identity fields. Each is independently Option; missing
+    // ones simply drop out of the JSON / table view rather than
+    // failing the query.
+    let extract_string = |field: &str| -> Option<String> {
+        let bytes = decode_compact_u8_vec(info, field)?;
+        if bytes.is_empty() {
+            None
+        } else {
+            Some(bytes)
+        }
+    };
+
+    let name = extract_string("name").or_else(|| extract_string("subnet_name"));
+    let symbol = extract_string("symbol");
+    let github_repo = extract_string("github_repo");
+    let subnet_url = extract_string("subnet_url");
+    let discord = extract_string("discord");
+    let description = extract_string("description");
+    let additional = extract_string("additional");
+    let logo_url = extract_string("logo_url");
+
+    Ok(SubnetInfoResult {
+        netuid: returned_netuid,
+        owner_hotkey_ss58,
+        owner_coldkey_ss58,
+        name,
+        symbol,
+        github_repo,
+        subnet_url,
+        discord,
+        description,
+        additional,
+        logo_url,
+        raw: format!("{info:?}"),
+        at_block,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
