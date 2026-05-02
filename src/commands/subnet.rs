@@ -737,39 +737,82 @@ fn format_rao_as_tao(rao: u128) -> String {
 /// the heaviest read in the subnet command tree), this is a small,
 /// fixed-size struct suitable for routine recon.
 ///
-/// Field shape decisions:
-/// - Owner hotkey/coldkey are emitted as ss58 strings, matching `list`
-///   and `metagraph`.
-/// - Identity strings (name, github_repo, subnet_url, discord,
-///   description, additional, logo_url) are surfaced as `Option<String>`
-///   because the runtime emits empty strings for unset identity fields
-///   and an `Option` makes the "owner has not registered identity"
-///   case explicit downstream.
-/// - The `raw` field carries the full SCALE-decoded `Value` as a
-///   debug-formatted string. v1 of this command extracts the
-///   conservative subset of fields above; the raw blob covers
-///   everything else (alpha-pool reserves, emission rate, registration
-///   cost, etc.) until subsequent commits add typed accessors per
-///   field.
+/// The on-chain `DynamicInfo` struct shape, confirmed by running v1
+/// against finney mainnet (block 8,097,770, see #cryptid post linked
+/// in PR description):
+///
+/// ```text
+/// DynamicInfo {
+///   netuid, owner_hotkey, owner_coldkey,
+///   subnet_name, token_symbol,
+///   tempo, last_step, blocks_since_last_step,
+///   emission, alpha_in, alpha_out, tao_in,
+///   alpha_out_emission, alpha_in_emission, tao_in_emission,
+///   pending_alpha_emission, pending_root_emission,
+///   subnet_volume, network_registered_at,
+///   subnet_identity: Option<SubnetIdentity {
+///     subnet_name, github_repo, subnet_contact,
+///     subnet_url, discord, description,
+///     logo_url, additional
+///   }>,
+///   moving_price: { bits: i128 }   // fixed-point Q-format price
+/// }
+/// ```
+///
+/// v2 promotes every field to a typed accessor and drops the raw
+/// debug blob v1 carried as a hedge against unknown shape. Identity
+/// strings nested under `subnet_identity` are flattened to the top
+/// level of the result for caller convenience.
 #[derive(Serialize, Debug)]
 pub struct SubnetInfoResult {
     pub netuid: u16,
     pub owner_hotkey_ss58: Option<String>,
     pub owner_coldkey_ss58: Option<String>,
+
+    /// Subnet display name, from the top-level `subnet_name` field.
     pub name: Option<String>,
+    /// Subnet token symbol, from the top-level `token_symbol` field.
+    /// Often a single Unicode character (e.g. `α`).
     pub symbol: Option<String>,
+
+    // Identity record fields, flattened from `subnet_identity: Option<SubnetIdentity>`.
+    // All None when the owner has not registered identity on chain.
+    pub identity_name: Option<String>,
     pub github_repo: Option<String>,
+    pub subnet_contact: Option<String>,
     pub subnet_url: Option<String>,
     pub discord: Option<String>,
     pub description: Option<String>,
-    pub additional: Option<String>,
     pub logo_url: Option<String>,
-    /// Full debug-formatted SCALE Value of the runtime API response.
-    /// Carries every field including ones not yet promoted to typed
-    /// accessors above. Stable across calls modulo on-chain state
-    /// changes; not stable across runtime upgrades that reshape the
-    /// struct.
-    pub raw: String,
+    pub additional: Option<String>,
+
+    // Tempo + epoch state.
+    pub tempo: Option<u16>,
+    pub last_step: Option<u64>,
+    pub blocks_since_last_step: Option<u64>,
+    pub network_registered_at: Option<u64>,
+
+    // dTAO market state (rao-denominated u128 stringified for JSON
+    // safety, matching the rest of btt's balance-output convention).
+    pub emission_rao: Option<String>,
+    pub alpha_in_rao: Option<String>,
+    pub alpha_out_rao: Option<String>,
+    pub tao_in_rao: Option<String>,
+    pub alpha_in_emission_rao: Option<String>,
+    pub alpha_out_emission_rao: Option<String>,
+    pub tao_in_emission_rao: Option<String>,
+    pub pending_alpha_emission_rao: Option<String>,
+    pub pending_root_emission_rao: Option<String>,
+    pub subnet_volume_rao: Option<String>,
+
+    /// Moving-price `bits` field as an i128, raw. The runtime stores
+    /// this as a fixed-point representation; the exact Q-format point
+    /// is owner-specific and out of scope for this command — callers
+    /// that need the rational price should either pull
+    /// `tao_in_rao / alpha_in_rao` (instantaneous pool spot) or
+    /// interpret bits per the subtensor source for the moving avg.
+    pub moving_price_bits: Option<String>,
+
     pub at_block: u64,
 }
 
@@ -810,7 +853,33 @@ pub async fn info(
     parse_dynamic_info(info_value, netuid, block_number)
 }
 
-fn parse_dynamic_info<C: Clone + std::fmt::Debug>(
+/// scale-value represents `Option<T>` as a `Variant`: `None` is the
+/// `None` variant, `Some` is the `Some` variant with a single unnamed
+/// inner that IS the `T`. This helper peels the `Some` and returns
+/// the inner value, or `None` if the input is the `None` variant or
+/// not a Variant at all.
+fn peel_some<C: Clone>(value: &Value<C>) -> Option<&Value<C>> {
+    if let subxt::ext::scale_value::ValueDef::Variant(v) = &value.value {
+        if v.name == "Some" {
+            // `Some` carries a single unnamed inner. The Composite
+            // values iterator gives us the children in order; the
+            // first one is the inner T.
+            if let subxt::ext::scale_value::Composite::Unnamed(items) = &v.values {
+                return items.first();
+            }
+        }
+    }
+    None
+}
+
+/// Pull a length-prefixed UTF-8 string field by name from a composite
+/// scale Value, returning None if missing or empty.
+fn field_string<C: Clone>(composite: &Value<C>, field: &str) -> Option<String> {
+    let bytes = decode_compact_u8_vec(composite, field)?;
+    if bytes.is_empty() { None } else { Some(bytes) }
+}
+
+fn parse_dynamic_info<C: Clone>(
     info: &Value<C>,
     expected_netuid: u16,
     at_block: u64,
@@ -835,26 +904,61 @@ fn parse_dynamic_info<C: Clone + std::fmt::Debug>(
     let owner_coldkey_ss58 = extract_account_id_field(info, "owner_coldkey")
         .map(|raw| AccountId32::from(raw).to_ss58check());
 
-    // String identity fields. Each is independently Option; missing
-    // ones simply drop out of the JSON / table view rather than
-    // failing the query.
-    let extract_string = |field: &str| -> Option<String> {
-        let bytes = decode_compact_u8_vec(info, field)?;
-        if bytes.is_empty() {
-            None
-        } else {
-            Some(bytes)
-        }
+    // Top-level name + symbol.
+    let name = field_string(info, "subnet_name");
+    let symbol = field_string(info, "token_symbol");
+
+    // Identity record is nested under `subnet_identity: Option<SubnetIdentity>`.
+    // Walk into the `Some` variant if present; otherwise all identity
+    // fields are None.
+    let identity = info.at("subnet_identity").and_then(peel_some);
+    let identity_name = identity.and_then(|i| field_string(i, "subnet_name"));
+    let github_repo = identity.and_then(|i| field_string(i, "github_repo"));
+    let subnet_contact = identity.and_then(|i| field_string(i, "subnet_contact"));
+    let subnet_url = identity.and_then(|i| field_string(i, "subnet_url"));
+    let discord = identity.and_then(|i| field_string(i, "discord"));
+    let description = identity.and_then(|i| field_string(i, "description"));
+    let logo_url = identity.and_then(|i| field_string(i, "logo_url"));
+    let additional = identity.and_then(|i| field_string(i, "additional"));
+
+    // Tempo / epoch fields.
+    let tempo = compact_u16(info, "tempo");
+    let last_step = compact_u64(info, "last_step");
+    let blocks_since_last_step = compact_u64(info, "blocks_since_last_step");
+    let network_registered_at = compact_u64(info, "network_registered_at");
+
+    // dTAO market state (all u128 rao). Stringified to keep JSON
+    // parsers safe against precision loss on large balances.
+    let stringify_balance = |field: &str| -> Option<String> {
+        compact_u128(info, field).map(|n| n.to_string())
     };
 
-    let name = extract_string("name").or_else(|| extract_string("subnet_name"));
-    let symbol = extract_string("symbol");
-    let github_repo = extract_string("github_repo");
-    let subnet_url = extract_string("subnet_url");
-    let discord = extract_string("discord");
-    let description = extract_string("description");
-    let additional = extract_string("additional");
-    let logo_url = extract_string("logo_url");
+    let emission_rao = stringify_balance("emission");
+    let alpha_in_rao = stringify_balance("alpha_in");
+    let alpha_out_rao = stringify_balance("alpha_out");
+    let tao_in_rao = stringify_balance("tao_in");
+    let alpha_in_emission_rao = stringify_balance("alpha_in_emission");
+    let alpha_out_emission_rao = stringify_balance("alpha_out_emission");
+    let tao_in_emission_rao = stringify_balance("tao_in_emission");
+    let pending_alpha_emission_rao = stringify_balance("pending_alpha_emission");
+    let pending_root_emission_rao = stringify_balance("pending_root_emission");
+    let subnet_volume_rao = stringify_balance("subnet_volume");
+
+    // moving_price.bits is a Primitive(I128). Match the variant
+    // explicitly because the existing dynamic_decode helpers all
+    // expect unsigned integers, and `bits` here is signed by design.
+    let moving_price_bits = info
+        .at("moving_price")
+        .and_then(|mp| mp.at("bits"))
+        .and_then(|bits| match &bits.value {
+            subxt::ext::scale_value::ValueDef::Primitive(
+                subxt::ext::scale_value::Primitive::I128(n),
+            ) => Some(n.to_string()),
+            subxt::ext::scale_value::ValueDef::Primitive(
+                subxt::ext::scale_value::Primitive::U128(n),
+            ) => Some(n.to_string()),
+            _ => None,
+        });
 
     Ok(SubnetInfoResult {
         netuid: returned_netuid,
@@ -862,13 +966,29 @@ fn parse_dynamic_info<C: Clone + std::fmt::Debug>(
         owner_coldkey_ss58,
         name,
         symbol,
+        identity_name,
         github_repo,
+        subnet_contact,
         subnet_url,
         discord,
         description,
-        additional,
         logo_url,
-        raw: format!("{info:?}"),
+        additional,
+        tempo,
+        last_step,
+        blocks_since_last_step,
+        network_registered_at,
+        emission_rao,
+        alpha_in_rao,
+        alpha_out_rao,
+        tao_in_rao,
+        alpha_in_emission_rao,
+        alpha_out_emission_rao,
+        tao_in_emission_rao,
+        pending_alpha_emission_rao,
+        pending_root_emission_rao,
+        subnet_volume_rao,
+        moving_price_bits,
         at_block,
     })
 }
