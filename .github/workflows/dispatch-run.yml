@@ -1,0 +1,284 @@
+name: dispatch-run
+
+# Maintainer-gated remote runner for read-only btt commands.
+#
+# Triggered manually via workflow_dispatch. Downloads the latest
+# successful `release.yml` artifact from main, runs an allowlisted
+# read-only btt subcommand against the user-selected network, and
+# uploads stdout + an audit log as artifacts.
+#
+# Why this exists: maintainers periodically want to check on-chain
+# state (`subnet info`, `subnet list`, `chain status`, ...) without
+# downloading a binary locally. This workflow gives them a one-click
+# path through the GitHub Actions UI: pick a subcommand, type the
+# args, hit run, read the output. Useful for quick diagnostics,
+# spot-checks, and replicating production-side reads when debugging
+# a user report.
+#
+# Security model:
+# - Static maintainer allowlist (`nkashy1` for v1; expand by editing
+#   `MAINTAINER_ALLOWLIST` below). Any non-allowlisted actor fails
+#   the `authorize` job before any binary runs.
+# - Subcommand is a closed enum of read-only commands only. No
+#   wallet/extrinsic-submitting commands are reachable from here;
+#   not even by free-form input. (Adding a new subcommand requires
+#   editing this YAML.)
+# - Args are validated against a per-subcommand allowlist regex
+#   before being passed through. The match is anchored both ends
+#   so partial matches do not slip through.
+# - The optional `url` override is regex-restricted to standard
+#   ws/wss/http/https URLs, blocking shell-injection vectors via
+#   the URL field.
+# - `permissions: read-all` on the workflow drops write access to
+#   the repo even though the binary is read-only — defense in
+#   depth in case a future subcommand drift introduces side effects.
+# - 5-minute timeout on the run step. No subcommand should take
+#   longer; if one does, the workflow fails rather than burning
+#   the runner.
+# - Every invocation writes a structured audit log artifact (actor,
+#   timestamp, subcommand, args, network, url override) with 90-day
+#   retention.
+
+on:
+  workflow_dispatch:
+    inputs:
+      subcommand:
+        description: 'btt subcommand to run (read-only allowlist)'
+        required: true
+        type: choice
+        options:
+          - subnet-info
+          - subnet-list
+          - subnet-metagraph
+          - subnet-hyperparameters
+          - subnet-lock-cost
+          - chain-status
+      args:
+        description: 'Arguments for the subcommand. Validated against per-subcommand regex.'
+        required: false
+        default: ''
+      network:
+        description: 'Network to target. Ignored if `url` is set.'
+        required: true
+        type: choice
+        default: 'finney'
+        options:
+          - finney
+          - test
+          - local
+      url:
+        description: 'Override the chain endpoint with a custom RPC URL. Must match `^(wss?|https?)://...$`.'
+        required: false
+        default: ''
+      pretty:
+        description: 'Pass --pretty for human-readable output (default JSON).'
+        required: false
+        type: boolean
+        default: false
+
+permissions: read-all
+
+jobs:
+  authorize:
+    name: Verify maintainer
+    runs-on: ubuntu-latest
+    env:
+      MAINTAINER_ALLOWLIST: 'nkashy1'
+      ACTOR: ${{ github.actor }}
+    steps:
+      - name: Check actor against allowlist
+        run: |
+          set -eu
+          # Tab-or-space separated maintainer list. To extend, add
+          # usernames to MAINTAINER_ALLOWLIST above.
+          for u in $MAINTAINER_ALLOWLIST; do
+            if [ "$u" = "$ACTOR" ]; then
+              echo "Authorized: $ACTOR"
+              exit 0
+            fi
+          done
+          echo "::error::Actor '$ACTOR' is not in maintainer allowlist. Workflow refusing to run."
+          exit 1
+
+  run:
+    name: Run btt
+    needs: authorize
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SUBCOMMAND: ${{ inputs.subcommand }}
+      ARGS: ${{ inputs.args }}
+      NETWORK: ${{ inputs.network }}
+      URL: ${{ inputs.url }}
+      PRETTY: ${{ inputs.pretty }}
+    steps:
+      - name: Validate args against per-subcommand regex
+        run: |
+          set -eu
+          case "$SUBCOMMAND" in
+            subnet-info)
+              # accept: --netuid <N> [--quiet]
+              if ! printf '%s' "$ARGS" | grep -Eq '^--netuid[[:space:]]+[0-9]+([[:space:]]+--quiet)?$'; then
+                echo "::error::Invalid args for subnet-info. Expected: --netuid <N> [--quiet]"
+                exit 1
+              fi
+              ;;
+            subnet-list)
+              if [ -n "$ARGS" ] && ! printf '%s' "$ARGS" | grep -Eq '^--quiet$'; then
+                echo "::error::Invalid args for subnet-list. Expected: empty or --quiet"
+                exit 1
+              fi
+              ;;
+            subnet-metagraph|subnet-hyperparameters)
+              if ! printf '%s' "$ARGS" | grep -Eq '^--netuid[[:space:]]+[0-9]+([[:space:]]+--quiet)?$'; then
+                echo "::error::Invalid args. Expected: --netuid <N> [--quiet]"
+                exit 1
+              fi
+              ;;
+            subnet-lock-cost|chain-status)
+              if [ -n "$ARGS" ] && ! printf '%s' "$ARGS" | grep -Eq '^--quiet$'; then
+                echo "::error::Invalid args. Expected: empty or --quiet"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::Unknown subcommand: $SUBCOMMAND"
+              exit 1
+              ;;
+          esac
+
+      - name: Validate URL override (if present)
+        run: |
+          set -eu
+          if [ -n "$URL" ]; then
+            if ! printf '%s' "$URL" | grep -Eq '^(wss?|https?)://[A-Za-z0-9._:/-]+$'; then
+              echo "::error::Invalid url override: $URL"
+              exit 1
+            fi
+          fi
+
+      - name: Find latest successful release artifact
+        id: find_artifact
+        run: |
+          set -eu
+          run_id=$(gh run list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --workflow release.yml \
+            --branch main \
+            --status success \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId // empty')
+          if [ -z "$run_id" ]; then
+            echo "::error::No successful release.yml run found on main. Trigger release.yml first."
+            exit 1
+          fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "Using release run id: $run_id"
+
+      - name: Download artifact
+        run: |
+          set -eu
+          mkdir -p dist
+          gh run download "${{ steps.find_artifact.outputs.run_id }}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --dir dist
+
+      - name: Locate and prepare binary
+        run: |
+          set -eu
+          btt=$(find dist -type f -name btt | head -n1)
+          if [ -z "$btt" ]; then
+            echo "::error::btt binary not present in artifact"
+            ls -laR dist/
+            exit 1
+          fi
+          chmod +x "$btt"
+          echo "BTT=$(realpath "$btt")" >> "$GITHUB_ENV"
+          "$btt" --version
+
+      - name: Run command
+        timeout-minutes: 5
+        run: |
+          set -eu
+          # Map dash-separated dispatch enum to btt's space-separated subcommand.
+          case "$SUBCOMMAND" in
+            subnet-info)            cmd="subnet info" ;;
+            subnet-list)            cmd="subnet list" ;;
+            subnet-metagraph)       cmd="subnet metagraph" ;;
+            subnet-hyperparameters) cmd="subnet hyperparameters" ;;
+            subnet-lock-cost)       cmd="subnet lock-cost" ;;
+            chain-status)           cmd="chain status" ;;
+          esac
+
+          # Build the endpoint args. --url takes precedence over --network.
+          if [ -n "$URL" ]; then
+            ep="--url $URL"
+          else
+            ep="--network $NETWORK"
+          fi
+
+          # --pretty if the boolean is true.
+          pf=""
+          if [ "$PRETTY" = "true" ]; then
+            pf="--pretty"
+          fi
+
+          # ARGS was validated against an anchored regex above, so
+          # word-splitting it here cannot smuggle shell metacharacters.
+          set -x
+          "$BTT" $cmd $ARGS $ep $pf 2>&1 | tee command-output.txt
+          set +x
+
+      - name: Write audit log
+        if: always()
+        run: |
+          set -eu
+          {
+            echo "actor:        ${{ github.actor }}"
+            echo "timestamp:    $(date -u --iso-8601=seconds)"
+            echo "run_id:       ${{ github.run_id }}"
+            echo "subcommand:   $SUBCOMMAND"
+            echo "args:         $ARGS"
+            echo "network:      $NETWORK"
+            echo "url_override: $URL"
+            echo "pretty:       $PRETTY"
+            echo "release_run:  ${{ steps.find_artifact.outputs.run_id }}"
+          } > audit-log.txt
+          cat audit-log.txt
+
+      - name: Append output to job summary
+        if: always()
+        run: |
+          set -eu
+          {
+            echo "## dispatch-run output"
+            echo
+            echo "### Audit log"
+            echo
+            echo '```'
+            cat audit-log.txt
+            echo '```'
+            echo
+            echo "### Command output"
+            echo
+            echo '```'
+            if [ -f command-output.txt ]; then
+              cat command-output.txt
+            else
+              echo '(no output captured — earlier step likely failed)'
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload audit + output artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dispatch-run-${{ github.run_id }}
+          path: |
+            audit-log.txt
+            command-output.txt
+          retention-days: 90
+          if-no-files-found: warn
