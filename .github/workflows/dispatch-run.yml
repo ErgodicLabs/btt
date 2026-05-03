@@ -83,7 +83,7 @@ jobs:
     name: Verify maintainer
     runs-on: ubuntu-latest
     env:
-      MAINTAINER_ALLOWLIST: 'nkashy1'
+      MAINTAINER_ALLOWLIST: 'nkashy1 moorkh'
       ACTOR: ${{ github.actor }}
     steps:
       - name: Check actor against allowlist
